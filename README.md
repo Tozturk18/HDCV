@@ -84,12 +84,15 @@ The viewer is optimized for the current system and uses the C reader directly ra
 
 Current GUI features:
 
-- native macOS window with Open dialog
-- overview heatmap built from a downsampled scan matrix
-- selected current-vs-time trace
-- selected cyclic voltammogram
-- scan slider and waveform-point slider
-- click-to-select on the heatmap
+- native macOS window with open dialog and drag-and-drop file loading
+- overview color plot built from a downsampled scan matrix
+- selected `I-t` plot at the chosen waveform point
+- selected `CV` plot at the chosen scan
+- scan, waveform-point, and background-scan controls
+- background subtraction toggle applied coherently to color plot, `I-t`, and `CV`
+- synchronized vertical and horizontal crosshair lines across the plots
+- click-and-drag selection on the color plot
+- click-to-select from the `I-t` and `CV` plots
 - sequence-time vs experiment-time toggle
 - summary plus raw metadata panel
 
@@ -99,6 +102,15 @@ Performance notes:
 - the heatmap is decimated for display rather than rendered at full scan-count width
 - the current-vs-time trace for the selected waveform point is extracted asynchronously
 - scan selection updates the CV immediately from the mmap-backed reader
+
+FSCV-specific interaction model:
+
+- the color plot is the primary overview surface
+- selecting a point in the color plot updates both the `I-t` and `CV` plots
+- selecting in the `I-t` plot moves the scan crosshair
+- selecting in the `CV` plot moves the waveform-point crosshair
+- the background scan can be chosen explicitly or set from the current selected scan
+- experiment time preserves inter-run gaps, while sequence time remains contiguous by scan index
 
 ## Validation Workflow
 
