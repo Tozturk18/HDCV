@@ -559,6 +559,33 @@ int hdcv_reader_copy_scan(const hdcv_reader *reader, uint32_t scan_index, float 
     return 1;
 }
 
+int hdcv_reader_copy_scan_points(
+    const hdcv_reader *reader,
+    uint32_t scan_index,
+    uint32_t point_start,
+    uint32_t point_count,
+    float *dst,
+    size_t dst_count
+)
+{
+    uint64_t row_bytes;
+    uint64_t offset;
+
+    if (scan_index >= reader->layout.scan_count ||
+        point_start > reader->layout.points_per_scan ||
+        point_count > reader->layout.points_per_scan - point_start ||
+        dst_count < point_count) {
+        return 0;
+    }
+
+    row_bytes = (uint64_t)reader->layout.points_per_scan * 4U;
+    offset = reader->layout.current_matrix_offset +
+        ((uint64_t)scan_index * row_bytes) +
+        ((uint64_t)point_start * 4U);
+    hdcv_copy_be_f32_array(reader->mapped.data + offset, dst, point_count);
+    return 1;
+}
+
 int hdcv_reader_copy_scan_range(
     const hdcv_reader *reader,
     uint32_t start_scan,

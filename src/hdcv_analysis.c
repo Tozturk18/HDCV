@@ -71,6 +71,18 @@ int hdcv_analysis_build_overview(
     }
 
     column_count = reader->layout.scan_count < max_columns ? reader->layout.scan_count : max_columns;
+    if (reader->layout.waveform_count > 1U && reader->layout.scan_count > max_columns) {
+        uint32_t phase_period = reader->layout.waveform_count;
+        uint32_t scans_per_column = (reader->layout.scan_count + max_columns - 1U) / max_columns;
+        uint32_t balanced_scans_per_column =
+            ((scans_per_column + phase_period - 1U) / phase_period) * phase_period;
+        if (balanced_scans_per_column > scans_per_column) {
+            column_count = (reader->layout.scan_count + balanced_scans_per_column - 1U) / balanced_scans_per_column;
+            if (column_count == 0U) {
+                column_count = 1U;
+            }
+        }
+    }
     if ((uint64_t)column_count * points_per_scan > dst_count) {
         return 0;
     }

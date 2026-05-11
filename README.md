@@ -87,30 +87,45 @@ Current GUI features:
 - native macOS window with open dialog and drag-and-drop file loading
 - overview color plot built from a downsampled scan matrix
 - selected `I-t` plot at the chosen waveform point
-- selected `CV` plot at the chosen scan
-- scan, waveform-point, and background-scan controls
-- background subtraction toggle applied coherently to color plot, `I-t`, and `CV`
+- selected `CV` plot at the chosen scan, preserving the full active waveform including custom repeated triangle cycles
+- constant FSCV waveform plot from the decoded active voltage waveform
+- numeric crosshair controls in plot headers using axis units: time in seconds and voltage in volts
+- direct axis editing by double-clicking visible plot min/max tick labels, typing a value, and pressing Return
+- phase-aligned background subtraction applied coherently to color plot, `I-t`, and `CV`
+- optional zero-phase Butterworth-style bandpass filter for the color plot, `I-t`, and `CV`
+- MATLAB-friendly CSV export for the color plot, selected-voltage `I-t`, and selected-time `CV`
+- single-phase plotting for files that contain repeated interleaved WaveNeuro waveform phases
 - synchronized vertical and horizontal crosshair lines across the plots
-- click-and-drag selection on the color plot
-- click-to-select from the `I-t` and `CV` plots
-- sequence-time vs experiment-time toggle
-- summary plus raw metadata panel
+- drag-to-move crosshair lines on the color plot, `I-t`, and `CV` plots
+- sequence-time plotting
+- color legend in nA for the overview color plot
 
 Performance notes:
 
 - file open and overview generation run off the main thread
-- the heatmap is decimated for display rather than rendered at full scan-count width
+- the heatmap is decimated for display rather than rendered at full scan-count width; display bins are balanced against repeated WaveNeuro template phases to avoid artificial column striping
 - the current-vs-time trace for the selected waveform point is extracted asynchronously
+- line plots render all visible samples when zoomed and use per-pixel min/max envelopes only for very dense ranges, so repeated scan phases are not hidden by stride aliasing
 - scan selection updates the CV immediately from the mmap-backed reader
 
 FSCV-specific interaction model:
 
 - the color plot is the primary overview surface
-- selecting a point in the color plot updates both the `I-t` and `CV` plots
-- selecting in the `I-t` plot moves the scan crosshair
-- selecting in the `CV` plot moves the waveform-point crosshair
-- the background scan can be chosen explicitly or set from the current selected scan
-- experiment time preserves inter-run gaps, while sequence time remains contiguous by scan index
+- dragging color-plot crosshair lines updates both the `I-t` and `CV` plots
+- dragging the `I-t` vertical crosshair moves the selected scan
+- dragging the `CV` vertical crosshair moves the waveform point
+- the waveform plot crosshair follows the selected waveform point; dragging its vertical line also moves the selected waveform point
+- the background scan can be chosen explicitly, dragged in the color plot and `I-t` plot, or set from the current selected scan
+- sequence time remains contiguous by scan index
+- plot subtitles use compact coordinates: color plot `[time ; voltage ; current]`, `I-t` `[time ; current]`, and `CV` `[voltage ; current]`
+- display ranges use robust percentile scaling so occasional phase/outlier points do not flatten the plots
+- the viewer preserves the full active voltage waveform reported by the parser, including custom repeated triangle cycles, and plots a single scan phase by default so `I-t` traces do not interleave multiple baseline families
+- when background subtraction is enabled, the visible background marker remains user-selected inside the active phase, and subtraction uses the nearest background scan with the same scan modulo waveform-count phase as the displayed scan; color plot overview columns average per-scan, phase-aligned subtraction rather than subtracting from a pre-averaged column
+- the `CV` plot keeps the full active waveform intact, including custom repeated triangle cycles; to reduce point jitter without cropping, it averages 3 same-phase scans around the selected time and, when background subtraction is on, 11 same-phase scans around the background time, then applies a narrow branch-preserving denoise along each waveform ramp
+- the waveform plot uses the active voltage axis decoded by the C reader; the current matrix remains stored for the active FSCV segment
+- editing the color-plot time bounds also updates the linked `I-t` time range, and editing the `I-t` time range updates the color-plot scan crop
+- the bandpass filter uses a zero-phase two-pole high-pass and low-pass cascade; for interleaved phase files it filters each phase family independently at that phase family's effective sampling rate
+- `Export Data` writes simple CSV files using the current plot processing state and active phase: color plot rows are `time_s,current_nA,voltage_V`, `I-t` rows are `time_s,current_nA` at the selected voltage crosshair, and `CV` rows are `voltage_V,current_nA` at the selected time crosshair
 
 ## Validation Workflow
 

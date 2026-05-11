@@ -3,29 +3,62 @@
 
 #include "hdcv_analysis.h"
 
+#include <ctype.h>
+#include <errno.h>
+#include <float.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
-
-typedef NS_ENUM(NSInteger, HDCVTimeAxisMode) {
-    HDCVTimeAxisModeSequence = 0,
-    HDCVTimeAxisModeExperiment = 1,
-};
 
 typedef NS_ENUM(NSInteger, HDCVLinePlotInteractionMode) {
     HDCVLinePlotInteractionModeNone = 0,
     HDCVLinePlotInteractionModeSelectX = 1,
 };
 
+typedef NS_ENUM(NSInteger, HDCVHeatmapDragTarget) {
+    HDCVHeatmapDragTargetNone = 0,
+    HDCVHeatmapDragTargetSelectionX = 1,
+    HDCVHeatmapDragTargetSelectionY = 2,
+    HDCVHeatmapDragTargetSelectionXY = 3,
+    HDCVHeatmapDragTargetBackgroundX = 4,
+};
+
+typedef NS_ENUM(NSInteger, HDCVLinePlotDragTarget) {
+    HDCVLinePlotDragTargetNone = 0,
+    HDCVLinePlotDragTargetSelectedX = 1,
+    HDCVLinePlotDragTargetBackgroundX = 2,
+};
+
+typedef NS_ENUM(NSInteger, HDCVAxisEditTarget) {
+    HDCVAxisEditTargetNone = 0,
+    HDCVAxisEditTargetXMin = 1,
+    HDCVAxisEditTargetXMax = 2,
+    HDCVAxisEditTargetYMin = 3,
+    HDCVAxisEditTargetYMax = 4,
+};
+
+typedef NS_OPTIONS(NSUInteger, HDCVExportOptions) {
+    HDCVExportOptionColorPlot = 1U << 0U,
+    HDCVExportOptionTimePlot = 1U << 1U,
+    HDCVExportOptionCVPlot = 1U << 2U,
+};
+
+static const NSUInteger HDCVCVSelectedHalfWindow = 1U;
+static const NSUInteger HDCVCVBackgroundHalfWindow = 5U;
+
 @class HDCVDropHostView;
 @class HDCVHeatmapView;
 @class HDCVLinePlotView;
+@class HDCVSwitchControl;
 
 @protocol HDCVDropHostViewDelegate <NSObject>
 - (void)dropHostView:(HDCVDropHostView *)view didReceiveFilePath:(NSString *)filePath;
 @end
 
 @protocol HDCVHeatmapViewDelegate <NSObject>
-- (void)heatmapView:(HDCVHeatmapView *)view didSelectScanIndex:(NSUInteger)scanIndex pointIndex:(NSUInteger)pointIndex;
+- (void)heatmapView:(HDCVHeatmapView *)view didDragSelectionScanIndex:(NSUInteger)scanIndex pointIndex:(NSUInteger)pointIndex updateScan:(BOOL)updateScan updatePoint:(BOOL)updatePoint;
+- (void)heatmapView:(HDCVHeatmapView *)view didDragBackgroundScanIndex:(NSUInteger)scanIndex;
+- (void)heatmapView:(HDCVHeatmapView *)view didEditAxisTarget:(HDCVAxisEditTarget)target value:(double)value;
 @end
 
 @protocol HDCVLinePlotDataSource <NSObject>
@@ -35,7 +68,8 @@ typedef NS_ENUM(NSInteger, HDCVLinePlotInteractionMode) {
 @end
 
 @protocol HDCVLinePlotViewDelegate <NSObject>
-- (void)linePlotView:(HDCVLinePlotView *)view didSelectXValue:(double)xValue;
+- (void)linePlotView:(HDCVLinePlotView *)view didDragXValue:(double)xValue yValue:(double)yValue target:(HDCVLinePlotDragTarget)target;
+- (void)linePlotView:(HDCVLinePlotView *)view didEditAxisTarget:(HDCVAxisEditTarget)target value:(double)value;
 @end
 
 @interface HDCVDropHostView : NSView <NSDraggingDestination>
@@ -43,7 +77,11 @@ typedef NS_ENUM(NSInteger, HDCVLinePlotInteractionMode) {
 @property(nonatomic) BOOL dragHighlight;
 @end
 
-@interface HDCVHeatmapView : NSView
+@interface HDCVSwitchControl : NSControl
+@property(nonatomic) BOOL on;
+@end
+
+@interface HDCVHeatmapView : NSView <NSTextFieldDelegate>
 @property(nonatomic, strong) NSImage *image;
 @property(nonatomic, strong) NSData *voltageData;
 @property(nonatomic, weak) id<HDCVHeatmapViewDelegate> delegate;
@@ -54,11 +92,16 @@ typedef NS_ENUM(NSInteger, HDCVLinePlotInteractionMode) {
 @property(nonatomic) NSUInteger scanCount;
 @property(nonatomic) NSUInteger selectedPointIndex;
 @property(nonatomic) NSUInteger pointCount;
+@property(nonatomic) NSUInteger visibleScanMinIndex;
+@property(nonatomic) NSUInteger visibleScanMaxIndex;
+@property(nonatomic) NSUInteger visiblePointMinIndex;
+@property(nonatomic) NSUInteger visiblePointMaxIndex;
 @property(nonatomic, copy) NSString *titleText;
 @property(nonatomic, copy) NSString *subtitleText;
+@property(nonatomic) double colorScaleMaxNA;
 @end
 
-@interface HDCVLinePlotView : NSView
+@interface HDCVLinePlotView : NSView <NSTextFieldDelegate>
 @property(nonatomic, weak) id<HDCVLinePlotDataSource> dataSource;
 @property(nonatomic, weak) id<HDCVLinePlotViewDelegate> delegate;
 @property(nonatomic) HDCVLinePlotInteractionMode interactionMode;
@@ -76,8 +119,10 @@ typedef NS_ENUM(NSInteger, HDCVLinePlotInteractionMode) {
 @property(nonatomic) double selectedXValue;
 @property(nonatomic) double selectedYValue;
 @property(nonatomic) double baselineYValue;
+@property(nonatomic) double backgroundXValue;
 @property(nonatomic) BOOL showsSelection;
 @property(nonatomic) BOOL showsBaseline;
+@property(nonatomic) BOOL showsBackgroundX;
 @end
 
 @interface HDCVLoadedFile : NSObject
@@ -91,6 +136,7 @@ typedef NS_ENUM(NSInteger, HDCVLinePlotInteractionMode) {
 - (double)cvfHz;
 - (double)scanIntervalSeconds;
 - (double)scanDurationSeconds;
+- (uint32_t)phasePeriod;
 - (uint32_t)runCount;
 - (uint32_t)scansPerRun;
 - (BOOL)hasExperimentTiming;
@@ -100,14 +146,16 @@ typedef NS_ENUM(NSInteger, HDCVLinePlotInteractionMode) {
 - (double)withinScanTimeSecondsAtPoint:(NSUInteger)pointIndex;
 - (double)sequenceTimeSecondsAtScan:(NSUInteger)scanIndex;
 - (double)experimentTimeSecondsAtScan:(NSUInteger)scanIndex;
+- (uint32_t)waveformPointCount;
+- (double)waveformCycleDurationSeconds;
 - (NSData *)voltageData;
+- (NSData *)waveformData;
 - (NSData *)overviewData;
-- (NSString *)summaryAndMetadataText;
 - (BOOL)copyScanAtIndex:(uint32_t)scanIndex intoMutableData:(NSMutableData *)buffer min:(float *)outMin max:(float *)outMax;
 - (BOOL)copyPointTraceAtIndex:(uint32_t)pointIndex intoMutableData:(NSMutableData *)buffer min:(float *)outMin max:(float *)outMax;
 @end
 
-@interface HDCVViewerController : NSObject <NSApplicationDelegate, HDCVDropHostViewDelegate, HDCVHeatmapViewDelegate, HDCVLinePlotDataSource, HDCVLinePlotViewDelegate>
+@interface HDCVViewerController : NSObject <NSApplicationDelegate, NSTextFieldDelegate, HDCVDropHostViewDelegate, HDCVHeatmapViewDelegate, HDCVLinePlotDataSource, HDCVLinePlotViewDelegate>
 - (void)setInitialPathFromArguments:(NSArray<NSString *> *)arguments;
 @end
 
@@ -168,6 +216,40 @@ static NSColor *HDCVSoftGridColor(void)
     return [NSColor colorWithWhite:0.88 alpha:1.0];
 }
 
+static void HDCVHeatmapRGBForNormalized(float normalized, float *outR, float *outG, float *outB)
+{
+    float t = (MAX(-1.0f, MIN(1.0f, normalized)) + 1.0f) * 0.5f;
+    float r;
+    float g;
+    float b;
+
+    if (t < 0.25f) {
+        float local = t / 0.25f;
+        r = 0.04f + local * 0.06f;
+        g = 0.12f + local * 0.36f;
+        b = 0.28f + local * 0.52f;
+    } else if (t < 0.5f) {
+        float local = (t - 0.25f) / 0.25f;
+        r = 0.10f + local * 0.08f;
+        g = 0.48f + local * 0.36f;
+        b = 0.80f - local * 0.40f;
+    } else if (t < 0.75f) {
+        float local = (t - 0.5f) / 0.25f;
+        r = 0.18f + local * 0.55f;
+        g = 0.84f + local * 0.07f;
+        b = 0.40f - local * 0.24f;
+    } else {
+        float local = (t - 0.75f) / 0.25f;
+        r = 0.73f + local * 0.22f;
+        g = 0.91f - local * 0.56f;
+        b = 0.16f - local * 0.08f;
+    }
+
+    *outR = r;
+    *outG = g;
+    *outB = b;
+}
+
 static NSView *HDCVPanelContainer(void)
 {
     NSView *view = [[NSView alloc] initWithFrame:NSZeroRect];
@@ -190,26 +272,6 @@ static NSTextField *HDCVLabel(NSString *string, NSFont *font, NSColor *color)
     return label;
 }
 
-static NSString *HDCVSafeStringFromBytes(const char *bytes, size_t length)
-{
-    NSString *string;
-    NSData *data;
-
-    if (bytes == NULL || length == 0U) {
-        return @"";
-    }
-
-    data = [NSData dataWithBytes:bytes length:length];
-    string = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (string == nil) {
-        string = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
-    }
-    if (string == nil) {
-        string = [[NSString alloc] initWithData:data encoding:NSWindowsCP1252StringEncoding];
-    }
-    return (string != nil) ? string : @"";
-}
-
 static void HDCVExpandRange(double *minValue, double *maxValue)
 {
     double range = *maxValue - *minValue;
@@ -222,6 +284,663 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         *minValue -= padding;
         *maxValue += padding;
     }
+}
+
+static BOOL HDCVParseLeadingDouble(NSString *string, double *outValue)
+{
+    const char *text = string.UTF8String;
+    char *endptr = NULL;
+    double parsed;
+
+    if (text == NULL) {
+        return NO;
+    }
+    parsed = strtod(text, &endptr);
+    if (endptr == text || !isfinite(parsed)) {
+        return NO;
+    }
+    if (outValue != NULL) {
+        *outValue = parsed;
+    }
+    return YES;
+}
+
+static NSUInteger HDCVPhaseAlignedBackgroundIndex(
+    NSUInteger rawBackgroundIndex,
+    NSUInteger scanIndex,
+    NSUInteger scanCount,
+    NSUInteger phasePeriod
+)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger rawIndex;
+    NSUInteger targetMod;
+    double nearestPeriod;
+    NSInteger nearest;
+    NSInteger maxScan;
+
+    if (scanCount == 0U) {
+        return 0U;
+    }
+
+    rawIndex = MIN(rawBackgroundIndex, scanCount - 1U);
+    if (period <= 1U) {
+        return rawIndex;
+    }
+
+    targetMod = scanIndex % period;
+    nearestPeriod = round(((double)rawIndex - (double)targetMod) / (double)period);
+    nearest = (NSInteger)targetMod + (NSInteger)llround(nearestPeriod) * (NSInteger)period;
+    maxScan = (NSInteger)scanCount - 1;
+    nearest = MAX(0, MIN(maxScan, nearest));
+
+    while ((NSUInteger)nearest > scanIndex && nearest - (NSInteger)period >= 0) {
+        nearest -= (NSInteger)period;
+    }
+    return (NSUInteger)MAX(0, MIN(maxScan, nearest));
+}
+
+static BOOL HDCVScanIndexMatchesPhase(NSUInteger scanIndex, NSUInteger phaseIndex, NSUInteger phasePeriod)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    return period <= 1U || (scanIndex % period) == (phaseIndex % period);
+}
+
+static NSUInteger HDCVNearestScanIndexForPhase(
+    NSUInteger scanIndex,
+    NSUInteger scanCount,
+    NSUInteger phaseIndex,
+    NSUInteger phasePeriod
+)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger targetPhase = phaseIndex % period;
+    NSInteger candidate;
+    NSInteger maxScan;
+
+    if (scanCount == 0U) {
+        return 0U;
+    }
+    if (period <= 1U || scanCount <= 1U) {
+        return MIN(scanIndex, scanCount - 1U);
+    }
+    if (targetPhase >= scanCount) {
+        targetPhase = 0U;
+    }
+
+    candidate = (NSInteger)targetPhase + (NSInteger)llround(((double)scanIndex - (double)targetPhase) / (double)period) * (NSInteger)period;
+    maxScan = (NSInteger)scanCount - 1;
+    while (candidate < 0) {
+        candidate += (NSInteger)period;
+    }
+    while (candidate > maxScan) {
+        candidate -= (NSInteger)period;
+    }
+    return (NSUInteger)MAX(0, MIN(maxScan, candidate));
+}
+
+static NSUInteger HDCVScanIndexForPhaseSample(
+    NSUInteger sampleIndex,
+    NSUInteger scanCount,
+    NSUInteger phaseIndex,
+    NSUInteger phasePeriod
+)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger scanIndex;
+
+    if (scanCount == 0U) {
+        return 0U;
+    }
+    if (period <= 1U) {
+        return MIN(sampleIndex, scanCount - 1U);
+    }
+    scanIndex = (phaseIndex % period) + (sampleIndex * period);
+    return MIN(scanIndex, scanCount - 1U);
+}
+
+static NSUInteger HDCVPhaseSampleCount(NSUInteger scanCount, NSUInteger phaseIndex, NSUInteger phasePeriod)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger firstScan = phaseIndex % period;
+
+    if (scanCount == 0U) {
+        return 0U;
+    }
+    if (period <= 1U) {
+        return scanCount;
+    }
+    if (firstScan >= scanCount) {
+        return 0U;
+    }
+    return ((scanCount - 1U - firstScan) / period) + 1U;
+}
+
+static NSUInteger HDCVFirstPhaseScanInRange(
+    NSUInteger minScan,
+    NSUInteger maxScan,
+    NSUInteger phaseIndex,
+    NSUInteger phasePeriod
+)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger targetPhase = phaseIndex % period;
+    NSUInteger remainder;
+    NSUInteger delta;
+
+    if (maxScan < minScan) {
+        return NSNotFound;
+    }
+    if (period <= 1U) {
+        return minScan;
+    }
+    remainder = minScan % period;
+    delta = (targetPhase + period - remainder) % period;
+    if (minScan + delta > maxScan) {
+        return NSNotFound;
+    }
+    return minScan + delta;
+}
+
+static NSUInteger HDCVPhaseSampleCountInRange(
+    NSUInteger minScan,
+    NSUInteger maxScan,
+    NSUInteger phaseIndex,
+    NSUInteger phasePeriod
+)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger firstScan = HDCVFirstPhaseScanInRange(minScan, maxScan, phaseIndex, period);
+
+    if (firstScan == NSNotFound) {
+        return 0U;
+    }
+    if (period <= 1U) {
+        return maxScan - firstScan + 1U;
+    }
+    return ((maxScan - firstScan) / period) + 1U;
+}
+
+static float HDCVAverageTraceInPhaseWindow(
+    const float *trace,
+    NSUInteger scanCount,
+    NSUInteger centerScan,
+    NSUInteger phaseIndex,
+    NSUInteger phasePeriod,
+    NSUInteger halfWindow
+)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger center = HDCVNearestScanIndexForPhase(centerScan, scanCount, phaseIndex, period);
+    NSInteger start = (NSInteger)center - ((NSInteger)halfWindow * (NSInteger)period);
+    NSInteger end = (NSInteger)center + ((NSInteger)halfWindow * (NSInteger)period);
+    double sum = 0.0;
+    NSUInteger count = 0U;
+
+    if (scanCount == 0U) {
+        return 0.0f;
+    }
+
+    while (start < 0) {
+        start += (NSInteger)period;
+    }
+    while (end >= (NSInteger)scanCount) {
+        end -= (NSInteger)period;
+    }
+
+    for (NSInteger scanIndex = start; scanIndex <= end; scanIndex += (NSInteger)period) {
+        if (scanIndex >= 0 && scanIndex < (NSInteger)scanCount) {
+            sum += (double)trace[scanIndex];
+            count += 1U;
+        }
+    }
+
+    if (count == 0U) {
+        return trace[center];
+    }
+    return (float)(sum / (double)count);
+}
+
+static void HDCVApplyPhaseAlignedBackgroundToTrace(
+    const float *source,
+    float *destination,
+    NSUInteger scanCount,
+    NSUInteger rawBackgroundIndex,
+    NSUInteger phasePeriod
+)
+{
+    for (NSUInteger scanIndex = 0U; scanIndex < scanCount; ++scanIndex) {
+        NSUInteger alignedIndex = HDCVPhaseAlignedBackgroundIndex(rawBackgroundIndex, scanIndex, scanCount, phasePeriod);
+        destination[scanIndex] = source[scanIndex] - source[alignedIndex];
+    }
+}
+
+static void HDCVSetCSVError(NSError **error, NSURL *url, NSString *message)
+{
+    if (error == NULL) {
+        return;
+    }
+    *error = [NSError errorWithDomain:HDCVViewerErrorDomain
+                                 code:11
+                             userInfo:@{
+                                 NSLocalizedDescriptionKey: message,
+                                 NSURLErrorKey: url
+                             }];
+}
+
+static FILE *HDCVOpenCSVFile(NSURL *url, NSError **error)
+{
+    FILE *file = fopen(url.path.fileSystemRepresentation, "w");
+    if (file == NULL) {
+        NSString *message = [NSString stringWithFormat:@"Could not create %@: %s", url.lastPathComponent, strerror(errno)];
+        HDCVSetCSVError(error, url, message);
+        return NULL;
+    }
+    (void)setvbuf(file, NULL, _IOFBF, 1024U * 1024U);
+    return file;
+}
+
+static BOOL HDCVCloseCSVFile(FILE *file, NSURL *url, NSError **error)
+{
+    int hadWriteError = ferror(file);
+    int closeResult = fclose(file);
+    if (hadWriteError != 0 || closeResult != 0) {
+        NSString *message = [NSString stringWithFormat:@"Could not finish writing %@: %s", url.lastPathComponent, strerror(errno)];
+        HDCVSetCSVError(error, url, message);
+        return NO;
+    }
+    return YES;
+}
+
+static NSURL *HDCVExportURLForSuffix(NSURL *baseURL, NSString *suffix, BOOL singleFile)
+{
+    if (singleFile) {
+        return baseURL;
+    }
+
+    NSURL *directoryURL = [baseURL URLByDeletingLastPathComponent];
+    NSString *baseName = baseURL.lastPathComponent.stringByDeletingPathExtension;
+    if (baseName.length == 0U) {
+        baseName = @"hdcv_export";
+    }
+    return [directoryURL URLByAppendingPathComponent:[NSString stringWithFormat:@"%@_%@.csv", baseName, suffix]];
+}
+
+typedef struct {
+    double b0;
+    double b1;
+    double b2;
+    double a1;
+    double a2;
+} HDCVBiquad;
+
+static HDCVBiquad HDCVButterworthLowpass(double cutoffHz, double sampleRateHz)
+{
+    double k = tan(M_PI * cutoffHz / sampleRateHz);
+    double norm = 1.0 / (1.0 + (M_SQRT2 * k) + (k * k));
+    HDCVBiquad c;
+    c.b0 = k * k * norm;
+    c.b1 = 2.0 * c.b0;
+    c.b2 = c.b0;
+    c.a1 = 2.0 * ((k * k) - 1.0) * norm;
+    c.a2 = (1.0 - (M_SQRT2 * k) + (k * k)) * norm;
+    return c;
+}
+
+static HDCVBiquad HDCVButterworthHighpass(double cutoffHz, double sampleRateHz)
+{
+    double k = tan(M_PI * cutoffHz / sampleRateHz);
+    double norm = 1.0 / (1.0 + (M_SQRT2 * k) + (k * k));
+    HDCVBiquad c;
+    c.b0 = norm;
+    c.b1 = -2.0 * c.b0;
+    c.b2 = c.b0;
+    c.a1 = 2.0 * ((k * k) - 1.0) * norm;
+    c.a2 = (1.0 - (M_SQRT2 * k) + (k * k)) * norm;
+    return c;
+}
+
+static void HDCVApplyBiquadForward(const float *src, float *dst, size_t count, HDCVBiquad c)
+{
+    double x1 = 0.0;
+    double x2 = 0.0;
+    double y1 = 0.0;
+    double y2 = 0.0;
+
+    for (size_t i = 0U; i < count; ++i) {
+        double x0 = (double)src[i];
+        double y0 = (c.b0 * x0) + (c.b1 * x1) + (c.b2 * x2) - (c.a1 * y1) - (c.a2 * y2);
+        dst[i] = (float)y0;
+        x2 = x1;
+        x1 = x0;
+        y2 = y1;
+        y1 = y0;
+    }
+}
+
+static void HDCVReverseFloatArray(float *values, size_t count)
+{
+    for (size_t i = 0U; i < count / 2U; ++i) {
+        float tmp = values[i];
+        values[i] = values[count - 1U - i];
+        values[count - 1U - i] = tmp;
+    }
+}
+
+static void HDCVApplyBiquadZeroPhase(float *values, float *scratch, size_t count, HDCVBiquad c)
+{
+    HDCVApplyBiquadForward(values, scratch, count, c);
+    HDCVReverseFloatArray(scratch, count);
+    HDCVApplyBiquadForward(scratch, values, count, c);
+    HDCVReverseFloatArray(values, count);
+}
+
+static BOOL HDCVApplyButterworthBandpass(float *values, size_t count, double sampleRateHz)
+{
+    double nyquist = sampleRateHz * 0.5;
+    double lowHz = 0.01;
+    double highHz = MIN(2.0, nyquist * 0.80);
+    float *scratch;
+
+    if (count < 8U || sampleRateHz <= 0.0 || highHz <= lowHz) {
+        return NO;
+    }
+
+    scratch = (float *)malloc(count * sizeof(*scratch));
+    if (scratch == NULL) {
+        return NO;
+    }
+
+    HDCVApplyBiquadZeroPhase(values, scratch, count, HDCVButterworthHighpass(lowHz, sampleRateHz));
+    HDCVApplyBiquadZeroPhase(values, scratch, count, HDCVButterworthLowpass(highHz, sampleRateHz));
+    free(scratch);
+    return YES;
+}
+
+static int HDCVCompareFloat(const void *a, const void *b)
+{
+    float fa = *(const float *)a;
+    float fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static float HDCVRobustAbsScale(const float *values, size_t count)
+{
+    size_t stride = MAX((size_t)1U, count / 65536U);
+    size_t sampleCapacity = (count + stride - 1U) / stride;
+    float *samples = (float *)malloc(sampleCapacity * sizeof(*samples));
+    size_t sampleCount = 0U;
+    float scale;
+
+    if (samples == NULL) {
+        return 1.0f;
+    }
+
+    for (size_t i = 0U; i < count; i += stride) {
+        float value = values[i];
+        if (isfinite(value)) {
+            samples[sampleCount++] = fabsf(value);
+        }
+    }
+
+    if (sampleCount == 0U) {
+        free(samples);
+        return 1.0f;
+    }
+
+    qsort(samples, sampleCount, sizeof(*samples), HDCVCompareFloat);
+    scale = samples[(size_t)floor((double)(sampleCount - 1U) * 0.99)];
+    free(samples);
+    return MAX(scale, 1.0e-6f);
+}
+
+static int HDCVVoltageStepDirection(float previous, float current, float epsilon)
+{
+    float delta = current - previous;
+    if (delta > epsilon) {
+        return 1;
+    }
+    if (delta < -epsilon) {
+        return -1;
+    }
+    return 0;
+}
+
+static void HDCVSmoothCVSegment(
+    const float *source,
+    float *destination,
+    NSUInteger startIndex,
+    NSUInteger endIndex,
+    NSUInteger radius
+)
+{
+    if (endIndex <= startIndex) {
+        return;
+    }
+
+    for (NSUInteger index = startIndex; index < endIndex; ++index) {
+        NSUInteger left = (index > startIndex + radius) ? index - radius : startIndex;
+        NSUInteger right = MIN(endIndex - 1U, index + radius);
+        double sum = 0.0;
+        double weightSum = 0.0;
+
+        for (NSUInteger neighbor = left; neighbor <= right; ++neighbor) {
+            NSUInteger distance = (neighbor > index) ? neighbor - index : index - neighbor;
+            double weight = (double)(radius + 1U - distance);
+            sum += (double)source[neighbor] * weight;
+            weightSum += weight;
+        }
+
+        destination[index] = (weightSum > 0.0) ? (float)(sum / weightSum) : source[index];
+    }
+}
+
+static void HDCVApplyBackgroundSubtractedCVDenoise(float *values, const float *voltage, NSUInteger count)
+{
+    static const NSUInteger radius = 2U;
+    float *source;
+    float voltageMin;
+    float voltageMax;
+    float epsilon;
+    NSUInteger segmentStart;
+    int segmentDirection;
+
+    if (values == NULL || voltage == NULL || count < ((radius * 2U) + 3U)) {
+        return;
+    }
+
+    source = (float *)malloc((size_t)count * sizeof(*source));
+    if (source == NULL) {
+        return;
+    }
+    memcpy(source, values, (size_t)count * sizeof(*source));
+
+    voltageMin = voltage[0];
+    voltageMax = voltage[0];
+    for (NSUInteger index = 1U; index < count; ++index) {
+        voltageMin = MIN(voltageMin, voltage[index]);
+        voltageMax = MAX(voltageMax, voltage[index]);
+    }
+    epsilon = MAX(1.0e-6f, (voltageMax - voltageMin) * 1.0e-5f);
+
+    segmentStart = 0U;
+    segmentDirection = 0;
+    for (NSUInteger index = 1U; index < count; ++index) {
+        int direction = HDCVVoltageStepDirection(voltage[index - 1U], voltage[index], epsilon);
+        if (direction == 0) {
+            continue;
+        }
+        if (segmentDirection != 0 && direction != segmentDirection && index > segmentStart + (radius * 2U)) {
+            HDCVSmoothCVSegment(source, values, segmentStart, index, radius);
+            segmentStart = index - 1U;
+        }
+        segmentDirection = direction;
+    }
+    HDCVSmoothCVSegment(source, values, segmentStart, count, radius);
+
+    free(source);
+}
+
+static void HDCVRobustRange(const float *values, size_t count, float *outMin, float *outMax)
+{
+    size_t stride = MAX((size_t)1U, count / 65536U);
+    size_t sampleCapacity = (count + stride - 1U) / stride;
+    float *samples = (float *)malloc(sampleCapacity * sizeof(*samples));
+    size_t sampleCount = 0U;
+    float minValue = 0.0f;
+    float maxValue = 0.0f;
+
+    if (samples == NULL || count == 0U) {
+        free(samples);
+        if (outMin != NULL) {
+            *outMin = 0.0f;
+        }
+        if (outMax != NULL) {
+            *outMax = 1.0f;
+        }
+        return;
+    }
+
+    for (size_t i = 0U; i < count; i += stride) {
+        float value = values[i];
+        if (isfinite(value)) {
+            samples[sampleCount++] = value;
+        }
+    }
+
+    if (sampleCount == 0U) {
+        free(samples);
+        if (outMin != NULL) {
+            *outMin = 0.0f;
+        }
+        if (outMax != NULL) {
+            *outMax = 1.0f;
+        }
+        return;
+    }
+
+    qsort(samples, sampleCount, sizeof(*samples), HDCVCompareFloat);
+    minValue = samples[(size_t)floor((double)(sampleCount - 1U) * 0.01)];
+    maxValue = samples[(size_t)floor((double)(sampleCount - 1U) * 0.99)];
+    if (maxValue <= minValue) {
+        minValue = samples[0];
+        maxValue = samples[sampleCount - 1U];
+    }
+    free(samples);
+
+    if (outMin != NULL) {
+        *outMin = minValue;
+    }
+    if (outMax != NULL) {
+        *outMax = maxValue;
+    }
+}
+
+static void HDCVRobustRangeForPhase(
+    const float *values,
+    size_t count,
+    NSUInteger phaseIndex,
+    NSUInteger phasePeriod,
+    float *outMin,
+    float *outMax
+)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger phase = phaseIndex % period;
+    size_t phaseCount;
+    float *samples;
+    size_t sampleCount = 0U;
+    float minValue;
+    float maxValue;
+
+    if (period <= 1U) {
+        HDCVRobustRange(values, count, outMin, outMax);
+        return;
+    }
+
+    phaseCount = HDCVPhaseSampleCount(count, phase, period);
+    samples = (float *)malloc(MAX((size_t)1U, phaseCount) * sizeof(*samples));
+    if (samples == NULL || phaseCount == 0U) {
+        free(samples);
+        if (outMin != NULL) {
+            *outMin = 0.0f;
+        }
+        if (outMax != NULL) {
+            *outMax = 1.0f;
+        }
+        return;
+    }
+
+    for (NSUInteger scanIndex = phase; scanIndex < count; scanIndex += period) {
+        float value = values[scanIndex];
+        if (isfinite(value)) {
+            samples[sampleCount++] = value;
+        }
+    }
+
+    if (sampleCount == 0U) {
+        free(samples);
+        if (outMin != NULL) {
+            *outMin = 0.0f;
+        }
+        if (outMax != NULL) {
+            *outMax = 1.0f;
+        }
+        return;
+    }
+
+    qsort(samples, sampleCount, sizeof(*samples), HDCVCompareFloat);
+    minValue = samples[(size_t)floor((double)(sampleCount - 1U) * 0.01)];
+    maxValue = samples[(size_t)floor((double)(sampleCount - 1U) * 0.99)];
+    if (maxValue <= minValue) {
+        minValue = samples[0];
+        maxValue = samples[sampleCount - 1U];
+    }
+    free(samples);
+
+    if (outMin != NULL) {
+        *outMin = minValue;
+    }
+    if (outMax != NULL) {
+        *outMax = maxValue;
+    }
+}
+
+static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSUInteger phasePeriod, double scanRateHz)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    BOOL filtered = NO;
+
+    if (period <= 1U) {
+        return HDCVApplyButterworthBandpass(values, count, scanRateHz);
+    }
+
+    for (NSUInteger phase = 0U; phase < period; ++phase) {
+        NSUInteger phaseCount = HDCVPhaseSampleCount(count, phase, period);
+        NSMutableData *phaseData;
+        float *phaseValues;
+        NSUInteger j = 0U;
+
+        if (phaseCount == 0U) {
+            continue;
+        }
+
+        phaseData = [NSMutableData dataWithLength:phaseCount * sizeof(float)];
+        phaseValues = phaseData.mutableBytes;
+        for (NSUInteger scanIndex = phase; scanIndex < count; scanIndex += period) {
+            phaseValues[j++] = values[scanIndex];
+        }
+
+        if (HDCVApplyButterworthBandpass(phaseValues, phaseCount, scanRateHz / (double)period)) {
+            j = 0U;
+            for (NSUInteger scanIndex = phase; scanIndex < count; scanIndex += period) {
+                values[scanIndex] = phaseValues[j++];
+            }
+            filtered = YES;
+        }
+    }
+
+    return filtered;
 }
 
 @implementation HDCVDropHostView
@@ -304,15 +1023,108 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 
 @end
 
-@implementation HDCVHeatmapView
+@implementation HDCVSwitchControl
+
+- (instancetype)initWithFrame:(NSRect)frameRect
+{
+    self = [super initWithFrame:frameRect];
+    if (self != nil) {
+        self.wantsLayer = YES;
+        self.enabled = NO;
+    }
+    return self;
+}
+
+- (BOOL)isFlipped
+{
+    return YES;
+}
+
+- (NSSize)intrinsicContentSize
+{
+    return NSMakeSize(48.0, 28.0);
+}
+
+- (void)setOn:(BOOL)on
+{
+    _on = on;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setEnabled:(BOOL)enabled
+{
+    [super setEnabled:enabled];
+    [self setNeedsDisplay:YES];
+}
+
+- (void)drawRect:(NSRect)dirtyRect
+{
+    (void)dirtyRect;
+    NSRect bounds = NSInsetRect(self.bounds, 2.0, 2.0);
+    CGFloat knobDiameter = MAX(18.0, bounds.size.height - 4.0);
+    CGFloat knobX = self.on ? (NSMaxX(bounds) - knobDiameter - 2.0) : (bounds.origin.x + 2.0);
+    NSColor *trackColor = self.on ? HDCVAccentBlue() : [NSColor colorWithWhite:0.78 alpha:1.0];
+    NSColor *knobColor = self.enabled ? NSColor.whiteColor : [NSColor colorWithWhite:0.92 alpha:1.0];
+
+    if (!self.enabled) {
+        trackColor = [trackColor colorWithAlphaComponent:0.45];
+    }
+
+    [trackColor setFill];
+    NSBezierPath *track = [NSBezierPath bezierPathWithRoundedRect:bounds
+                                                         xRadius:bounds.size.height * 0.5
+                                                         yRadius:bounds.size.height * 0.5];
+    [track fill];
+
+    NSRect knobRect = NSMakeRect(knobX, bounds.origin.y + 2.0, knobDiameter, knobDiameter);
+    [knobColor setFill];
+    NSBezierPath *knob = [NSBezierPath bezierPathWithOvalInRect:knobRect];
+    [knob fill];
+
+    [[[NSColor blackColor] colorWithAlphaComponent:0.11] setStroke];
+    knob.lineWidth = 0.5;
+    [knob stroke];
+}
+
+- (void)mouseDown:(NSEvent *)event
+{
+    (void)event;
+    if (!self.enabled) {
+        return;
+    }
+    self.on = !self.on;
+    [self sendAction:self.action to:self.target];
+}
+
+- (void)resetCursorRects
+{
+    if (self.enabled) {
+        [self addCursorRect:self.bounds cursor:NSCursor.pointingHandCursor];
+    }
+}
+
+@end
+
+@implementation HDCVHeatmapView {
+    HDCVHeatmapDragTarget _activeDragTarget;
+    HDCVAxisEditTarget _activeAxisEditTarget;
+    NSTextField *_axisEditor;
+    NSTrackingArea *_trackingArea;
+}
 
 - (instancetype)initWithFrame:(NSRect)frameRect
 {
     self = [super initWithFrame:frameRect];
     if (self != nil) {
         _titleText = @"Color Plot";
-        _subtitleText = @"Raw Current";
+        _subtitleText = @"No file loaded";
         _backgroundScanIndex = NSNotFound;
+        _colorScaleMaxNA = 1.0;
+        _visibleScanMinIndex = 0U;
+        _visibleScanMaxIndex = NSNotFound;
+        _visiblePointMinIndex = 0U;
+        _visiblePointMaxIndex = NSNotFound;
+        _activeDragTarget = HDCVHeatmapDragTargetNone;
         self.wantsLayer = YES;
         self.layer.backgroundColor = NSColor.whiteColor.CGColor;
     }
@@ -324,9 +1136,14 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     return YES;
 }
 
+- (BOOL)acceptsFirstResponder
+{
+    return YES;
+}
+
 - (NSRect)plotRect
 {
-    return NSMakeRect(66.0, 46.0, MAX(40.0, self.bounds.size.width - 90.0), MAX(40.0, self.bounds.size.height - 82.0));
+    return NSMakeRect(66.0, 76.0, MAX(40.0, self.bounds.size.width - 138.0), MAX(40.0, self.bounds.size.height - 112.0));
 }
 
 - (NSDictionary<NSAttributedStringKey, id> *)labelAttributesWithColor:(NSColor *)color size:(CGFloat)size weight:(NSFontWeight)weight
@@ -361,6 +1178,30 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     [self setNeedsDisplay:YES];
 }
 
+- (void)setVisibleScanMinIndex:(NSUInteger)visibleScanMinIndex
+{
+    _visibleScanMinIndex = visibleScanMinIndex;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setVisibleScanMaxIndex:(NSUInteger)visibleScanMaxIndex
+{
+    _visibleScanMaxIndex = visibleScanMaxIndex;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setVisiblePointMinIndex:(NSUInteger)visiblePointMinIndex
+{
+    _visiblePointMinIndex = visiblePointMinIndex;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setVisiblePointMaxIndex:(NSUInteger)visiblePointMaxIndex
+{
+    _visiblePointMaxIndex = visiblePointMaxIndex;
+    [self setNeedsDisplay:YES];
+}
+
 - (void)setXTickLabels:(NSArray<NSString *> *)xTickLabels
 {
     _xTickLabels = [xTickLabels copy];
@@ -377,6 +1218,304 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 {
     _subtitleText = [subtitleText copy];
     [self setNeedsDisplay:YES];
+}
+
+- (void)setColorScaleMaxNA:(double)colorScaleMaxNA
+{
+    _colorScaleMaxNA = colorScaleMaxNA;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)updateTrackingAreas
+{
+    [super updateTrackingAreas];
+    if (_trackingArea != nil) {
+        [self removeTrackingArea:_trackingArea];
+    }
+    _trackingArea = [[NSTrackingArea alloc] initWithRect:NSZeroRect
+                                                 options:(NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect)
+                                                   owner:self
+                                                userInfo:nil];
+    [self addTrackingArea:_trackingArea];
+}
+
+- (CGFloat)xPositionForScanIndex:(NSUInteger)scanIndex inPlotRect:(NSRect)plotRect
+{
+    NSUInteger minScan = [self normalizedVisibleScanMin];
+    NSUInteger maxScan = [self normalizedVisibleScanMax];
+    CGFloat fraction = (maxScan > minScan) ? (CGFloat)((double)scanIndex - (double)minScan) / (CGFloat)(maxScan - minScan) : 0.0;
+    return plotRect.origin.x + (fraction * plotRect.size.width);
+}
+
+- (CGFloat)yPositionForPointIndex:(NSUInteger)pointIndex inPlotRect:(NSRect)plotRect
+{
+    NSUInteger minPoint = [self normalizedVisiblePointMin];
+    NSUInteger maxPoint = [self normalizedVisiblePointMax];
+    CGFloat fraction = (maxPoint > minPoint) ? (CGFloat)((double)pointIndex - (double)minPoint) / (CGFloat)(maxPoint - minPoint) : 0.0;
+    return plotRect.origin.y + plotRect.size.height - (fraction * plotRect.size.height);
+}
+
+- (NSUInteger)normalizedVisibleScanMin
+{
+    if (self.scanCount == 0U) {
+        return 0U;
+    }
+    return MIN(self.visibleScanMinIndex, self.scanCount - 1U);
+}
+
+- (NSUInteger)normalizedVisibleScanMax
+{
+    if (self.scanCount == 0U) {
+        return 0U;
+    }
+    NSUInteger fallback = self.scanCount - 1U;
+    NSUInteger maxScan = (self.visibleScanMaxIndex == NSNotFound) ? fallback : MIN(self.visibleScanMaxIndex, fallback);
+    NSUInteger minScan = [self normalizedVisibleScanMin];
+    return MAX(maxScan, minScan + (minScan < fallback ? 1U : 0U));
+}
+
+- (NSUInteger)normalizedVisiblePointMin
+{
+    if (self.pointCount == 0U) {
+        return 0U;
+    }
+    return MIN(self.visiblePointMinIndex, self.pointCount - 1U);
+}
+
+- (NSUInteger)normalizedVisiblePointMax
+{
+    if (self.pointCount == 0U) {
+        return 0U;
+    }
+    NSUInteger fallback = self.pointCount - 1U;
+    NSUInteger maxPoint = (self.visiblePointMaxIndex == NSNotFound) ? fallback : MIN(self.visiblePointMaxIndex, fallback);
+    NSUInteger minPoint = [self normalizedVisiblePointMin];
+    return MAX(maxPoint, minPoint + (minPoint < fallback ? 1U : 0U));
+}
+
+- (BOOL)scanIndex:(NSUInteger *)outScanIndex pointIndex:(NSUInteger *)outPointIndex fromPoint:(NSPoint)point
+{
+    NSRect plotRect = [self plotRect];
+    if (!NSPointInRect(point, plotRect) || self.scanCount == 0U || self.pointCount == 0U) {
+        return NO;
+    }
+
+    NSUInteger minScan = [self normalizedVisibleScanMin];
+    NSUInteger maxScan = [self normalizedVisibleScanMax];
+    NSUInteger minPoint = [self normalizedVisiblePointMin];
+    NSUInteger maxPoint = [self normalizedVisiblePointMax];
+    CGFloat xFraction = (point.x - plotRect.origin.x) / plotRect.size.width;
+    CGFloat yFraction = 1.0 - ((point.y - plotRect.origin.y) / plotRect.size.height);
+    if (outScanIndex != NULL) {
+        *outScanIndex = minScan + (NSUInteger)llround(MAX(0.0, MIN(1.0, xFraction)) * (double)(maxScan - minScan));
+    }
+    if (outPointIndex != NULL) {
+        *outPointIndex = minPoint + (NSUInteger)llround(MAX(0.0, MIN(1.0, yFraction)) * (double)(maxPoint - minPoint));
+    }
+    return YES;
+}
+
+- (NSString *)axisEditStringForTarget:(HDCVAxisEditTarget)target
+{
+    NSUInteger minPoint = [self normalizedVisiblePointMin];
+    NSUInteger maxPoint = [self normalizedVisiblePointMax];
+    const float *voltage = self.voltageData.bytes;
+
+    if (target == HDCVAxisEditTargetXMin && self.xTickLabels.count > 0U) {
+        return self.xTickLabels.firstObject;
+    }
+    if (target == HDCVAxisEditTargetXMax && self.xTickLabels.count > 0U) {
+        return self.xTickLabels.lastObject;
+    }
+    if (self.voltageData.length >= self.pointCount * sizeof(float) && self.pointCount > 0U) {
+        if (target == HDCVAxisEditTargetYMin) {
+            return [NSString stringWithFormat:@"%.3f V", voltage[minPoint]];
+        }
+        if (target == HDCVAxisEditTargetYMax) {
+            return [NSString stringWithFormat:@"%.3f V", voltage[maxPoint]];
+        }
+    }
+    return @"0";
+}
+
+- (NSRect)axisEditRectForTarget:(HDCVAxisEditTarget)target
+                       plotRect:(NSRect)plotRect
+                     attributes:(NSDictionary<NSAttributedStringKey, id> *)attributes
+{
+    NSString *label = [self axisEditStringForTarget:target];
+    NSSize size = [label sizeWithAttributes:attributes];
+
+    if ((target == HDCVAxisEditTargetXMin || target == HDCVAxisEditTargetXMax) &&
+        self.xTickFractions.count > 0U) {
+        CGFloat fraction = (target == HDCVAxisEditTargetXMin)
+            ? self.xTickFractions.firstObject.doubleValue
+            : self.xTickFractions.lastObject.doubleValue;
+        CGFloat x = plotRect.origin.x + (fraction * plotRect.size.width) - (size.width * 0.5);
+        CGFloat y = NSMaxY(plotRect) + 20.0;
+        return NSInsetRect(NSMakeRect(x, y, MAX(size.width, 56.0), MAX(size.height, 16.0)), -16.0, -9.0);
+    }
+
+    if (target == HDCVAxisEditTargetYMin || target == HDCVAxisEditTargetYMax) {
+        CGFloat y = (target == HDCVAxisEditTargetYMin)
+            ? NSMaxY(plotRect) - (size.height * 0.5)
+            : plotRect.origin.y - (size.height * 0.5);
+        return NSInsetRect(NSMakeRect(6.0, y, MAX(size.width, 56.0), MAX(size.height, 16.0)), -16.0, -9.0);
+    }
+
+    return NSZeroRect;
+}
+
+- (HDCVAxisEditTarget)axisEditTargetForPoint:(NSPoint)point editorRect:(NSRect *)outRect
+{
+    NSRect plotRect = [self plotRect];
+    NSDictionary *tickAttrs = [self labelAttributesWithColor:HDCVMutedText() size:9.0 weight:NSFontWeightRegular];
+    HDCVAxisEditTarget targets[] = {
+        HDCVAxisEditTargetXMin,
+        HDCVAxisEditTargetXMax,
+        HDCVAxisEditTargetYMin,
+        HDCVAxisEditTargetYMax
+    };
+
+    for (NSUInteger i = 0U; i < sizeof(targets) / sizeof(targets[0]); ++i) {
+        NSRect rect = [self axisEditRectForTarget:targets[i] plotRect:plotRect attributes:tickAttrs];
+        if (!NSEqualRects(rect, NSZeroRect) && NSPointInRect(point, rect)) {
+            if (outRect != NULL) {
+                *outRect = rect;
+            }
+            return targets[i];
+        }
+    }
+    return HDCVAxisEditTargetNone;
+}
+
+- (void)finishAxisEditing
+{
+    if (_axisEditor == nil || _activeAxisEditTarget == HDCVAxisEditTargetNone) {
+        return;
+    }
+
+    NSTextField *editor = _axisEditor;
+    HDCVAxisEditTarget target = _activeAxisEditTarget;
+    double value = 0.0;
+    _axisEditor = nil;
+    _activeAxisEditTarget = HDCVAxisEditTargetNone;
+    [editor removeFromSuperview];
+
+    if (HDCVParseLeadingDouble(editor.stringValue, &value)) {
+        [self.delegate heatmapView:self didEditAxisTarget:target value:value];
+    }
+}
+
+- (void)axisEditorAction:(id)sender
+{
+    (void)sender;
+    [self finishAxisEditing];
+    [self.window makeFirstResponder:self];
+}
+
+- (void)controlTextDidEndEditing:(NSNotification *)notification
+{
+    (void)notification;
+    [self finishAxisEditing];
+}
+
+- (void)beginAxisEditingTarget:(HDCVAxisEditTarget)target rect:(NSRect)rect
+{
+    [_axisEditor removeFromSuperview];
+    _activeAxisEditTarget = target;
+
+    NSRect editorRect = NSInsetRect(rect, -4.0, -2.0);
+    editorRect.size.width = MAX(editorRect.size.width, 74.0);
+    editorRect.size.height = 22.0;
+    editorRect.origin.x = MAX(2.0, MIN(editorRect.origin.x, self.bounds.size.width - editorRect.size.width - 2.0));
+    editorRect.origin.y = MAX(2.0, MIN(editorRect.origin.y, self.bounds.size.height - editorRect.size.height - 2.0));
+
+    _axisEditor = [[NSTextField alloc] initWithFrame:editorRect];
+    _axisEditor.font = [NSFont monospacedDigitSystemFontOfSize:11.0 weight:NSFontWeightMedium];
+    _axisEditor.alignment = NSTextAlignmentCenter;
+    _axisEditor.bezelStyle = NSTextFieldRoundedBezel;
+    _axisEditor.controlSize = NSControlSizeSmall;
+    _axisEditor.stringValue = [self axisEditStringForTarget:target];
+    _axisEditor.target = self;
+    _axisEditor.action = @selector(axisEditorAction:);
+    [self addSubview:_axisEditor];
+    [self.window makeFirstResponder:_axisEditor];
+    [_axisEditor selectText:nil];
+}
+
+- (HDCVHeatmapDragTarget)dragTargetForPoint:(NSPoint)point
+{
+    NSRect plotRect = [self plotRect];
+    CGFloat tolerance = 7.0;
+    CGFloat selectedX;
+    CGFloat selectedY;
+    CGFloat backgroundX = CGFLOAT_MAX;
+    CGFloat selectedXDistance;
+    CGFloat backgroundXDistance;
+    BOOL nearSelectedX;
+    BOOL nearSelectedY;
+    BOOL nearBackgroundX;
+    BOOL selectedVisible;
+    BOOL backgroundVisible;
+
+    if (!NSPointInRect(point, plotRect) || self.scanCount == 0U || self.pointCount == 0U) {
+        return HDCVHeatmapDragTargetNone;
+    }
+
+    selectedVisible = self.selectedScanIndex >= [self normalizedVisibleScanMin] &&
+        self.selectedScanIndex <= [self normalizedVisibleScanMax] &&
+        self.selectedPointIndex >= [self normalizedVisiblePointMin] &&
+        self.selectedPointIndex <= [self normalizedVisiblePointMax];
+    backgroundVisible = self.backgroundScanIndex != NSNotFound &&
+        self.backgroundScanIndex >= [self normalizedVisibleScanMin] &&
+        self.backgroundScanIndex <= [self normalizedVisibleScanMax];
+
+    selectedX = selectedVisible ? [self xPositionForScanIndex:self.selectedScanIndex inPlotRect:plotRect] : CGFLOAT_MAX;
+    selectedY = selectedVisible ? [self yPositionForPointIndex:self.selectedPointIndex inPlotRect:plotRect] : CGFLOAT_MAX;
+    if (backgroundVisible) {
+        backgroundX = [self xPositionForScanIndex:self.backgroundScanIndex inPlotRect:plotRect];
+    }
+
+    selectedXDistance = fabs(point.x - selectedX);
+    backgroundXDistance = fabs(point.x - backgroundX);
+    nearSelectedX = selectedVisible && selectedXDistance <= tolerance;
+    nearSelectedY = selectedVisible && fabs(point.y - selectedY) <= tolerance;
+    nearBackgroundX = backgroundVisible && backgroundXDistance <= tolerance;
+
+    if (nearSelectedX && nearSelectedY) {
+        return HDCVHeatmapDragTargetSelectionXY;
+    }
+    if (nearSelectedX && (!nearBackgroundX || selectedXDistance <= backgroundXDistance)) {
+        return HDCVHeatmapDragTargetSelectionX;
+    }
+    if (nearSelectedY) {
+        return HDCVHeatmapDragTargetSelectionY;
+    }
+    if (nearBackgroundX) {
+        return HDCVHeatmapDragTargetBackgroundX;
+    }
+    return HDCVHeatmapDragTargetNone;
+}
+
+- (void)updateCursorForEvent:(NSEvent *)event
+{
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    if ([self dragTargetForPoint:point] == HDCVHeatmapDragTargetNone) {
+        [NSCursor.arrowCursor set];
+    } else {
+        [NSCursor.openHandCursor set];
+    }
+}
+
+- (void)mouseMoved:(NSEvent *)event
+{
+    [self updateCursorForEvent:event];
+}
+
+- (void)mouseExited:(NSEvent *)event
+{
+    (void)event;
+    [NSCursor.arrowCursor set];
 }
 
 - (void)drawRect:(NSRect)dirtyRect
@@ -403,12 +1542,58 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     [self.subtitleText drawAtPoint:NSMakePoint(plotRect.origin.x, 28.0) withAttributes:subtitleAttrs];
 
     if (self.image != nil) {
-        [self.image drawInRect:plotRect];
+        NSUInteger minScan = [self normalizedVisibleScanMin];
+        NSUInteger maxScan = [self normalizedVisibleScanMax];
+        NSUInteger minPoint = [self normalizedVisiblePointMin];
+        NSUInteger maxPoint = [self normalizedVisiblePointMax];
+        CGFloat imageWidth = MAX(self.image.size.width, 1.0);
+        CGFloat imageHeight = MAX(self.image.size.height, 1.0);
+        CGFloat scanDenominator = self.scanCount > 1U ? (CGFloat)(self.scanCount - 1U) : 1.0;
+        CGFloat pointDenominator = self.pointCount > 1U ? (CGFloat)(self.pointCount - 1U) : 1.0;
+        CGFloat sourceX = ((CGFloat)minScan / scanDenominator) * imageWidth;
+        CGFloat sourceWidth = MAX(1.0, ((CGFloat)(maxScan - minScan) / scanDenominator) * imageWidth);
+        CGFloat sourceY = ((CGFloat)minPoint / pointDenominator) * imageHeight;
+        CGFloat sourceHeight = MAX(1.0, ((CGFloat)(maxPoint - minPoint) / pointDenominator) * imageHeight);
+        NSRect sourceRect = NSMakeRect(sourceX, sourceY, sourceWidth, sourceHeight);
+        [self.image drawInRect:plotRect
+                      fromRect:sourceRect
+                     operation:NSCompositingOperationSourceOver
+                      fraction:1.0
+                respectFlipped:YES
+                         hints:nil];
     }
 
-    if (self.scanCount > 0U && self.backgroundScanIndex != NSNotFound && self.backgroundScanIndex < self.scanCount) {
-        CGFloat backgroundFraction = self.scanCount > 1U ? (CGFloat)self.backgroundScanIndex / (CGFloat)(self.scanCount - 1U) : 0.0;
-        CGFloat backgroundX = plotRect.origin.x + (backgroundFraction * plotRect.size.width);
+    {
+        NSRect legendRect = NSMakeRect(NSMaxX(plotRect) + 14.0, plotRect.origin.y, 14.0, plotRect.size.height);
+        NSUInteger steps = MAX((NSUInteger)plotRect.size.height, 1U);
+        for (NSUInteger i = 0U; i < steps; ++i) {
+            CGFloat fraction = steps > 1U ? (CGFloat)i / (CGFloat)(steps - 1U) : 0.0;
+            float r;
+            float g;
+            float b;
+            HDCVHeatmapRGBForNormalized((float)(1.0 - (2.0 * fraction)), &r, &g, &b);
+            [[NSColor colorWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:1.0] setFill];
+            NSRectFill(NSMakeRect(legendRect.origin.x, legendRect.origin.y + (CGFloat)i, legendRect.size.width, 1.0));
+        }
+        [[NSColor colorWithWhite:0.72 alpha:1.0] setStroke];
+        NSBezierPath *legendBorder = [NSBezierPath bezierPathWithRoundedRect:legendRect xRadius:4.0 yRadius:4.0];
+        legendBorder.lineWidth = 0.8;
+        [legendBorder stroke];
+
+        NSString *topLabel = [NSString stringWithFormat:@"+%.0f nA", self.colorScaleMaxNA];
+        NSString *middleLabel = @"0 nA";
+        NSString *bottomLabel = [NSString stringWithFormat:@"-%.0f nA", self.colorScaleMaxNA];
+        [@"Current (nA)" drawAtPoint:NSMakePoint(NSMaxX(plotRect) + 2.0, plotRect.origin.y - 18.0) withAttributes:tickAttrs];
+        [topLabel drawAtPoint:NSMakePoint(NSMaxX(legendRect) + 5.0, legendRect.origin.y - 2.0) withAttributes:tickAttrs];
+        [middleLabel drawAtPoint:NSMakePoint(NSMaxX(legendRect) + 5.0, NSMidY(legendRect) - 6.0) withAttributes:tickAttrs];
+        [bottomLabel drawAtPoint:NSMakePoint(NSMaxX(legendRect) + 5.0, NSMaxY(legendRect) - 13.0) withAttributes:tickAttrs];
+    }
+
+    if (self.scanCount > 0U &&
+        self.backgroundScanIndex != NSNotFound &&
+        self.backgroundScanIndex >= [self normalizedVisibleScanMin] &&
+        self.backgroundScanIndex <= [self normalizedVisibleScanMax]) {
+        CGFloat backgroundX = [self xPositionForScanIndex:self.backgroundScanIndex inPlotRect:plotRect];
         NSBezierPath *backgroundLine = [NSBezierPath bezierPath];
         [backgroundLine moveToPoint:NSMakePoint(backgroundX, plotRect.origin.y)];
         [backgroundLine lineToPoint:NSMakePoint(backgroundX, NSMaxY(plotRect))];
@@ -419,11 +1604,14 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         [backgroundLine stroke];
     }
 
-    if (self.scanCount > 0U && self.pointCount > 0U) {
-        CGFloat xFraction = self.scanCount > 1U ? (CGFloat)self.selectedScanIndex / (CGFloat)(self.scanCount - 1U) : 0.0;
-        CGFloat yFraction = self.pointCount > 1U ? (CGFloat)self.selectedPointIndex / (CGFloat)(self.pointCount - 1U) : 0.0;
-        CGFloat crossX = plotRect.origin.x + (xFraction * plotRect.size.width);
-        CGFloat crossY = plotRect.origin.y + plotRect.size.height - (yFraction * plotRect.size.height);
+    if (self.scanCount > 0U &&
+        self.pointCount > 0U &&
+        self.selectedScanIndex >= [self normalizedVisibleScanMin] &&
+        self.selectedScanIndex <= [self normalizedVisibleScanMax] &&
+        self.selectedPointIndex >= [self normalizedVisiblePointMin] &&
+        self.selectedPointIndex <= [self normalizedVisiblePointMax]) {
+        CGFloat crossX = [self xPositionForScanIndex:self.selectedScanIndex inPlotRect:plotRect];
+        CGFloat crossY = [self yPositionForPointIndex:self.selectedPointIndex inPlotRect:plotRect];
 
         NSBezierPath *vertical = [NSBezierPath bezierPath];
         [vertical moveToPoint:NSMakePoint(crossX, plotRect.origin.y)];
@@ -444,8 +1632,8 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         [horizontal stroke];
     }
 
-    [@"Time" drawAtPoint:NSMakePoint(NSMidX(plotRect) - 14.0, NSMaxY(plotRect) + 8.0) withAttributes:axisAttrs];
-    [@"Voltage / Waveform Point" drawAtPoint:NSMakePoint(8.0, 16.0) withAttributes:axisAttrs];
+    [@"Time (s)" drawAtPoint:NSMakePoint(NSMidX(plotRect) - 22.0, NSMaxY(plotRect) + 8.0) withAttributes:axisAttrs];
+    [@"Voltage (V)" drawAtPoint:NSMakePoint(8.0, 16.0) withAttributes:axisAttrs];
 
     if (self.xTickLabels.count == self.xTickFractions.count) {
         for (NSUInteger i = 0U; i < self.xTickLabels.count; ++i) {
@@ -460,12 +1648,14 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 
     if (self.voltageData.length >= self.pointCount * sizeof(float) && self.pointCount > 0U) {
         const float *voltage = self.voltageData.bytes;
-        NSUInteger tickCount = MIN((NSUInteger)6U, self.pointCount);
+        NSUInteger minPoint = [self normalizedVisiblePointMin];
+        NSUInteger maxPoint = [self normalizedVisiblePointMax];
+        NSUInteger tickCount = MIN((NSUInteger)6U, maxPoint - minPoint + 1U);
         for (NSUInteger i = 0U; i < tickCount; ++i) {
             NSUInteger pointIndex = (tickCount == 1U)
-                ? 0U
-                : (NSUInteger)llround((double)i * (double)(self.pointCount - 1U) / (double)(tickCount - 1U));
-            CGFloat fraction = self.pointCount > 1U ? (CGFloat)pointIndex / (CGFloat)(self.pointCount - 1U) : 0.0;
+                ? minPoint
+                : minPoint + (NSUInteger)llround((double)i * (double)(maxPoint - minPoint) / (double)(tickCount - 1U));
+            CGFloat fraction = (maxPoint > minPoint) ? (CGFloat)(pointIndex - minPoint) / (CGFloat)(maxPoint - minPoint) : 0.0;
             CGFloat y = plotRect.origin.y + plotRect.size.height - (fraction * plotRect.size.height);
             NSString *label = [NSString stringWithFormat:@"%.2f V", voltage[pointIndex]];
             NSSize size = [label sizeWithAttributes:tickAttrs];
@@ -484,31 +1674,62 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 - (void)updateSelectionFromEvent:(NSEvent *)event
 {
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
-    NSRect plotRect = [self plotRect];
-    if (!NSPointInRect(point, plotRect) || self.scanCount == 0U || self.pointCount == 0U) {
+    NSUInteger scanIndex = 0U;
+    NSUInteger pointIndex = 0U;
+    if (![self scanIndex:&scanIndex pointIndex:&pointIndex fromPoint:point]) {
         return;
     }
 
-    CGFloat xFraction = (point.x - plotRect.origin.x) / plotRect.size.width;
-    CGFloat yFraction = 1.0 - ((point.y - plotRect.origin.y) / plotRect.size.height);
-    NSUInteger scanIndex = (NSUInteger)llround(MAX(0.0, MIN(1.0, xFraction)) * (double)(self.scanCount - 1U));
-    NSUInteger pointIndex = (NSUInteger)llround(MAX(0.0, MIN(1.0, yFraction)) * (double)(self.pointCount - 1U));
-    [self.delegate heatmapView:self didSelectScanIndex:scanIndex pointIndex:pointIndex];
+    if (_activeDragTarget == HDCVHeatmapDragTargetBackgroundX) {
+        [self.delegate heatmapView:self didDragBackgroundScanIndex:scanIndex];
+    } else if (_activeDragTarget == HDCVHeatmapDragTargetSelectionX) {
+        [self.delegate heatmapView:self didDragSelectionScanIndex:scanIndex pointIndex:pointIndex updateScan:YES updatePoint:NO];
+    } else if (_activeDragTarget == HDCVHeatmapDragTargetSelectionY) {
+        [self.delegate heatmapView:self didDragSelectionScanIndex:scanIndex pointIndex:pointIndex updateScan:NO updatePoint:YES];
+    } else if (_activeDragTarget == HDCVHeatmapDragTargetSelectionXY) {
+        [self.delegate heatmapView:self didDragSelectionScanIndex:scanIndex pointIndex:pointIndex updateScan:YES updatePoint:YES];
+    }
 }
 
 - (void)mouseDown:(NSEvent *)event
 {
-    [self updateSelectionFromEvent:event];
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    if (event.clickCount >= 2) {
+        NSRect editorRect = NSZeroRect;
+        HDCVAxisEditTarget target = [self axisEditTargetForPoint:point editorRect:&editorRect];
+        if (target != HDCVAxisEditTargetNone) {
+            [self beginAxisEditingTarget:target rect:editorRect];
+            return;
+        }
+    }
+    _activeDragTarget = [self dragTargetForPoint:point];
+    if (_activeDragTarget != HDCVHeatmapDragTargetNone) {
+        [NSCursor.closedHandCursor set];
+    }
 }
 
 - (void)mouseDragged:(NSEvent *)event
 {
-    [self updateSelectionFromEvent:event];
+    if (_activeDragTarget != HDCVHeatmapDragTargetNone) {
+        [NSCursor.closedHandCursor set];
+        [self updateSelectionFromEvent:event];
+    }
+}
+
+- (void)mouseUp:(NSEvent *)event
+{
+    (void)event;
+    _activeDragTarget = HDCVHeatmapDragTargetNone;
 }
 
 @end
 
-@implementation HDCVLinePlotView
+@implementation HDCVLinePlotView {
+    HDCVLinePlotDragTarget _activeDragTarget;
+    HDCVAxisEditTarget _activeAxisEditTarget;
+    NSTextField *_axisEditor;
+    NSTrackingArea *_trackingArea;
+}
 
 - (instancetype)initWithFrame:(NSRect)frameRect
 {
@@ -521,6 +1742,7 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         _yLabelText = @"Y";
         _xTickFormat = @"%.2f";
         _yTickFormat = @"%.2f";
+        _activeDragTarget = HDCVLinePlotDragTargetNone;
         self.wantsLayer = YES;
         self.layer.backgroundColor = NSColor.whiteColor.CGColor;
     }
@@ -532,9 +1754,14 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     return YES;
 }
 
+- (BOOL)acceptsFirstResponder
+{
+    return YES;
+}
+
 - (NSRect)plotRect
 {
-    return NSMakeRect(60.0, 48.0, MAX(40.0, self.bounds.size.width - 84.0), MAX(40.0, self.bounds.size.height - 84.0));
+    return NSMakeRect(60.0, 62.0, MAX(40.0, self.bounds.size.width - 84.0), MAX(40.0, self.bounds.size.height - 98.0));
 }
 
 - (NSDictionary<NSAttributedStringKey, id> *)labelAttributesWithColor:(NSColor *)color size:(CGFloat)size weight:(NSFontWeight)weight
@@ -551,6 +1778,211 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     double fraction = (double)((point.x - plotRect.origin.x) / plotRect.size.width);
     double clampedFraction = MAX(0.0, MIN(1.0, fraction));
     return self.xMin + ((self.xMax - self.xMin) * clampedFraction);
+}
+
+- (double)clampedYValueForPoint:(NSPoint)point
+{
+    NSRect plotRect = [self plotRect];
+    double fraction = 1.0 - (double)((point.y - plotRect.origin.y) / plotRect.size.height);
+    double clampedFraction = MAX(0.0, MIN(1.0, fraction));
+    return self.yMin + ((self.yMax - self.yMin) * clampedFraction);
+}
+
+- (void)updateTrackingAreas
+{
+    [super updateTrackingAreas];
+    if (_trackingArea != nil) {
+        [self removeTrackingArea:_trackingArea];
+    }
+    _trackingArea = [[NSTrackingArea alloc] initWithRect:NSZeroRect
+                                                 options:(NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect)
+                                                   owner:self
+                                                userInfo:nil];
+    [self addTrackingArea:_trackingArea];
+}
+
+- (CGFloat)xPositionForValue:(double)xValue inPlotRect:(NSRect)plotRect xMin:(double)xMin xRange:(double)xRange
+{
+    return plotRect.origin.x + (CGFloat)((xValue - xMin) / xRange) * plotRect.size.width;
+}
+
+- (NSString *)axisEditStringForTarget:(HDCVAxisEditTarget)target
+{
+    switch (target) {
+        case HDCVAxisEditTargetXMin:
+            return [NSString stringWithFormat:self.xTickFormat, self.xMin];
+        case HDCVAxisEditTargetXMax:
+            return [NSString stringWithFormat:self.xTickFormat, self.xMax];
+        case HDCVAxisEditTargetYMin:
+            return [NSString stringWithFormat:self.yTickFormat, self.yMin];
+        case HDCVAxisEditTargetYMax:
+            return [NSString stringWithFormat:self.yTickFormat, self.yMax];
+        default:
+            return @"0";
+    }
+}
+
+- (NSRect)axisEditRectForTarget:(HDCVAxisEditTarget)target
+                       plotRect:(NSRect)plotRect
+                     attributes:(NSDictionary<NSAttributedStringKey, id> *)attributes
+{
+    NSString *label = [self axisEditStringForTarget:target];
+    NSSize size = [label sizeWithAttributes:attributes];
+
+    if (target == HDCVAxisEditTargetXMin || target == HDCVAxisEditTargetXMax) {
+        CGFloat fraction = (target == HDCVAxisEditTargetXMin) ? 0.0 : 1.0;
+        CGFloat x = plotRect.origin.x + (fraction * plotRect.size.width) - (size.width * 0.5);
+        CGFloat y = NSMaxY(plotRect) + 20.0;
+        return NSInsetRect(NSMakeRect(x, y, MAX(size.width, 56.0), MAX(size.height, 16.0)), -16.0, -9.0);
+    }
+
+    if (target == HDCVAxisEditTargetYMin || target == HDCVAxisEditTargetYMax) {
+        CGFloat y = (target == HDCVAxisEditTargetYMax)
+            ? plotRect.origin.y - (size.height * 0.5)
+            : NSMaxY(plotRect) - (size.height * 0.5);
+        return NSInsetRect(NSMakeRect(6.0, y, MAX(size.width, 56.0), MAX(size.height, 16.0)), -16.0, -9.0);
+    }
+
+    return NSZeroRect;
+}
+
+- (HDCVAxisEditTarget)axisEditTargetForPoint:(NSPoint)point editorRect:(NSRect *)outRect
+{
+    NSRect plotRect = [self plotRect];
+    NSDictionary *tickAttrs = [self labelAttributesWithColor:HDCVMutedText() size:9.0 weight:NSFontWeightRegular];
+    HDCVAxisEditTarget targets[] = {
+        HDCVAxisEditTargetXMin,
+        HDCVAxisEditTargetXMax,
+        HDCVAxisEditTargetYMin,
+        HDCVAxisEditTargetYMax
+    };
+
+    for (NSUInteger i = 0U; i < sizeof(targets) / sizeof(targets[0]); ++i) {
+        NSRect rect = [self axisEditRectForTarget:targets[i] plotRect:plotRect attributes:tickAttrs];
+        if (!NSEqualRects(rect, NSZeroRect) && NSPointInRect(point, rect)) {
+            if (outRect != NULL) {
+                *outRect = rect;
+            }
+            return targets[i];
+        }
+    }
+    return HDCVAxisEditTargetNone;
+}
+
+- (void)finishAxisEditing
+{
+    if (_axisEditor == nil || _activeAxisEditTarget == HDCVAxisEditTargetNone) {
+        return;
+    }
+
+    NSTextField *editor = _axisEditor;
+    HDCVAxisEditTarget target = _activeAxisEditTarget;
+    double value = 0.0;
+    _axisEditor = nil;
+    _activeAxisEditTarget = HDCVAxisEditTargetNone;
+    [editor removeFromSuperview];
+
+    if (HDCVParseLeadingDouble(editor.stringValue, &value)) {
+        [self.delegate linePlotView:self didEditAxisTarget:target value:value];
+    }
+}
+
+- (void)axisEditorAction:(id)sender
+{
+    (void)sender;
+    [self finishAxisEditing];
+    [self.window makeFirstResponder:self];
+}
+
+- (void)controlTextDidEndEditing:(NSNotification *)notification
+{
+    (void)notification;
+    [self finishAxisEditing];
+}
+
+- (void)beginAxisEditingTarget:(HDCVAxisEditTarget)target rect:(NSRect)rect
+{
+    [_axisEditor removeFromSuperview];
+    _activeAxisEditTarget = target;
+
+    NSRect editorRect = NSInsetRect(rect, -4.0, -2.0);
+    editorRect.size.width = MAX(editorRect.size.width, 74.0);
+    editorRect.size.height = 22.0;
+    editorRect.origin.x = MAX(2.0, MIN(editorRect.origin.x, self.bounds.size.width - editorRect.size.width - 2.0));
+    editorRect.origin.y = MAX(2.0, MIN(editorRect.origin.y, self.bounds.size.height - editorRect.size.height - 2.0));
+
+    _axisEditor = [[NSTextField alloc] initWithFrame:editorRect];
+    _axisEditor.font = [NSFont monospacedDigitSystemFontOfSize:11.0 weight:NSFontWeightMedium];
+    _axisEditor.alignment = NSTextAlignmentCenter;
+    _axisEditor.bezelStyle = NSTextFieldRoundedBezel;
+    _axisEditor.controlSize = NSControlSizeSmall;
+    _axisEditor.stringValue = [self axisEditStringForTarget:target];
+    _axisEditor.target = self;
+    _axisEditor.action = @selector(axisEditorAction:);
+    [self addSubview:_axisEditor];
+    [self.window makeFirstResponder:_axisEditor];
+    [_axisEditor selectText:nil];
+}
+
+- (HDCVLinePlotDragTarget)dragTargetForPoint:(NSPoint)point
+{
+    NSRect plotRect = [self plotRect];
+    double xMin = self.xMin;
+    double xMax = self.xMax;
+    double xRange;
+    CGFloat tolerance = 7.0;
+    CGFloat selectedX;
+    CGFloat backgroundX = CGFLOAT_MAX;
+    CGFloat selectedDistance;
+    CGFloat backgroundDistance;
+    BOOL nearSelected;
+    BOOL nearBackground;
+
+    if (!NSPointInRect(point, plotRect) || self.interactionMode != HDCVLinePlotInteractionModeSelectX) {
+        return HDCVLinePlotDragTargetNone;
+    }
+    if (xMax <= xMin) {
+        xMax = xMin + 1.0;
+    }
+    xRange = xMax - xMin;
+
+    selectedX = [self xPositionForValue:self.selectedXValue inPlotRect:plotRect xMin:xMin xRange:xRange];
+    if (self.showsBackgroundX) {
+        backgroundX = [self xPositionForValue:self.backgroundXValue inPlotRect:plotRect xMin:xMin xRange:xRange];
+    }
+    selectedDistance = fabs(point.x - selectedX);
+    backgroundDistance = fabs(point.x - backgroundX);
+    nearSelected = self.showsSelection && selectedDistance <= tolerance;
+    nearBackground = self.showsBackgroundX && backgroundDistance <= tolerance;
+
+    if (nearSelected && (!nearBackground || selectedDistance <= backgroundDistance)) {
+        return HDCVLinePlotDragTargetSelectedX;
+    }
+    if (nearBackground) {
+        return HDCVLinePlotDragTargetBackgroundX;
+    }
+    return HDCVLinePlotDragTargetNone;
+}
+
+- (void)updateCursorForEvent:(NSEvent *)event
+{
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    if ([self dragTargetForPoint:point] == HDCVLinePlotDragTargetNone) {
+        [NSCursor.arrowCursor set];
+    } else {
+        [NSCursor.openHandCursor set];
+    }
+}
+
+- (void)mouseMoved:(NSEvent *)event
+{
+    [self updateCursorForEvent:event];
+}
+
+- (void)mouseExited:(NSEvent *)event
+{
+    (void)event;
+    [NSCursor.arrowCursor set];
 }
 
 - (void)drawRect:(NSRect)dirtyRect
@@ -628,6 +2060,9 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         [yLabel drawAtPoint:NSMakePoint(6.0, y - ySize.height * 0.5) withAttributes:tickAttrs];
     }
 
+    [NSGraphicsContext saveGraphicsState];
+    [[NSBezierPath bezierPathWithRect:plotRect] addClip];
+
     if (self.showsBaseline) {
         double baselineFraction = (self.baselineYValue - yMin) / yRange;
         if (baselineFraction >= 0.0 && baselineFraction <= 1.0) {
@@ -643,38 +2078,149 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         }
     }
 
-    NSUInteger step = 1U;
-    NSUInteger targetSegments = MAX((NSUInteger)plotRect.size.width * 2U, 1U);
-    if (sampleCount > targetSegments) {
-        step = sampleCount / targetSegments;
-        if (step == 0U) {
-            step = 1U;
-        }
+    if (self.showsBackgroundX) {
+        CGFloat backgroundX = [self xPositionForValue:self.backgroundXValue inPlotRect:plotRect xMin:xMin xRange:xRange];
+        NSBezierPath *backgroundLine = [NSBezierPath bezierPath];
+        [backgroundLine moveToPoint:NSMakePoint(backgroundX, plotRect.origin.y)];
+        [backgroundLine lineToPoint:NSMakePoint(backgroundX, NSMaxY(plotRect))];
+        backgroundLine.lineWidth = 1.15;
+        CGFloat dashes[] = {3.0, 4.0};
+        [backgroundLine setLineDash:dashes count:2 phase:0.0];
+        [[HDCVAccentBlue() colorWithAlphaComponent:0.92] setStroke];
+        [backgroundLine stroke];
     }
 
-    [self.strokeColor setStroke];
-    NSBezierPath *path = [NSBezierPath bezierPath];
-    path.lineWidth = 1.9;
-    for (NSUInteger i = 0U; i < sampleCount; i += step) {
-        double xValue = [self.dataSource linePlotView:self xValueAtIndex:i];
-        double yValue = [self.dataSource linePlotView:self yValueAtIndex:i];
-        CGFloat x = plotRect.origin.x + (CGFloat)((xValue - xMin) / xRange) * plotRect.size.width;
-        CGFloat y = plotRect.origin.y + plotRect.size.height - (CGFloat)((yValue - yMin) / yRange) * plotRect.size.height;
-        if (i == 0U) {
-            [path moveToPoint:NSMakePoint(x, y)];
+    {
+        BOOL monotonicX = YES;
+        double previousX = [self.dataSource linePlotView:self xValueAtIndex:0U];
+        NSUInteger firstVisible = NSNotFound;
+        NSUInteger lastVisible = 0U;
+        NSUInteger visibleCount = 0U;
+
+        for (NSUInteger i = 0U; i < sampleCount; ++i) {
+            double xValue = (i == 0U) ? previousX : [self.dataSource linePlotView:self xValueAtIndex:i];
+            if (i > 0U && xValue < previousX) {
+                monotonicX = NO;
+            }
+            previousX = xValue;
+
+            if (xValue >= xMin && xValue <= xMax) {
+                if (firstVisible == NSNotFound) {
+                    firstVisible = i;
+                }
+                lastVisible = i;
+                visibleCount += 1U;
+            }
+        }
+
+        [self.strokeColor setStroke];
+
+        NSUInteger directThreshold = MAX((NSUInteger)10000U, (NSUInteger)ceil(plotRect.size.width) * 12U);
+        if (!monotonicX || visibleCount <= directThreshold || firstVisible == NSNotFound) {
+            NSUInteger startIndex = 0U;
+            NSUInteger endIndex = sampleCount - 1U;
+            if (monotonicX && firstVisible != NSNotFound) {
+                startIndex = (firstVisible > 0U) ? firstVisible - 1U : firstVisible;
+                endIndex = MIN(sampleCount - 1U, lastVisible + 1U);
+            }
+
+            NSBezierPath *path = [NSBezierPath bezierPath];
+            path.lineWidth = 1.9;
+            BOOL hasPoint = NO;
+            for (NSUInteger i = startIndex; i <= endIndex; ++i) {
+                double xValue = [self.dataSource linePlotView:self xValueAtIndex:i];
+                double yValue = [self.dataSource linePlotView:self yValueAtIndex:i];
+                if (!isfinite(xValue) || !isfinite(yValue)) {
+                    hasPoint = NO;
+                    continue;
+                }
+                CGFloat x = plotRect.origin.x + (CGFloat)((xValue - xMin) / xRange) * plotRect.size.width;
+                CGFloat y = plotRect.origin.y + plotRect.size.height - (CGFloat)((yValue - yMin) / yRange) * plotRect.size.height;
+                if (!hasPoint) {
+                    [path moveToPoint:NSMakePoint(x, y)];
+                    hasPoint = YES;
+                } else {
+                    [path lineToPoint:NSMakePoint(x, y)];
+                }
+            }
+            [path stroke];
         } else {
-            [path lineToPoint:NSMakePoint(x, y)];
+            NSUInteger binCount = MAX((NSUInteger)ceil(plotRect.size.width), 1U);
+            double *minValues = (double *)malloc(binCount * sizeof(*minValues));
+            double *maxValues = (double *)malloc(binCount * sizeof(*maxValues));
+            unsigned char *hasValues = (unsigned char *)calloc(binCount, sizeof(*hasValues));
+
+            if (minValues != NULL && maxValues != NULL && hasValues != NULL) {
+                for (NSUInteger bin = 0U; bin < binCount; ++bin) {
+                    minValues[bin] = DBL_MAX;
+                    maxValues[bin] = -DBL_MAX;
+                }
+
+                for (NSUInteger i = firstVisible; i <= lastVisible; ++i) {
+                    double xValue = [self.dataSource linePlotView:self xValueAtIndex:i];
+                    double yValue = [self.dataSource linePlotView:self yValueAtIndex:i];
+                    if (!isfinite(xValue) || !isfinite(yValue)) {
+                        continue;
+                    }
+                    double fraction = (xValue - xMin) / xRange;
+                    NSInteger bin = (NSInteger)floor(fraction * (double)binCount);
+                    bin = MAX((NSInteger)0, MIN((NSInteger)binCount - 1, bin));
+                    if (!hasValues[bin]) {
+                        minValues[bin] = yValue;
+                        maxValues[bin] = yValue;
+                        hasValues[bin] = 1U;
+                    } else {
+                        minValues[bin] = MIN(minValues[bin], yValue);
+                        maxValues[bin] = MAX(maxValues[bin], yValue);
+                    }
+                }
+
+                NSBezierPath *envelope = [NSBezierPath bezierPath];
+                envelope.lineWidth = 1.15;
+                for (NSUInteger bin = 0U; bin < binCount; ++bin) {
+                    if (!hasValues[bin]) {
+                        continue;
+                    }
+                    CGFloat x = plotRect.origin.x + ((CGFloat)bin + 0.5) / (CGFloat)binCount * plotRect.size.width;
+                    CGFloat y1 = plotRect.origin.y + plotRect.size.height - (CGFloat)((minValues[bin] - yMin) / yRange) * plotRect.size.height;
+                    CGFloat y2 = plotRect.origin.y + plotRect.size.height - (CGFloat)((maxValues[bin] - yMin) / yRange) * plotRect.size.height;
+                    if (fabs(y1 - y2) < 1.0) {
+                        y1 -= 0.5;
+                        y2 += 0.5;
+                    }
+                    [envelope moveToPoint:NSMakePoint(x, y1)];
+                    [envelope lineToPoint:NSMakePoint(x, y2)];
+                }
+                [[self.strokeColor colorWithAlphaComponent:0.86] setStroke];
+                [envelope stroke];
+            } else {
+                NSBezierPath *path = [NSBezierPath bezierPath];
+                path.lineWidth = 1.9;
+                BOOL hasPoint = NO;
+                for (NSUInteger i = 0U; i < sampleCount; ++i) {
+                    double xValue = [self.dataSource linePlotView:self xValueAtIndex:i];
+                    double yValue = [self.dataSource linePlotView:self yValueAtIndex:i];
+                    if (!isfinite(xValue) || !isfinite(yValue)) {
+                        hasPoint = NO;
+                        continue;
+                    }
+                    CGFloat x = plotRect.origin.x + (CGFloat)((xValue - xMin) / xRange) * plotRect.size.width;
+                    CGFloat y = plotRect.origin.y + plotRect.size.height - (CGFloat)((yValue - yMin) / yRange) * plotRect.size.height;
+                    if (!hasPoint) {
+                        [path moveToPoint:NSMakePoint(x, y)];
+                        hasPoint = YES;
+                    } else {
+                        [path lineToPoint:NSMakePoint(x, y)];
+                    }
+                }
+                [path stroke];
+            }
+
+            free(minValues);
+            free(maxValues);
+            free(hasValues);
         }
     }
-    if ((sampleCount - 1U) % step != 0U) {
-        NSUInteger i = sampleCount - 1U;
-        double xValue = [self.dataSource linePlotView:self xValueAtIndex:i];
-        double yValue = [self.dataSource linePlotView:self yValueAtIndex:i];
-        CGFloat x = plotRect.origin.x + (CGFloat)((xValue - xMin) / xRange) * plotRect.size.width;
-        CGFloat y = plotRect.origin.y + plotRect.size.height - (CGFloat)((yValue - yMin) / yRange) * plotRect.size.height;
-        [path lineToPoint:NSMakePoint(x, y)];
-    }
-    [path stroke];
 
     if (self.showsSelection) {
         CGFloat selectedX = plotRect.origin.x + (CGFloat)((self.selectedXValue - xMin) / xRange) * plotRect.size.width;
@@ -702,26 +2248,51 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         NSBezierPath *marker = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(selectedX - 4.0, selectedY - 4.0, 8.0, 8.0)];
         [marker fill];
     }
+    [NSGraphicsContext restoreGraphicsState];
 }
 
 - (void)dispatchSelectionForEvent:(NSEvent *)event
 {
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
     NSRect plotRect = [self plotRect];
-    if (!NSPointInRect(point, plotRect) || self.interactionMode != HDCVLinePlotInteractionModeSelectX) {
+    if (!NSPointInRect(point, plotRect) || self.interactionMode != HDCVLinePlotInteractionModeSelectX || _activeDragTarget == HDCVLinePlotDragTargetNone) {
         return;
     }
-    [self.delegate linePlotView:self didSelectXValue:[self clampedXValueForPoint:point]];
+    [self.delegate linePlotView:self
+                  didDragXValue:[self clampedXValueForPoint:point]
+                          yValue:[self clampedYValueForPoint:point]
+                          target:_activeDragTarget];
 }
 
 - (void)mouseDown:(NSEvent *)event
 {
-    [self dispatchSelectionForEvent:event];
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    if (event.clickCount >= 2) {
+        NSRect editorRect = NSZeroRect;
+        HDCVAxisEditTarget target = [self axisEditTargetForPoint:point editorRect:&editorRect];
+        if (target != HDCVAxisEditTargetNone) {
+            [self beginAxisEditingTarget:target rect:editorRect];
+            return;
+        }
+    }
+    _activeDragTarget = [self dragTargetForPoint:point];
+    if (_activeDragTarget != HDCVLinePlotDragTargetNone) {
+        [NSCursor.closedHandCursor set];
+    }
 }
 
 - (void)mouseDragged:(NSEvent *)event
 {
+    if (_activeDragTarget != HDCVLinePlotDragTargetNone) {
+        [NSCursor.closedHandCursor set];
+    }
     [self dispatchSelectionForEvent:event];
+}
+
+- (void)mouseUp:(NSEvent *)event
+{
+    (void)event;
+    _activeDragTarget = HDCVLinePlotDragTargetNone;
 }
 
 @end
@@ -730,9 +2301,11 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     hdcv_reader _reader;
     BOOL _isOpen;
     NSData *_voltageData;
+    NSData *_waveformData;
     NSData *_overviewData;
-    NSString *_summaryText;
     uint32_t _overviewColumnCount;
+    uint32_t _waveformPointCount;
+    double _waveformCycleDurationSeconds;
     float _overviewMinValue;
     float _overviewMaxValue;
 }
@@ -763,16 +2336,22 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         }
         return nil;
     }
+
     _voltageData = [voltageBuffer copy];
+    _waveformPointCount = _reader.layout.points_per_scan;
+    _waveformCycleDurationSeconds = (_waveformPointCount > 0U)
+        ? (double)(_waveformPointCount - 1U) / _reader.layout.sample_rate_hz
+        : 0.0;
+    _waveformData = _voltageData;
 
     {
         uint32_t overviewColumns = (uint32_t)MAX((NSUInteger)256U, MIN(maxOverviewColumns, (NSUInteger)2048U));
-        NSMutableData *overviewBuffer = [NSMutableData dataWithLength:(NSUInteger)_reader.layout.points_per_scan * (NSUInteger)overviewColumns * sizeof(float)];
+        NSMutableData *fullOverviewBuffer = [NSMutableData dataWithLength:(NSUInteger)_reader.layout.points_per_scan * (NSUInteger)overviewColumns * sizeof(float)];
         hdcv_overview_result overviewResult;
         if (!hdcv_analysis_build_overview(
                 &_reader,
                 overviewColumns,
-                overviewBuffer.mutableBytes,
+                fullOverviewBuffer.mutableBytes,
                 (size_t)((NSUInteger)_reader.layout.points_per_scan * (NSUInteger)overviewColumns),
                 &overviewResult)) {
             if (error != NULL) {
@@ -783,13 +2362,12 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
             return nil;
         }
         _overviewColumnCount = overviewResult.column_count;
+        fullOverviewBuffer.length = (NSUInteger)_reader.layout.points_per_scan * (NSUInteger)_overviewColumnCount * sizeof(float);
         _overviewMinValue = overviewResult.min_value;
         _overviewMaxValue = overviewResult.max_value;
-        overviewBuffer.length = (NSUInteger)_reader.layout.points_per_scan * (NSUInteger)_overviewColumnCount * sizeof(float);
-        _overviewData = [overviewBuffer copy];
+        _overviewData = [fullOverviewBuffer copy];
     }
 
-    _summaryText = [self buildSummaryText];
     return self;
 }
 
@@ -801,43 +2379,6 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     }
 }
 
-- (NSString *)buildSummaryText
-{
-    NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"File\n%@\n\n", HDCVSafeStringFromBytes(_reader.path, strlen(_reader.path))];
-    [text appendString:@"Verified Layout\n"];
-    [text appendFormat:@"Metadata: [%llu, %llu)\n",
-     (unsigned long long)_reader.layout.metadata_start_offset,
-     (unsigned long long)_reader.layout.metadata_end_offset];
-    [text appendFormat:@"Waveform templates: %u x %u points\n", _reader.layout.waveform_count, _reader.layout.waveform_full_points];
-    [text appendFormat:@"Active scan points: %u\n", _reader.layout.points_per_scan];
-    [text appendFormat:@"Current matrix offset: %llu\n", (unsigned long long)_reader.layout.current_matrix_offset];
-    [text appendFormat:@"Current matrix shape: %u x %u\n\n", _reader.layout.scan_count, _reader.layout.points_per_scan];
-
-    [text appendString:@"Timing\n"];
-    [text appendFormat:@"Sample rate: %.3f Hz\n", _reader.layout.sample_rate_hz];
-    [text appendFormat:@"CVF: %.3f Hz\n", _reader.layout.cvf_hz];
-    [text appendFormat:@"Scan duration: %.4f ms\n", _reader.layout.scan_duration_s * 1000.0];
-    [text appendFormat:@"Sequence span: %.3f s\n", hdcv_reader_scan_time_sequence_s(&_reader, _reader.layout.scan_count - 1U)];
-    [text appendFormat:@"Experiment span: %.3f s\n\n", hdcv_reader_scan_time_experiment_s(&_reader, _reader.layout.scan_count - 1U)];
-
-    [text appendString:@"Experiment Structure\n"];
-    [text appendFormat:@"Runs: %u\n", _reader.layout.run_count];
-    [text appendFormat:@"Scans per run: %u\n", _reader.layout.scans_per_run];
-    [text appendFormat:@"Run duration: %.3f s\n", _reader.layout.run_duration_s];
-    [text appendFormat:@"Delay between runs: %.3f s\n\n", _reader.layout.delay_between_runs_s];
-
-    if (_reader.layout.has_voltage_bounds) {
-        [text appendString:@"Waveform Bounds\n"];
-        [text appendFormat:@"V1: %.3f V\n", _reader.layout.v1_v];
-        [text appendFormat:@"V2: %.3f V\n\n", _reader.layout.v2_v];
-    }
-
-    [text appendString:@"Metadata Block\n"];
-    [text appendString:HDCVSafeStringFromBytes(_reader.metadata.raw_text, _reader.metadata.raw_length)];
-    return text;
-}
-
 - (uint32_t)scanCount { return _reader.layout.scan_count; }
 - (uint32_t)pointsPerScan { return _reader.layout.points_per_scan; }
 - (uint32_t)overviewColumnCount { return _overviewColumnCount; }
@@ -847,14 +2388,17 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 - (double)cvfHz { return _reader.layout.cvf_hz; }
 - (double)scanIntervalSeconds { return _reader.layout.scan_interval_s; }
 - (double)scanDurationSeconds { return _reader.layout.scan_duration_s; }
+- (uint32_t)phasePeriod { return MAX(_reader.layout.waveform_count, 1U); }
 - (uint32_t)runCount { return _reader.layout.run_count; }
 - (uint32_t)scansPerRun { return _reader.layout.scans_per_run; }
 - (BOOL)hasExperimentTiming { return _reader.layout.has_experiment_timing != 0; }
 - (double)runDurationSeconds { return _reader.layout.run_duration_s; }
 - (double)delayBetweenRunsSeconds { return _reader.layout.delay_between_runs_s; }
+- (uint32_t)waveformPointCount { return _waveformPointCount; }
+- (double)waveformCycleDurationSeconds { return _waveformCycleDurationSeconds; }
 - (NSData *)voltageData { return _voltageData; }
+- (NSData *)waveformData { return _waveformData; }
 - (NSData *)overviewData { return _overviewData; }
-- (NSString *)summaryAndMetadataText { return _summaryText; }
 
 - (float)voltageAtPoint:(NSUInteger)pointIndex
 {
@@ -905,45 +2449,72 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 @implementation HDCVViewerController {
     NSWindow *_window;
     HDCVDropHostView *_contentHostView;
-    HDCVHeatmapView *_heatmapView;
-    HDCVLinePlotView *_timePlotView;
-    HDCVLinePlotView *_cvPlotView;
-    NSTextField *_heroTitleLabel;
-    NSTextField *_heroStatusLabel;
-    NSTextField *_fileLabel;
-    NSTextField *_modeSummaryLabel;
-    NSTextField *_scanControlLabel;
-    NSTextField *_pointControlLabel;
-    NSTextField *_backgroundControlLabel;
-    NSTextField *_selectionHeadlineLabel;
-    NSTextField *_selectionDetail1Label;
-    NSTextField *_selectionDetail2Label;
-    NSTextField *_selectionDetail3Label;
-    NSTextField *_selectionDetail4Label;
-    NSTextView *_infoTextView;
-    NSScrollView *_infoScrollView;
-    NSSlider *_scanSlider;
-    NSSlider *_pointSlider;
-    NSSlider *_backgroundSlider;
-    NSSegmentedControl *_timeAxisControl;
-    NSButton *_backgroundSubtractCheckbox;
-    NSButton *_useSelectedAsBackgroundButton;
-    NSProgressIndicator *_progressIndicator;
-    HDCVLoadedFile *_loadedFile;
+	    HDCVHeatmapView *_heatmapView;
+	    HDCVLinePlotView *_timePlotView;
+	    HDCVLinePlotView *_cvPlotView;
+	    HDCVLinePlotView *_waveformPlotView;
+	    NSTextField *_heroTitleLabel;
+	    NSTextField *_heroStatusLabel;
+	    NSTextField *_fileLabel;
+	    NSTextField *_heatmapScanField;
+	    NSTextField *_heatmapPointField;
+	    NSTextField *_heatmapBackgroundField;
+	    NSTextField *_timeScanField;
+	    NSTextField *_timeBackgroundField;
+	    NSTextField *_cvPointField;
+	    NSTextField *_backgroundModeLabel;
+	    NSTextField *_bandpassFilterLabel;
+	    HDCVSwitchControl *_backgroundSubtractSwitch;
+	    HDCVSwitchControl *_bandpassFilterSwitch;
+	    NSButton *_useSelectedAsBackgroundButton;
+	    NSButton *_exportButton;
+	    NSProgressIndicator *_progressIndicator;
+	    HDCVLoadedFile *_loadedFile;
     NSMutableData *_selectedRawScanData;
     NSMutableData *_backgroundScanData;
+    NSMutableData *_selectedPhaseBackgroundScanData;
     NSMutableData *_displayScanData;
+    NSMutableData *_displayCVScanData;
     NSMutableData *_rawPointTraceData;
     NSMutableData *_displayPointTraceData;
     float _displayScanMin;
     float _displayScanMax;
+    float _displayCVScanMin;
+    float _displayCVScanMax;
     float _displayTraceMin;
     float _displayTraceMax;
     NSUInteger _selectedScanIndex;
-    NSUInteger _selectedPointIndex;
-    NSUInteger _backgroundScanIndex;
-    BOOL _backgroundSubtractEnabled;
-    dispatch_queue_t _workerQueue;
+	    NSUInteger _selectedPointIndex;
+	    NSUInteger _backgroundScanIndex;
+	    NSUInteger _activePhaseIndex;
+	    BOOL _backgroundSubtractEnabled;
+	    BOOL _bandpassFilterEnabled;
+	    BOOL _exportInProgress;
+	    BOOL _heatmapXManual;
+	    BOOL _heatmapYManual;
+	    BOOL _timeXManual;
+	    BOOL _timeYManual;
+	    BOOL _cvXManual;
+	    BOOL _cvYManual;
+	    BOOL _waveformXManual;
+	    BOOL _waveformYManual;
+	    double _heatmapXMinManual;
+	    double _heatmapXMaxManual;
+	    double _heatmapYMinManual;
+	    double _heatmapYMaxManual;
+	    double _timeXMinManual;
+	    double _timeXMaxManual;
+	    double _timeYMinManual;
+	    double _timeYMaxManual;
+	    double _cvXMinManual;
+	    double _cvXMaxManual;
+	    double _cvYMinManual;
+	    double _cvYMaxManual;
+	    double _waveformXMinManual;
+	    double _waveformXMaxManual;
+	    double _waveformYMinManual;
+	    double _waveformYMaxManual;
+	    dispatch_queue_t _workerQueue;
     NSUInteger _traceRequestToken;
     NSString *_pendingOpenPath;
 }
@@ -956,7 +2527,9 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         _selectedScanIndex = 0U;
         _selectedPointIndex = 0U;
         _backgroundScanIndex = 0U;
+        _activePhaseIndex = 0U;
         _backgroundSubtractEnabled = NO;
+        _bandpassFilterEnabled = NO;
     }
     return self;
 }
@@ -986,6 +2559,71 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 {
     (void)sender;
     return YES;
+}
+
+- (NSTextField *)compactInputFieldWithAction:(SEL)action width:(CGFloat)width
+{
+    NSTextField *field = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    field.translatesAutoresizingMaskIntoConstraints = NO;
+    field.font = [NSFont monospacedDigitSystemFontOfSize:11.0 weight:NSFontWeightMedium];
+    field.alignment = NSTextAlignmentRight;
+    field.bezelStyle = NSTextFieldRoundedBezel;
+    field.controlSize = NSControlSizeSmall;
+    field.target = self;
+    field.action = action;
+    field.delegate = self;
+    field.enabled = NO;
+    [field.widthAnchor constraintEqualToConstant:width].active = YES;
+    return field;
+}
+
+- (NSStackView *)controlPairWithLabel:(NSString *)label field:(NSTextField *)field
+{
+    NSTextField *textLabel = HDCVLabel(label, [NSFont systemFontOfSize:10.0 weight:NSFontWeightSemibold], HDCVMutedText());
+    textLabel.alignment = NSTextAlignmentRight;
+    NSStackView *pair = [[NSStackView alloc] init];
+    pair.translatesAutoresizingMaskIntoConstraints = NO;
+    pair.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    pair.alignment = NSLayoutAttributeCenterY;
+    pair.spacing = 4.0;
+    [pair addArrangedSubview:textLabel];
+    [pair addArrangedSubview:field];
+    return pair;
+}
+
+- (NSStackView *)compactControlsStack
+{
+    NSStackView *stack = [[NSStackView alloc] init];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    stack.alignment = NSLayoutAttributeCenterY;
+    stack.spacing = 8.0;
+    return stack;
+}
+
+- (NSButton *)smallActionButtonWithTitle:(NSString *)title action:(SEL)action
+{
+    NSButton *button = [NSButton buttonWithTitle:title target:self action:action];
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    button.bezelStyle = NSBezelStyleRounded;
+    button.controlSize = NSControlSizeSmall;
+    button.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightSemibold];
+    button.enabled = NO;
+    return button;
+}
+
+- (void)setInputControlsEnabled:(BOOL)enabled
+{
+    for (NSTextField *field in @[
+        _heatmapScanField, _heatmapPointField, _heatmapBackgroundField,
+        _timeScanField, _timeBackgroundField, _cvPointField
+    ]) {
+        field.enabled = enabled;
+    }
+    _backgroundSubtractSwitch.enabled = enabled;
+    _bandpassFilterSwitch.enabled = enabled;
+    _useSelectedAsBackgroundButton.enabled = enabled;
+    _exportButton.enabled = enabled && !_exportInProgress && _loadedFile != nil;
 }
 
 - (void)buildWindow
@@ -1032,7 +2670,25 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         openButton.bezelColor = [NSColor colorWithRed:0.96 green:0.98 blue:1.0 alpha:1.0];
         openButton.contentTintColor = HDCVHeroColor();
     }
-    [heroPanel addSubview:openButton];
+
+    _exportButton = [NSButton buttonWithTitle:@"Export Data" target:self action:@selector(exportData:)];
+    _exportButton.translatesAutoresizingMaskIntoConstraints = NO;
+    _exportButton.bezelStyle = NSBezelStyleRounded;
+    _exportButton.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightSemibold];
+    _exportButton.enabled = NO;
+    if (@available(macOS 11.0, *)) {
+        _exportButton.bezelColor = [NSColor colorWithRed:0.96 green:0.98 blue:1.0 alpha:1.0];
+        _exportButton.contentTintColor = HDCVHeroColor();
+    }
+
+    NSStackView *heroActions = [[NSStackView alloc] init];
+    heroActions.translatesAutoresizingMaskIntoConstraints = NO;
+    heroActions.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    heroActions.alignment = NSLayoutAttributeCenterY;
+    heroActions.spacing = 10.0;
+    [heroActions addArrangedSubview:openButton];
+    [heroActions addArrangedSubview:_exportButton];
+    [heroPanel addSubview:heroActions];
 
     _heroTitleLabel = HDCVLabel(@"WaveNeuro FSCV Review Workspace", [NSFont systemFontOfSize:18.0 weight:NSFontWeightSemibold], NSColor.whiteColor);
     [heroPanel addSubview:_heroTitleLabel];
@@ -1051,31 +2707,18 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     _progressIndicator.displayedWhenStopped = NO;
     [heroPanel addSubview:_progressIndicator];
 
-    _timeAxisControl = [[NSSegmentedControl alloc] initWithFrame:NSZeroRect];
-    _timeAxisControl.translatesAutoresizingMaskIntoConstraints = NO;
-    _timeAxisControl.segmentCount = 2;
-    [_timeAxisControl setLabel:@"Sequence Time" forSegment:0];
-    [_timeAxisControl setLabel:@"Experiment Time" forSegment:1];
-    _timeAxisControl.trackingMode = NSSegmentSwitchTrackingSelectOne;
-    _timeAxisControl.selectedSegment = 0;
-    _timeAxisControl.target = self;
-    _timeAxisControl.action = @selector(timeAxisModeChanged:);
-    [heroPanel addSubview:_timeAxisControl];
-
     [NSLayoutConstraint activateConstraints:@[
         [_heroTitleLabel.leadingAnchor constraintEqualToAnchor:heroPanel.leadingAnchor constant:18.0],
         [_heroTitleLabel.topAnchor constraintEqualToAnchor:heroPanel.topAnchor constant:14.0],
         [_heroStatusLabel.leadingAnchor constraintEqualToAnchor:_heroTitleLabel.leadingAnchor],
         [_heroStatusLabel.topAnchor constraintEqualToAnchor:_heroTitleLabel.bottomAnchor constant:6.0],
-        [_heroStatusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:openButton.leadingAnchor constant:-16.0],
+        [_heroStatusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:heroActions.leadingAnchor constant:-16.0],
         [_fileLabel.leadingAnchor constraintEqualToAnchor:_heroTitleLabel.leadingAnchor],
         [_fileLabel.topAnchor constraintEqualToAnchor:_heroStatusLabel.bottomAnchor constant:8.0],
-        [openButton.trailingAnchor constraintEqualToAnchor:heroPanel.trailingAnchor constant:-18.0],
-        [openButton.topAnchor constraintEqualToAnchor:heroPanel.topAnchor constant:18.0],
-        [_timeAxisControl.trailingAnchor constraintEqualToAnchor:heroPanel.trailingAnchor constant:-18.0],
-        [_timeAxisControl.bottomAnchor constraintEqualToAnchor:heroPanel.bottomAnchor constant:-14.0],
-        [_progressIndicator.trailingAnchor constraintEqualToAnchor:_timeAxisControl.leadingAnchor constant:-14.0],
-        [_progressIndicator.centerYAnchor constraintEqualToAnchor:_timeAxisControl.centerYAnchor],
+        [heroActions.trailingAnchor constraintEqualToAnchor:heroPanel.trailingAnchor constant:-18.0],
+        [heroActions.topAnchor constraintEqualToAnchor:heroPanel.topAnchor constant:18.0],
+        [_progressIndicator.trailingAnchor constraintEqualToAnchor:heroActions.leadingAnchor constant:-14.0],
+        [_progressIndicator.centerYAnchor constraintEqualToAnchor:heroActions.centerYAnchor],
     ]];
 
     NSStackView *contentRow = [[NSStackView alloc] init];
@@ -1112,6 +2755,33 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         [_heatmapView.bottomAnchor constraintEqualToAnchor:heatmapPanel.bottomAnchor constant:-8.0],
     ]];
 
+    _heatmapBackgroundField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:68.0];
+    _heatmapScanField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:68.0];
+    _heatmapPointField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:68.0];
+    _backgroundSubtractSwitch = [[HDCVSwitchControl alloc] initWithFrame:NSZeroRect];
+    _backgroundSubtractSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    _backgroundSubtractSwitch.target = self;
+    _backgroundSubtractSwitch.action = @selector(backgroundSubtractToggled:);
+    [_backgroundSubtractSwitch.widthAnchor constraintEqualToConstant:48.0].active = YES;
+    [_backgroundSubtractSwitch.heightAnchor constraintEqualToConstant:28.0].active = YES;
+    _backgroundModeLabel = HDCVLabel(@"BG subtract", [NSFont systemFontOfSize:10.0 weight:NSFontWeightSemibold], HDCVMutedText());
+    _useSelectedAsBackgroundButton = [self smallActionButtonWithTitle:@"Set BG = Scan" action:@selector(useSelectedScanAsBackground:)];
+
+    NSStackView *heatmapControls = [self compactControlsStack];
+    [heatmapControls addArrangedSubview:[self controlPairWithLabel:@"BG s" field:_heatmapBackgroundField]];
+    [heatmapControls addArrangedSubview:[self controlPairWithLabel:@"Time s" field:_heatmapScanField]];
+    [heatmapControls addArrangedSubview:[self controlPairWithLabel:@"Volt V" field:_heatmapPointField]];
+    [heatmapControls addArrangedSubview:_backgroundModeLabel];
+    [heatmapControls addArrangedSubview:_backgroundSubtractSwitch];
+    [heatmapControls addArrangedSubview:_useSelectedAsBackgroundButton];
+    [heatmapPanel addSubview:heatmapControls];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [heatmapControls.trailingAnchor constraintEqualToAnchor:heatmapPanel.trailingAnchor constant:-88.0],
+        [heatmapControls.topAnchor constraintEqualToAnchor:heatmapPanel.topAnchor constant:14.0],
+        [heatmapControls.leadingAnchor constraintGreaterThanOrEqualToAnchor:heatmapPanel.leadingAnchor constant:170.0],
+    ]];
+
     NSStackView *plotRow = [[NSStackView alloc] init];
     plotRow.translatesAutoresizingMaskIntoConstraints = NO;
     plotRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
@@ -1133,7 +2803,7 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     _timePlotView.interactionMode = HDCVLinePlotInteractionModeSelectX;
     _timePlotView.titleText = @"I-t Plot";
     _timePlotView.xLabelText = @"Sequence Time (s)";
-    _timePlotView.yLabelText = @"Current";
+    _timePlotView.yLabelText = @"Current (nA)";
     _timePlotView.xTickFormat = @"%.1f";
     _timePlotView.yTickFormat = @"%.0f";
     _timePlotView.strokeColor = HDCVAccentBlue();
@@ -1146,7 +2816,7 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     _cvPlotView.interactionMode = HDCVLinePlotInteractionModeSelectX;
     _cvPlotView.titleText = @"CV Plot";
     _cvPlotView.xLabelText = @"Voltage (V)";
-    _cvPlotView.yLabelText = @"Current";
+    _cvPlotView.yLabelText = @"Current (nA)";
     _cvPlotView.xTickFormat = @"%.2f";
     _cvPlotView.yTickFormat = @"%.0f";
     _cvPlotView.strokeColor = HDCVAccentCopper();
@@ -1163,165 +2833,62 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         [_cvPlotView.bottomAnchor constraintEqualToAnchor:cvPanel.bottomAnchor constant:-8.0],
     ]];
 
-    NSView *controlsPanel = HDCVPanelContainer();
-    [sidebarColumn addArrangedSubview:controlsPanel];
-    [controlsPanel.heightAnchor constraintEqualToConstant:258.0].active = YES;
+    _timeBackgroundField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:68.0];
+    _timeScanField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:68.0];
+    _bandpassFilterSwitch = [[HDCVSwitchControl alloc] initWithFrame:NSZeroRect];
+    _bandpassFilterSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    _bandpassFilterSwitch.target = self;
+    _bandpassFilterSwitch.action = @selector(bandpassFilterToggled:);
+    [_bandpassFilterSwitch.widthAnchor constraintEqualToConstant:48.0].active = YES;
+    [_bandpassFilterSwitch.heightAnchor constraintEqualToConstant:28.0].active = YES;
+    _bandpassFilterLabel = HDCVLabel(@"Bandpass", [NSFont systemFontOfSize:10.0 weight:NSFontWeightSemibold], HDCVMutedText());
 
-    NSTextField *controlsTitle = HDCVLabel(@"Analysis Controls", [NSFont systemFontOfSize:14.0 weight:NSFontWeightSemibold], NSColor.blackColor);
-    [controlsPanel addSubview:controlsTitle];
+    NSStackView *timePrimaryControls = [self compactControlsStack];
+    [timePrimaryControls addArrangedSubview:[self controlPairWithLabel:@"BG s" field:_timeBackgroundField]];
+    [timePrimaryControls addArrangedSubview:[self controlPairWithLabel:@"Time s" field:_timeScanField]];
+    [timePrimaryControls addArrangedSubview:_bandpassFilterLabel];
+    [timePrimaryControls addArrangedSubview:_bandpassFilterSwitch];
+    [timePanel addSubview:timePrimaryControls];
 
-    _modeSummaryLabel = HDCVLabel(@"Display mode: raw current.", [NSFont systemFontOfSize:11.0 weight:NSFontWeightMedium], HDCVMutedText());
-    _modeSummaryLabel.lineBreakMode = NSLineBreakByWordWrapping;
-    [controlsPanel addSubview:_modeSummaryLabel];
+    _cvPointField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:68.0];
 
-    _scanControlLabel = HDCVLabel(@"Selected scan", [NSFont systemFontOfSize:11.5 weight:NSFontWeightSemibold], NSColor.blackColor);
-    _pointControlLabel = HDCVLabel(@"Selected voltage point", [NSFont systemFontOfSize:11.5 weight:NSFontWeightSemibold], NSColor.blackColor);
-    _backgroundControlLabel = HDCVLabel(@"Background scan", [NSFont systemFontOfSize:11.5 weight:NSFontWeightSemibold], NSColor.blackColor);
-    [controlsPanel addSubview:_scanControlLabel];
-    [controlsPanel addSubview:_pointControlLabel];
-    [controlsPanel addSubview:_backgroundControlLabel];
-
-    _scanSlider = [[NSSlider alloc] init];
-    _pointSlider = [[NSSlider alloc] init];
-    _backgroundSlider = [[NSSlider alloc] init];
-    _scanSlider.translatesAutoresizingMaskIntoConstraints = NO;
-    _pointSlider.translatesAutoresizingMaskIntoConstraints = NO;
-    _backgroundSlider.translatesAutoresizingMaskIntoConstraints = NO;
-    _scanSlider.target = self;
-    _scanSlider.action = @selector(scanSliderChanged:);
-    _scanSlider.continuous = YES;
-    _pointSlider.target = self;
-    _pointSlider.action = @selector(pointSliderChanged:);
-    _pointSlider.continuous = NO;
-    _backgroundSlider.target = self;
-    _backgroundSlider.action = @selector(backgroundSliderChanged:);
-    _backgroundSlider.continuous = NO;
-    _scanSlider.enabled = NO;
-    _pointSlider.enabled = NO;
-    _backgroundSlider.enabled = NO;
-    [controlsPanel addSubview:_scanSlider];
-    [controlsPanel addSubview:_pointSlider];
-    [controlsPanel addSubview:_backgroundSlider];
-
-    _backgroundSubtractCheckbox = [[NSButton alloc] init];
-    _backgroundSubtractCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
-    _backgroundSubtractCheckbox.buttonType = NSButtonTypeSwitch;
-    _backgroundSubtractCheckbox.title = @"Enable background subtraction";
-    _backgroundSubtractCheckbox.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightSemibold];
-    _backgroundSubtractCheckbox.target = self;
-    _backgroundSubtractCheckbox.action = @selector(backgroundSubtractToggled:);
-    _backgroundSubtractCheckbox.enabled = NO;
-    [controlsPanel addSubview:_backgroundSubtractCheckbox];
-
-    _useSelectedAsBackgroundButton = [NSButton buttonWithTitle:@"Use Selected Scan as Background" target:self action:@selector(useSelectedScanAsBackground:)];
-    _useSelectedAsBackgroundButton.translatesAutoresizingMaskIntoConstraints = NO;
-    _useSelectedAsBackgroundButton.bezelStyle = NSBezelStyleRounded;
-    _useSelectedAsBackgroundButton.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightSemibold];
-    _useSelectedAsBackgroundButton.enabled = NO;
-    [controlsPanel addSubview:_useSelectedAsBackgroundButton];
+    NSStackView *cvPrimaryControls = [self compactControlsStack];
+    [cvPrimaryControls addArrangedSubview:[self controlPairWithLabel:@"Volt V" field:_cvPointField]];
+    [cvPanel addSubview:cvPrimaryControls];
 
     [NSLayoutConstraint activateConstraints:@[
-        [controlsTitle.leadingAnchor constraintEqualToAnchor:controlsPanel.leadingAnchor constant:16.0],
-        [controlsTitle.topAnchor constraintEqualToAnchor:controlsPanel.topAnchor constant:14.0],
-        [_modeSummaryLabel.leadingAnchor constraintEqualToAnchor:controlsTitle.leadingAnchor],
-        [_modeSummaryLabel.trailingAnchor constraintEqualToAnchor:controlsPanel.trailingAnchor constant:-16.0],
-        [_modeSummaryLabel.topAnchor constraintEqualToAnchor:controlsTitle.bottomAnchor constant:6.0],
+        [timePrimaryControls.trailingAnchor constraintEqualToAnchor:timePanel.trailingAnchor constant:-32.0],
+        [timePrimaryControls.topAnchor constraintEqualToAnchor:timePanel.topAnchor constant:13.0],
+        [timePrimaryControls.leadingAnchor constraintGreaterThanOrEqualToAnchor:timePanel.leadingAnchor constant:132.0],
 
-        [_scanControlLabel.leadingAnchor constraintEqualToAnchor:controlsTitle.leadingAnchor],
-        [_scanControlLabel.topAnchor constraintEqualToAnchor:_modeSummaryLabel.bottomAnchor constant:14.0],
-        [_scanSlider.leadingAnchor constraintEqualToAnchor:controlsTitle.leadingAnchor],
-        [_scanSlider.trailingAnchor constraintEqualToAnchor:controlsPanel.trailingAnchor constant:-16.0],
-        [_scanSlider.topAnchor constraintEqualToAnchor:_scanControlLabel.bottomAnchor constant:6.0],
-
-        [_pointControlLabel.leadingAnchor constraintEqualToAnchor:controlsTitle.leadingAnchor],
-        [_pointControlLabel.topAnchor constraintEqualToAnchor:_scanSlider.bottomAnchor constant:10.0],
-        [_pointSlider.leadingAnchor constraintEqualToAnchor:controlsTitle.leadingAnchor],
-        [_pointSlider.trailingAnchor constraintEqualToAnchor:controlsPanel.trailingAnchor constant:-16.0],
-        [_pointSlider.topAnchor constraintEqualToAnchor:_pointControlLabel.bottomAnchor constant:6.0],
-
-        [_backgroundControlLabel.leadingAnchor constraintEqualToAnchor:controlsTitle.leadingAnchor],
-        [_backgroundControlLabel.topAnchor constraintEqualToAnchor:_pointSlider.bottomAnchor constant:10.0],
-        [_backgroundSlider.leadingAnchor constraintEqualToAnchor:controlsTitle.leadingAnchor],
-        [_backgroundSlider.trailingAnchor constraintEqualToAnchor:controlsPanel.trailingAnchor constant:-16.0],
-        [_backgroundSlider.topAnchor constraintEqualToAnchor:_backgroundControlLabel.bottomAnchor constant:6.0],
-
-        [_backgroundSubtractCheckbox.leadingAnchor constraintEqualToAnchor:controlsTitle.leadingAnchor],
-        [_backgroundSubtractCheckbox.topAnchor constraintEqualToAnchor:_backgroundSlider.bottomAnchor constant:12.0],
-        [_useSelectedAsBackgroundButton.leadingAnchor constraintEqualToAnchor:controlsTitle.leadingAnchor],
-        [_useSelectedAsBackgroundButton.topAnchor constraintEqualToAnchor:_backgroundSubtractCheckbox.bottomAnchor constant:8.0],
+        [cvPrimaryControls.trailingAnchor constraintEqualToAnchor:cvPanel.trailingAnchor constant:-32.0],
+        [cvPrimaryControls.topAnchor constraintEqualToAnchor:cvPanel.topAnchor constant:13.0],
+        [cvPrimaryControls.leadingAnchor constraintGreaterThanOrEqualToAnchor:cvPanel.leadingAnchor constant:132.0],
     ]];
 
-    NSView *selectionPanel = HDCVPanelContainer();
-    [sidebarColumn addArrangedSubview:selectionPanel];
-    [selectionPanel.heightAnchor constraintEqualToConstant:188.0].active = YES;
+    NSView *waveformPanel = HDCVPanelContainer();
+    [sidebarColumn addArrangedSubview:waveformPanel];
+    [waveformPanel.heightAnchor constraintGreaterThanOrEqualToConstant:420.0].active = YES;
 
-    NSTextField *selectionTitle = HDCVLabel(@"Selection Readout", [NSFont systemFontOfSize:14.0 weight:NSFontWeightSemibold], NSColor.blackColor);
-    [selectionPanel addSubview:selectionTitle];
-
-    _selectionHeadlineLabel = HDCVLabel(@"No active selection.", [NSFont systemFontOfSize:12.0 weight:NSFontWeightSemibold], NSColor.blackColor);
-    _selectionDetail1Label = HDCVLabel(@"", [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular], HDCVMutedText());
-    _selectionDetail2Label = HDCVLabel(@"", [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular], HDCVMutedText());
-    _selectionDetail3Label = HDCVLabel(@"", [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular], HDCVMutedText());
-    _selectionDetail4Label = HDCVLabel(@"", [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular], HDCVMutedText());
-    _selectionDetail1Label.lineBreakMode = NSLineBreakByWordWrapping;
-    _selectionDetail2Label.lineBreakMode = NSLineBreakByWordWrapping;
-    _selectionDetail3Label.lineBreakMode = NSLineBreakByWordWrapping;
-    _selectionDetail4Label.lineBreakMode = NSLineBreakByWordWrapping;
-    [selectionPanel addSubview:_selectionHeadlineLabel];
-    [selectionPanel addSubview:_selectionDetail1Label];
-    [selectionPanel addSubview:_selectionDetail2Label];
-    [selectionPanel addSubview:_selectionDetail3Label];
-    [selectionPanel addSubview:_selectionDetail4Label];
+    _waveformPlotView = [[HDCVLinePlotView alloc] initWithFrame:NSZeroRect];
+    _waveformPlotView.translatesAutoresizingMaskIntoConstraints = NO;
+    _waveformPlotView.dataSource = self;
+    _waveformPlotView.delegate = self;
+    _waveformPlotView.interactionMode = HDCVLinePlotInteractionModeSelectX;
+    _waveformPlotView.titleText = @"FSCV Waveform";
+    _waveformPlotView.subtitleText = @"No file loaded";
+    _waveformPlotView.xLabelText = @"Time (ms)";
+    _waveformPlotView.yLabelText = @"Voltage (V)";
+    _waveformPlotView.xTickFormat = @"%.2f";
+    _waveformPlotView.yTickFormat = @"%.2f";
+    _waveformPlotView.strokeColor = HDCVAccentTeal();
+    [waveformPanel addSubview:_waveformPlotView];
 
     [NSLayoutConstraint activateConstraints:@[
-        [selectionTitle.leadingAnchor constraintEqualToAnchor:selectionPanel.leadingAnchor constant:16.0],
-        [selectionTitle.topAnchor constraintEqualToAnchor:selectionPanel.topAnchor constant:14.0],
-        [_selectionHeadlineLabel.leadingAnchor constraintEqualToAnchor:selectionTitle.leadingAnchor],
-        [_selectionHeadlineLabel.trailingAnchor constraintEqualToAnchor:selectionPanel.trailingAnchor constant:-16.0],
-        [_selectionHeadlineLabel.topAnchor constraintEqualToAnchor:selectionTitle.bottomAnchor constant:8.0],
-        [_selectionDetail1Label.leadingAnchor constraintEqualToAnchor:selectionTitle.leadingAnchor],
-        [_selectionDetail1Label.trailingAnchor constraintEqualToAnchor:selectionPanel.trailingAnchor constant:-16.0],
-        [_selectionDetail1Label.topAnchor constraintEqualToAnchor:_selectionHeadlineLabel.bottomAnchor constant:10.0],
-        [_selectionDetail2Label.leadingAnchor constraintEqualToAnchor:selectionTitle.leadingAnchor],
-        [_selectionDetail2Label.trailingAnchor constraintEqualToAnchor:selectionPanel.trailingAnchor constant:-16.0],
-        [_selectionDetail2Label.topAnchor constraintEqualToAnchor:_selectionDetail1Label.bottomAnchor constant:6.0],
-        [_selectionDetail3Label.leadingAnchor constraintEqualToAnchor:selectionTitle.leadingAnchor],
-        [_selectionDetail3Label.trailingAnchor constraintEqualToAnchor:selectionPanel.trailingAnchor constant:-16.0],
-        [_selectionDetail3Label.topAnchor constraintEqualToAnchor:_selectionDetail2Label.bottomAnchor constant:6.0],
-        [_selectionDetail4Label.leadingAnchor constraintEqualToAnchor:selectionTitle.leadingAnchor],
-        [_selectionDetail4Label.trailingAnchor constraintEqualToAnchor:selectionPanel.trailingAnchor constant:-16.0],
-        [_selectionDetail4Label.topAnchor constraintEqualToAnchor:_selectionDetail3Label.bottomAnchor constant:6.0],
-    ]];
-
-    NSView *infoPanel = HDCVPanelContainer();
-    [sidebarColumn addArrangedSubview:infoPanel];
-
-    NSTextField *infoTitle = HDCVLabel(@"Format Summary and Metadata", [NSFont systemFontOfSize:14.0 weight:NSFontWeightSemibold], NSColor.blackColor);
-    [infoPanel addSubview:infoTitle];
-
-    _infoTextView = [[NSTextView alloc] initWithFrame:NSZeroRect];
-    _infoTextView.editable = NO;
-    _infoTextView.selectable = YES;
-    _infoTextView.font = [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightRegular];
-    _infoTextView.textColor = [NSColor colorWithRed:0.19 green:0.22 blue:0.28 alpha:1.0];
-    _infoTextView.backgroundColor = NSColor.clearColor;
-    _infoTextView.string = @"Open or drag an HDCV file to inspect its validated structure and metadata.";
-
-    _infoScrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
-    _infoScrollView.translatesAutoresizingMaskIntoConstraints = NO;
-    _infoScrollView.borderType = NSNoBorder;
-    _infoScrollView.hasVerticalScroller = YES;
-    _infoScrollView.documentView = _infoTextView;
-    _infoScrollView.drawsBackground = NO;
-    [infoPanel addSubview:_infoScrollView];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [infoTitle.leadingAnchor constraintEqualToAnchor:infoPanel.leadingAnchor constant:16.0],
-        [infoTitle.topAnchor constraintEqualToAnchor:infoPanel.topAnchor constant:14.0],
-        [_infoScrollView.leadingAnchor constraintEqualToAnchor:infoPanel.leadingAnchor constant:10.0],
-        [_infoScrollView.trailingAnchor constraintEqualToAnchor:infoPanel.trailingAnchor constant:-10.0],
-        [_infoScrollView.topAnchor constraintEqualToAnchor:infoTitle.bottomAnchor constant:8.0],
-        [_infoScrollView.bottomAnchor constraintEqualToAnchor:infoPanel.bottomAnchor constant:-10.0],
+        [_waveformPlotView.leadingAnchor constraintEqualToAnchor:waveformPanel.leadingAnchor constant:8.0],
+        [_waveformPlotView.trailingAnchor constraintEqualToAnchor:waveformPanel.trailingAnchor constant:-8.0],
+        [_waveformPlotView.topAnchor constraintEqualToAnchor:waveformPanel.topAnchor constant:8.0],
+        [_waveformPlotView.bottomAnchor constraintEqualToAnchor:waveformPanel.bottomAnchor constant:-8.0],
     ]];
 }
 
@@ -1351,19 +2918,524 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     }];
 }
 
+- (void)exportData:(id)sender
+{
+    (void)sender;
+    if (_loadedFile == nil || _exportInProgress) {
+        return;
+    }
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleInformational;
+    alert.messageText = @"Export FSCV plot data";
+    alert.informativeText = @"Exports use the current background subtraction and bandpass settings. I-t uses the selected voltage; CV uses the selected time.";
+    [alert addButtonWithTitle:@"Export"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSButton *colorCheck = [NSButton checkboxWithTitle:@"Color plot data (t, I, V)" target:nil action:nil];
+    NSButton *timeCheck = [NSButton checkboxWithTitle:@"I-t plot (t, I)" target:nil action:nil];
+    NSButton *cvCheck = [NSButton checkboxWithTitle:@"CV plot (V, I)" target:nil action:nil];
+    colorCheck.state = NSControlStateValueOn;
+    timeCheck.state = NSControlStateValueOn;
+    cvCheck.state = NSControlStateValueOn;
+
+    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 330.0, 82.0)];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 8.0;
+    [stack addArrangedSubview:colorCheck];
+    [stack addArrangedSubview:timeCheck];
+    [stack addArrangedSubview:cvCheck];
+    alert.accessoryView = stack;
+
+    [alert beginSheetModalForWindow:_window completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertFirstButtonReturn) {
+            return;
+        }
+
+        HDCVExportOptions options = 0U;
+        NSUInteger selectedCount = 0U;
+        if (colorCheck.state == NSControlStateValueOn) {
+            options |= HDCVExportOptionColorPlot;
+            selectedCount += 1U;
+        }
+        if (timeCheck.state == NSControlStateValueOn) {
+            options |= HDCVExportOptionTimePlot;
+            selectedCount += 1U;
+        }
+        if (cvCheck.state == NSControlStateValueOn) {
+            options |= HDCVExportOptionCVPlot;
+            selectedCount += 1U;
+        }
+
+        if (selectedCount == 0U) {
+            NSAlert *emptyAlert = [[NSAlert alloc] init];
+            emptyAlert.alertStyle = NSAlertStyleWarning;
+            emptyAlert.messageText = @"Choose at least one CSV export";
+            [emptyAlert beginSheetModalForWindow:self->_window completionHandler:nil];
+            return;
+        }
+
+        NSSavePanel *savePanel = [NSSavePanel savePanel];
+        NSString *baseName = self->_pendingOpenPath.lastPathComponent.stringByDeletingPathExtension;
+        if (baseName.length == 0U) {
+            baseName = @"hdcv_export";
+        }
+        savePanel.nameFieldStringValue = [NSString stringWithFormat:@"%@_export.csv", baseName];
+        savePanel.message = selectedCount > 1U
+            ? @"Choose a base filename. The selected plots will be written as separate suffixed CSV files."
+            : @"Choose the CSV filename.";
+        savePanel.canCreateDirectories = YES;
+
+        [savePanel beginSheetModalForWindow:self->_window completionHandler:^(NSModalResponse saveResponse) {
+            if (saveResponse != NSModalResponseOK || savePanel.URL == nil) {
+                return;
+            }
+            [self performExportWithOptions:options baseURL:savePanel.URL singleFile:(selectedCount == 1U)];
+        }];
+    }];
+}
+
 - (void)dropHostView:(HDCVDropHostView *)view didReceiveFilePath:(NSString *)filePath
 {
     (void)view;
     [self loadFileAtPath:filePath];
 }
 
+- (BOOL)writeTimePlotCSVToURL:(NSURL *)url
+                    loadedFile:(HDCVLoadedFile *)loadedFile
+                    pointIndex:(NSUInteger)pointIndex
+           backgroundScanIndex:(NSUInteger)backgroundScanIndex
+    backgroundSubtractEnabled:(BOOL)backgroundSubtractEnabled
+         bandpassFilterEnabled:(BOOL)bandpassFilterEnabled
+              activePhaseIndex:(NSUInteger)activePhaseIndex
+                   phasePeriod:(NSUInteger)phasePeriod
+                         error:(NSError **)error
+{
+    NSUInteger scanCount = loadedFile.scanCount;
+    NSMutableData *traceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
+    FILE *file = HDCVOpenCSVFile(url, error);
+    if (file == NULL) {
+        return NO;
+    }
+
+    if (![loadedFile copyPointTraceAtIndex:(uint32_t)pointIndex intoMutableData:traceData min:NULL max:NULL]) {
+        fclose(file);
+        HDCVSetCSVError(error, url, @"Could not read the selected I-t trace.");
+        return NO;
+    }
+
+    float *trace = traceData.mutableBytes;
+    if (backgroundSubtractEnabled) {
+        NSMutableData *sourceTraceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
+        memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
+        HDCVApplyPhaseAlignedBackgroundToTrace(
+            sourceTraceData.bytes,
+            trace,
+            scanCount,
+            backgroundScanIndex,
+            phasePeriod
+        );
+    }
+    if (bandpassFilterEnabled) {
+        (void)HDCVApplyButterworthBandpassByPhase(trace, scanCount, phasePeriod, loadedFile.cvfHz);
+    }
+
+    fprintf(file, "time_s,current_nA\n");
+    NSUInteger firstScan = HDCVFirstPhaseScanInRange(0U, scanCount - 1U, activePhaseIndex, phasePeriod);
+    for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex < scanCount; scanIndex += MAX(phasePeriod, 1U)) {
+        fprintf(file, "%.9g,%.9g\n", [loadedFile sequenceTimeSecondsAtScan:scanIndex], (double)trace[scanIndex]);
+    }
+    return HDCVCloseCSVFile(file, url, error);
+}
+
+- (BOOL)writeCVPlotCSVToURL:(NSURL *)url
+                 loadedFile:(HDCVLoadedFile *)loadedFile
+                  scanIndex:(NSUInteger)scanIndex
+        backgroundScanIndex:(NSUInteger)backgroundScanIndex
+ backgroundSubtractEnabled:(BOOL)backgroundSubtractEnabled
+      bandpassFilterEnabled:(BOOL)bandpassFilterEnabled
+           activePhaseIndex:(NSUInteger)activePhaseIndex
+                phasePeriod:(NSUInteger)phasePeriod
+                      error:(NSError **)error
+{
+    NSUInteger scanCount = loadedFile.scanCount;
+    NSUInteger pointsPerScan = loadedFile.pointsPerScan;
+    FILE *file = HDCVOpenCSVFile(url, error);
+    if (file == NULL) {
+        return NO;
+    }
+
+    fprintf(file, "voltage_V,current_nA\n");
+    if (bandpassFilterEnabled) {
+        NSMutableData *traceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
+        NSMutableData *sourceTraceData = backgroundSubtractEnabled ? [NSMutableData dataWithLength:scanCount * sizeof(float)] : nil;
+        NSMutableData *cvData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+        float *cvValues = cvData.mutableBytes;
+
+        for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+            if (![loadedFile copyPointTraceAtIndex:(uint32_t)pointIndex intoMutableData:traceData min:NULL max:NULL]) {
+                fclose(file);
+                HDCVSetCSVError(error, url, @"Could not read a waveform-point trace for CV export.");
+                return NO;
+            }
+
+            float *trace = traceData.mutableBytes;
+            if (backgroundSubtractEnabled) {
+                memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
+                HDCVApplyPhaseAlignedBackgroundToTrace(
+                    sourceTraceData.bytes,
+                    trace,
+                    scanCount,
+                    backgroundScanIndex,
+                    phasePeriod
+                );
+            }
+            (void)HDCVApplyButterworthBandpassByPhase(trace, scanCount, phasePeriod, loadedFile.cvfHz);
+            float current = HDCVAverageTraceInPhaseWindow(
+                trace,
+                scanCount,
+                scanIndex,
+                activePhaseIndex,
+                phasePeriod,
+                HDCVCVSelectedHalfWindow
+            );
+            cvValues[pointIndex] = current;
+        }
+        if (backgroundSubtractEnabled) {
+            HDCVApplyBackgroundSubtractedCVDenoise(cvValues, loadedFile.voltageData.bytes, pointsPerScan);
+        }
+        for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+            fprintf(file, "%.9g,%.9g\n", (double)[loadedFile voltageAtPoint:pointIndex], (double)cvValues[pointIndex]);
+        }
+    } else {
+        NSMutableData *selectedAverageData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+        NSMutableData *backgroundAverageData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+        NSMutableData *cvData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+        NSMutableData *scratchData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+        NSMutableData *sumsData = [NSMutableData dataWithLength:pointsPerScan * sizeof(double)];
+        double *sums = sumsData.mutableBytes;
+        float *selectedAverage = selectedAverageData.mutableBytes;
+        float *backgroundAverage = backgroundAverageData.mutableBytes;
+        float *cvValues = cvData.mutableBytes;
+        BOOL hasBackgroundAverage = NO;
+
+        BOOL (^copyAverageScan)(NSUInteger, NSUInteger, float *) = ^BOOL(NSUInteger centerScan, NSUInteger halfWindow, float *destination) {
+            NSUInteger center = HDCVNearestScanIndexForPhase(centerScan, scanCount, activePhaseIndex, phasePeriod);
+            NSInteger start = (NSInteger)center - ((NSInteger)halfWindow * (NSInteger)phasePeriod);
+            NSInteger end = (NSInteger)center + ((NSInteger)halfWindow * (NSInteger)phasePeriod);
+            NSUInteger usedCount = 0U;
+            memset(sums, 0, pointsPerScan * sizeof(double));
+            while (start < 0) {
+                start += (NSInteger)phasePeriod;
+            }
+            while (end >= (NSInteger)scanCount) {
+                end -= (NSInteger)phasePeriod;
+            }
+            for (NSInteger localScan = start; localScan <= end; localScan += (NSInteger)phasePeriod) {
+                if (localScan < 0 || localScan >= (NSInteger)scanCount) {
+                    continue;
+                }
+                if (![loadedFile copyScanAtIndex:(uint32_t)localScan intoMutableData:scratchData min:NULL max:NULL]) {
+                    return NO;
+                }
+                const float *scratch = scratchData.bytes;
+                for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+                    sums[pointIndex] += (double)scratch[pointIndex];
+                }
+                usedCount += 1U;
+            }
+            if (usedCount == 0U) {
+                if (![loadedFile copyScanAtIndex:(uint32_t)center intoMutableData:scratchData min:NULL max:NULL]) {
+                    return NO;
+                }
+                memcpy(destination, scratchData.bytes, pointsPerScan * sizeof(float));
+                return YES;
+            }
+            double invCount = 1.0 / (double)usedCount;
+            for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+                destination[pointIndex] = (float)(sums[pointIndex] * invCount);
+            }
+            return YES;
+        };
+
+        if (!copyAverageScan(scanIndex, HDCVCVSelectedHalfWindow, selectedAverage)) {
+            fclose(file);
+            HDCVSetCSVError(error, url, @"Could not read the selected CV scan average.");
+            return NO;
+        }
+
+        if (backgroundSubtractEnabled) {
+            if (!copyAverageScan(backgroundScanIndex, HDCVCVBackgroundHalfWindow, backgroundAverage)) {
+                fclose(file);
+                HDCVSetCSVError(error, url, @"Could not read the phase-aligned background average for CV export.");
+                return NO;
+            }
+            hasBackgroundAverage = YES;
+        }
+
+        for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+            double current = (double)selectedAverage[pointIndex] - (hasBackgroundAverage ? (double)backgroundAverage[pointIndex] : 0.0);
+            cvValues[pointIndex] = (float)current;
+        }
+        if (backgroundSubtractEnabled) {
+            HDCVApplyBackgroundSubtractedCVDenoise(cvValues, loadedFile.voltageData.bytes, pointsPerScan);
+        }
+        for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+            fprintf(file, "%.9g,%.9g\n", (double)[loadedFile voltageAtPoint:pointIndex], (double)cvValues[pointIndex]);
+        }
+    }
+
+    return HDCVCloseCSVFile(file, url, error);
+}
+
+- (BOOL)writeColorPlotCSVToURL:(NSURL *)url
+                    loadedFile:(HDCVLoadedFile *)loadedFile
+                    scanMinIndex:(NSUInteger)scanMinIndex
+                    scanMaxIndex:(NSUInteger)scanMaxIndex
+                   pointMinIndex:(NSUInteger)pointMinIndex
+                   pointMaxIndex:(NSUInteger)pointMaxIndex
+            backgroundScanIndex:(NSUInteger)backgroundScanIndex
+     backgroundSubtractEnabled:(BOOL)backgroundSubtractEnabled
+          bandpassFilterEnabled:(BOOL)bandpassFilterEnabled
+               activePhaseIndex:(NSUInteger)activePhaseIndex
+                    phasePeriod:(NSUInteger)phasePeriod
+                          error:(NSError **)error
+{
+    NSUInteger scanCount = loadedFile.scanCount;
+    NSUInteger pointsPerScan = loadedFile.pointsPerScan;
+    NSUInteger exportScanCount = HDCVPhaseSampleCountInRange(scanMinIndex, scanMaxIndex, activePhaseIndex, phasePeriod);
+    NSUInteger exportPointCount = pointMaxIndex - pointMinIndex + 1U;
+    FILE *file = HDCVOpenCSVFile(url, error);
+    if (file == NULL) {
+        return NO;
+    }
+
+    fprintf(file, "time_s,current_nA,voltage_V\n");
+    if (bandpassFilterEnabled) {
+        NSMutableData *traceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
+        NSMutableData *sourceTraceData = backgroundSubtractEnabled ? [NSMutableData dataWithLength:scanCount * sizeof(float)] : nil;
+        NSMutableData *matrixData = [NSMutableData dataWithLength:exportScanCount * exportPointCount * sizeof(float)];
+        float *matrix = matrixData.mutableBytes;
+
+        for (NSUInteger pointIndex = pointMinIndex; pointIndex <= pointMaxIndex; ++pointIndex) {
+            if (![loadedFile copyPointTraceAtIndex:(uint32_t)pointIndex intoMutableData:traceData min:NULL max:NULL]) {
+                fclose(file);
+                HDCVSetCSVError(error, url, @"Could not read a waveform-point trace for color plot export.");
+                return NO;
+            }
+
+            float *trace = traceData.mutableBytes;
+            if (backgroundSubtractEnabled) {
+                memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
+                HDCVApplyPhaseAlignedBackgroundToTrace(
+                    sourceTraceData.bytes,
+                    trace,
+                    scanCount,
+                    backgroundScanIndex,
+                    phasePeriod
+                );
+            }
+            (void)HDCVApplyButterworthBandpassByPhase(trace, scanCount, phasePeriod, loadedFile.cvfHz);
+
+            NSUInteger localPoint = pointIndex - pointMinIndex;
+            NSUInteger localScan = 0U;
+            NSUInteger firstScan = HDCVFirstPhaseScanInRange(scanMinIndex, scanMaxIndex, activePhaseIndex, phasePeriod);
+            for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex <= scanMaxIndex; scanIndex += MAX(phasePeriod, 1U)) {
+                matrix[(localScan * exportPointCount) + localPoint] = trace[scanIndex];
+                localScan += 1U;
+            }
+        }
+
+        NSUInteger localScan = 0U;
+        NSUInteger firstScan = HDCVFirstPhaseScanInRange(scanMinIndex, scanMaxIndex, activePhaseIndex, phasePeriod);
+        for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex <= scanMaxIndex; scanIndex += MAX(phasePeriod, 1U)) {
+            double time = [loadedFile sequenceTimeSecondsAtScan:scanIndex];
+            for (NSUInteger pointIndex = pointMinIndex; pointIndex <= pointMaxIndex; ++pointIndex) {
+                NSUInteger localPoint = pointIndex - pointMinIndex;
+                fprintf(
+                    file,
+                    "%.9g,%.9g,%.9g\n",
+                    time,
+                    (double)matrix[(localScan * exportPointCount) + localPoint],
+                    (double)[loadedFile voltageAtPoint:pointIndex]
+                );
+            }
+            localScan += 1U;
+        }
+    } else {
+        NSMutableDictionary<NSNumber *, NSData *> *backgroundCache = [NSMutableDictionary dictionary];
+        NSMutableData *scanData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+
+        NSUInteger firstScan = HDCVFirstPhaseScanInRange(scanMinIndex, scanMaxIndex, activePhaseIndex, phasePeriod);
+        for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex <= scanMaxIndex; scanIndex += MAX(phasePeriod, 1U)) {
+            if (![loadedFile copyScanAtIndex:(uint32_t)scanIndex intoMutableData:scanData min:NULL max:NULL]) {
+                fclose(file);
+                HDCVSetCSVError(error, url, @"Could not read a scan for color plot export.");
+                return NO;
+            }
+
+            const float *background = NULL;
+            if (backgroundSubtractEnabled) {
+                NSUInteger alignedIndex = HDCVPhaseAlignedBackgroundIndex(backgroundScanIndex, scanIndex, scanCount, phasePeriod);
+                NSNumber *key = @(alignedIndex);
+                NSData *cachedBackground = backgroundCache[key];
+                if (cachedBackground == nil) {
+                    NSMutableData *backgroundData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+                    if (![loadedFile copyScanAtIndex:(uint32_t)alignedIndex intoMutableData:backgroundData min:NULL max:NULL]) {
+                        fclose(file);
+                        HDCVSetCSVError(error, url, @"Could not read a phase-aligned background scan for color plot export.");
+                        return NO;
+                    }
+                    cachedBackground = [backgroundData copy];
+                    backgroundCache[key] = cachedBackground;
+                }
+                background = cachedBackground.bytes;
+            }
+
+            const float *scan = scanData.bytes;
+            double time = [loadedFile sequenceTimeSecondsAtScan:scanIndex];
+            for (NSUInteger pointIndex = pointMinIndex; pointIndex <= pointMaxIndex; ++pointIndex) {
+                double current = (double)scan[pointIndex] - ((background != NULL) ? (double)background[pointIndex] : 0.0);
+                fprintf(file, "%.9g,%.9g,%.9g\n", time, current, (double)[loadedFile voltageAtPoint:pointIndex]);
+            }
+        }
+    }
+
+    return HDCVCloseCSVFile(file, url, error);
+}
+
+- (void)performExportWithOptions:(HDCVExportOptions)options baseURL:(NSURL *)baseURL singleFile:(BOOL)singleFile
+{
+    HDCVLoadedFile *loadedFile = _loadedFile;
+    if (loadedFile == nil) {
+        return;
+    }
+
+    NSUInteger selectedScanIndex = MIN(_selectedScanIndex, (NSUInteger)loadedFile.scanCount - 1U);
+    NSUInteger selectedPointIndex = MIN(_selectedPointIndex, (NSUInteger)loadedFile.pointsPerScan - 1U);
+    NSUInteger backgroundScanIndex = MIN(_backgroundScanIndex, (NSUInteger)loadedFile.scanCount - 1U);
+    NSUInteger phasePeriod = MAX((NSUInteger)loadedFile.phasePeriod, 1U);
+    NSUInteger activePhaseIndex = _activePhaseIndex % phasePeriod;
+    BOOL backgroundSubtractEnabled = _backgroundSubtractEnabled;
+    BOOL bandpassFilterEnabled = _bandpassFilterEnabled;
+    NSUInteger scanMinIndex = MIN(_heatmapView.visibleScanMinIndex, (NSUInteger)loadedFile.scanCount - 1U);
+    NSUInteger scanMaxIndex = (_heatmapView.visibleScanMaxIndex == NSNotFound)
+        ? (NSUInteger)loadedFile.scanCount - 1U
+        : MIN(_heatmapView.visibleScanMaxIndex, (NSUInteger)loadedFile.scanCount - 1U);
+    NSUInteger pointMinIndex = MIN(_heatmapView.visiblePointMinIndex, (NSUInteger)loadedFile.pointsPerScan - 1U);
+    NSUInteger pointMaxIndex = (_heatmapView.visiblePointMaxIndex == NSNotFound)
+        ? (NSUInteger)loadedFile.pointsPerScan - 1U
+        : MIN(_heatmapView.visiblePointMaxIndex, (NSUInteger)loadedFile.pointsPerScan - 1U);
+
+    if (scanMaxIndex < scanMinIndex) {
+        scanMaxIndex = scanMinIndex;
+    }
+    if (pointMaxIndex < pointMinIndex) {
+        pointMaxIndex = pointMinIndex;
+    }
+
+    _exportInProgress = YES;
+    _exportButton.enabled = NO;
+    _heroStatusLabel.stringValue = @"Exporting CSV data from the current FSCV plot state…";
+    [_progressIndicator startAnimation:nil];
+
+    dispatch_async(_workerQueue, ^{
+        NSError *error = nil;
+        NSMutableArray<NSURL *> *writtenURLs = [NSMutableArray array];
+
+        if ((options & HDCVExportOptionColorPlot) != 0U) {
+            NSURL *url = HDCVExportURLForSuffix(baseURL, @"color", singleFile);
+            if (![self writeColorPlotCSVToURL:url
+                                   loadedFile:loadedFile
+                                 scanMinIndex:scanMinIndex
+                                 scanMaxIndex:scanMaxIndex
+                                pointMinIndex:pointMinIndex
+                                pointMaxIndex:pointMaxIndex
+                          backgroundScanIndex:backgroundScanIndex
+                   backgroundSubtractEnabled:backgroundSubtractEnabled
+                        bandpassFilterEnabled:bandpassFilterEnabled
+                              activePhaseIndex:activePhaseIndex
+                                  phasePeriod:phasePeriod
+                                        error:&error]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self finishExportWithError:error writtenURLs:writtenURLs];
+                });
+                return;
+            }
+            [writtenURLs addObject:url];
+        }
+
+        if ((options & HDCVExportOptionTimePlot) != 0U) {
+            NSURL *url = HDCVExportURLForSuffix(baseURL, @"it", singleFile);
+            if (![self writeTimePlotCSVToURL:url
+                                  loadedFile:loadedFile
+                                  pointIndex:selectedPointIndex
+                         backgroundScanIndex:backgroundScanIndex
+                  backgroundSubtractEnabled:backgroundSubtractEnabled
+                       bandpassFilterEnabled:bandpassFilterEnabled
+                             activePhaseIndex:activePhaseIndex
+                                 phasePeriod:phasePeriod
+                                       error:&error]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self finishExportWithError:error writtenURLs:writtenURLs];
+                });
+                return;
+            }
+            [writtenURLs addObject:url];
+        }
+
+        if ((options & HDCVExportOptionCVPlot) != 0U) {
+            NSURL *url = HDCVExportURLForSuffix(baseURL, @"cv", singleFile);
+            if (![self writeCVPlotCSVToURL:url
+                                loadedFile:loadedFile
+                                 scanIndex:selectedScanIndex
+                       backgroundScanIndex:backgroundScanIndex
+                backgroundSubtractEnabled:backgroundSubtractEnabled
+                     bandpassFilterEnabled:bandpassFilterEnabled
+                          activePhaseIndex:activePhaseIndex
+                               phasePeriod:phasePeriod
+                                     error:&error]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self finishExportWithError:error writtenURLs:writtenURLs];
+                });
+                return;
+            }
+            [writtenURLs addObject:url];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self finishExportWithError:nil writtenURLs:writtenURLs];
+        });
+    });
+}
+
+- (void)finishExportWithError:(NSError *)error writtenURLs:(NSArray<NSURL *> *)writtenURLs
+{
+    _exportInProgress = NO;
+    [_progressIndicator stopAnimation:nil];
+    [self setInputControlsEnabled:(_loadedFile != nil)];
+
+    if (error != nil) {
+        _heroStatusLabel.stringValue = error.localizedDescription;
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.alertStyle = NSAlertStyleWarning;
+        alert.messageText = @"CSV export failed";
+        alert.informativeText = (error.localizedDescription != nil)
+            ? error.localizedDescription
+            : @"The selected plot data could not be exported.";
+        [alert beginSheetModalForWindow:_window completionHandler:nil];
+        return;
+    }
+
+    NSString *fileList = [[writtenURLs valueForKey:@"lastPathComponent"] componentsJoinedByString:@", "];
+    _heroStatusLabel.stringValue = [NSString stringWithFormat:@"Export complete: %@", fileList];
+}
+
 - (void)loadFileAtPath:(NSString *)path
 {
     _pendingOpenPath = path;
-    _scanSlider.enabled = NO;
-    _pointSlider.enabled = NO;
-    _backgroundSlider.enabled = NO;
-    _backgroundSubtractCheckbox.enabled = NO;
+    [self setInputControlsEnabled:NO];
     _useSelectedAsBackgroundButton.enabled = NO;
     _fileLabel.stringValue = path.lastPathComponent;
     _heroStatusLabel.stringValue = @"Loading file, validating offsets, and preparing interactive FSCV views…";
@@ -1392,37 +3464,32 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 - (void)installLoadedFile:(HDCVLoadedFile *)loaded
 {
     _loadedFile = loaded;
-    _infoTextView.string = loaded.summaryAndMetadataText;
 
     _selectedRawScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
     _backgroundScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
+    _selectedPhaseBackgroundScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
     _displayScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
+    _displayCVScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
     _rawPointTraceData = [NSMutableData dataWithLength:(NSUInteger)loaded.scanCount * sizeof(float)];
     _displayPointTraceData = [NSMutableData dataWithLength:(NSUInteger)loaded.scanCount * sizeof(float)];
 
-    _selectedScanIndex = loaded.scanCount / 2U;
+    _activePhaseIndex = 0U;
+    _selectedScanIndex = [self scanIndexNearestActivePhaseToScanIndex:loaded.scanCount / 2U];
     _selectedPointIndex = loaded.pointsPerScan / 2U;
-    _backgroundScanIndex = 0U;
+    _backgroundScanIndex = [self scanIndexNearestActivePhaseToScanIndex:0U];
     _backgroundSubtractEnabled = NO;
-
-    _scanSlider.enabled = YES;
-    _pointSlider.enabled = YES;
-    _backgroundSlider.enabled = YES;
-    _backgroundSubtractCheckbox.enabled = YES;
-    _useSelectedAsBackgroundButton.enabled = YES;
-    _backgroundSubtractCheckbox.state = NSControlStateValueOff;
-
-    _scanSlider.minValue = 0.0;
-    _scanSlider.maxValue = (double)(loaded.scanCount - 1U);
-    _scanSlider.doubleValue = (double)_selectedScanIndex;
-
-    _pointSlider.minValue = 0.0;
-    _pointSlider.maxValue = (double)(loaded.pointsPerScan - 1U);
-    _pointSlider.doubleValue = (double)_selectedPointIndex;
-
-    _backgroundSlider.minValue = 0.0;
-    _backgroundSlider.maxValue = (double)(loaded.scanCount - 1U);
-    _backgroundSlider.doubleValue = (double)_backgroundScanIndex;
+    _bandpassFilterEnabled = NO;
+    _heatmapXManual = NO;
+    _heatmapYManual = NO;
+    _timeXManual = NO;
+    _timeYManual = NO;
+    _cvXManual = NO;
+    _cvYManual = NO;
+    _waveformXManual = NO;
+    _waveformYManual = NO;
+    _backgroundSubtractSwitch.on = NO;
+    _bandpassFilterSwitch.on = NO;
+    [self setInputControlsEnabled:YES];
 
     _heatmapView.scanCount = loaded.scanCount;
     _heatmapView.pointCount = loaded.pointsPerScan;
@@ -1435,6 +3502,8 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     _timePlotView.yTickFormat = @"%.0f";
     _cvPlotView.xTickFormat = @"%.2f";
     _cvPlotView.yTickFormat = @"%.0f";
+    _waveformPlotView.xTickFormat = @"%.2f";
+    _waveformPlotView.yTickFormat = @"%.2f";
 
     [self copyBackgroundScan];
     [self copySelectedScan];
@@ -1445,8 +3514,12 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     [self refreshSelectionReadout];
     [self requestPointTraceRefresh];
 
-    _fileLabel.stringValue = [NSString stringWithFormat:@"%@  |  %u scans × %u points", _pendingOpenPath.lastPathComponent, loaded.scanCount, loaded.pointsPerScan];
-    _heroStatusLabel.stringValue = @"Layout verified. Click or drag across the color plot, I-t plot, or CV plot to explore the FSCV recording.";
+    _fileLabel.stringValue = [self fileSubtitleForLoadedFile:loaded filename:_pendingOpenPath.lastPathComponent];
+    _heroStatusLabel.stringValue = ([self activePhasePeriod] > 1U)
+        ? [NSString stringWithFormat:@"Layout verified. Showing phase %lu of %lu; crosshairs snap to that FSCV scan family.",
+            (unsigned long)_activePhaseIndex + 1UL,
+            (unsigned long)[self activePhasePeriod]]
+        : @"Layout verified. Grab a crosshair line to move it; sequence time is used for all time axes.";
 }
 
 - (BOOL)copyBackgroundScan
@@ -1458,17 +3531,233 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     return [_loadedFile copyScanAtIndex:(uint32_t)_backgroundScanIndex intoMutableData:_backgroundScanData min:NULL max:NULL];
 }
 
+- (NSUInteger)activePhasePeriod
+{
+    return (_loadedFile == nil) ? 1U : MAX((NSUInteger)_loadedFile.phasePeriod, 1U);
+}
+
+- (NSUInteger)scanIndexNearestActivePhaseToScanIndex:(NSUInteger)scanIndex
+{
+    if (_loadedFile == nil) {
+        return 0U;
+    }
+    return HDCVNearestScanIndexForPhase(
+        scanIndex,
+        (NSUInteger)_loadedFile.scanCount,
+        _activePhaseIndex,
+        [self activePhasePeriod]
+    );
+}
+
+- (NSUInteger)phaseAlignedBackgroundScanIndexForScan:(NSUInteger)scanIndex
+{
+    return HDCVPhaseAlignedBackgroundIndex(
+        _backgroundScanIndex,
+        scanIndex,
+        (NSUInteger)_loadedFile.scanCount,
+        (NSUInteger)_loadedFile.phasePeriod
+    );
+}
+
+- (BOOL)copyPhaseAlignedBackgroundScanForSelectedScan
+{
+    if (_loadedFile == nil) {
+        return NO;
+    }
+    NSUInteger alignedIndex = [self phaseAlignedBackgroundScanIndexForScan:_selectedScanIndex];
+    return [_loadedFile copyScanAtIndex:(uint32_t)alignedIndex intoMutableData:_selectedPhaseBackgroundScanData min:NULL max:NULL];
+}
+
 - (BOOL)copySelectedScan
 {
     if (_loadedFile == nil) {
         return NO;
     }
-    return [_loadedFile copyScanAtIndex:(uint32_t)_selectedScanIndex intoMutableData:_selectedRawScanData min:NULL max:NULL];
+    if (![_loadedFile copyScanAtIndex:(uint32_t)_selectedScanIndex intoMutableData:_selectedRawScanData min:NULL max:NULL]) {
+        return NO;
+    }
+    return [self copyPhaseAlignedBackgroundScanForSelectedScan];
 }
 
-- (NSString *)displayModeText
+- (NSData *)cachedBackgroundScanForIndex:(NSUInteger)scanIndex cache:(NSMutableDictionary<NSNumber *, NSData *> *)cache
 {
-    return _backgroundSubtractEnabled ? @"background-subtracted current" : @"raw current";
+    NSNumber *key = @(scanIndex);
+    NSData *cached = cache[key];
+    if (cached != nil) {
+        return cached;
+    }
+
+    NSMutableData *buffer = [NSMutableData dataWithLength:(NSUInteger)_loadedFile.pointsPerScan * sizeof(float)];
+    if (![_loadedFile copyScanAtIndex:(uint32_t)scanIndex intoMutableData:buffer min:NULL max:NULL]) {
+        return nil;
+    }
+    NSData *frozen = [buffer copy];
+    cache[key] = frozen;
+    return frozen;
+}
+
+- (BOOL)copyAverageScanAroundIndex:(NSUInteger)centerScan
+                        halfWindow:(NSUInteger)halfWindow
+                    intoMutableData:(NSMutableData *)destination
+{
+    if (_loadedFile == nil) {
+        return NO;
+    }
+
+    NSUInteger scanCount = _loadedFile.scanCount;
+    NSUInteger pointsPerScan = _loadedFile.pointsPerScan;
+    NSUInteger period = [self activePhasePeriod];
+    NSUInteger center = [self scanIndexNearestActivePhaseToScanIndex:centerScan];
+    NSInteger start = (NSInteger)center - ((NSInteger)halfWindow * (NSInteger)period);
+    NSInteger end = (NSInteger)center + ((NSInteger)halfWindow * (NSInteger)period);
+    NSMutableData *scanData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+    NSMutableData *sumsData = [NSMutableData dataWithLength:pointsPerScan * sizeof(double)];
+    double *sums = sumsData.mutableBytes;
+    NSUInteger usedCount = 0U;
+
+    destination.length = pointsPerScan * sizeof(float);
+    while (start < 0) {
+        start += (NSInteger)period;
+    }
+    while (end >= (NSInteger)scanCount) {
+        end -= (NSInteger)period;
+    }
+
+    for (NSInteger scanIndex = start; scanIndex <= end; scanIndex += (NSInteger)period) {
+        if (scanIndex < 0 || scanIndex >= (NSInteger)scanCount) {
+            continue;
+        }
+        if (![_loadedFile copyScanAtIndex:(uint32_t)scanIndex intoMutableData:scanData min:NULL max:NULL]) {
+            return NO;
+        }
+        const float *scan = scanData.bytes;
+        for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+            sums[pointIndex] += (double)scan[pointIndex];
+        }
+        usedCount += 1U;
+    }
+
+    if (usedCount == 0U) {
+        return [_loadedFile copyScanAtIndex:(uint32_t)center intoMutableData:destination min:NULL max:NULL];
+    }
+
+    float *average = destination.mutableBytes;
+    double invCount = 1.0 / (double)usedCount;
+    for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+        average[pointIndex] = (float)(sums[pointIndex] * invCount);
+    }
+    return YES;
+}
+
+- (BOOL)copyBandpassFilteredSelectedScanIntoDisplayBuffer
+{
+    NSUInteger scanCount;
+    NSUInteger pointsPerScan;
+    NSMutableData *traceData;
+    NSMutableData *sourceTraceData;
+    float *displayScan;
+
+    if (_loadedFile == nil) {
+        return NO;
+    }
+
+    scanCount = _loadedFile.scanCount;
+    pointsPerScan = _loadedFile.pointsPerScan;
+    traceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
+    sourceTraceData = _backgroundSubtractEnabled ? [NSMutableData dataWithLength:scanCount * sizeof(float)] : nil;
+    displayScan = _displayScanData.mutableBytes;
+
+    for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+        if (![_loadedFile copyPointTraceAtIndex:(uint32_t)pointIndex intoMutableData:traceData min:NULL max:NULL]) {
+            return NO;
+        }
+
+        float *trace = traceData.mutableBytes;
+        if (_backgroundSubtractEnabled) {
+            memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
+            HDCVApplyPhaseAlignedBackgroundToTrace(
+                sourceTraceData.bytes,
+                trace,
+                scanCount,
+                _backgroundScanIndex,
+                (NSUInteger)_loadedFile.phasePeriod
+            );
+        }
+
+        (void)HDCVApplyButterworthBandpassByPhase(trace, scanCount, [self activePhasePeriod], _loadedFile.cvfHz);
+        displayScan[pointIndex] = trace[_selectedScanIndex];
+    }
+
+    HDCVRobustRange(_displayScanData.bytes, pointsPerScan, &_displayScanMin, &_displayScanMax);
+    return YES;
+}
+
+- (BOOL)copyProcessedCVScanIntoDisplayBuffer
+{
+    if (_loadedFile == nil) {
+        return NO;
+    }
+
+    NSUInteger scanCount = _loadedFile.scanCount;
+    NSUInteger pointsPerScan = _loadedFile.pointsPerScan;
+    float *displayCVScan = _displayCVScanData.mutableBytes;
+
+    if (_bandpassFilterEnabled) {
+        NSMutableData *traceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
+        NSMutableData *sourceTraceData = _backgroundSubtractEnabled ? [NSMutableData dataWithLength:scanCount * sizeof(float)] : nil;
+
+        for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+            if (![_loadedFile copyPointTraceAtIndex:(uint32_t)pointIndex intoMutableData:traceData min:NULL max:NULL]) {
+                return NO;
+            }
+
+            float *trace = traceData.mutableBytes;
+            if (_backgroundSubtractEnabled) {
+                memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
+                HDCVApplyPhaseAlignedBackgroundToTrace(
+                    sourceTraceData.bytes,
+                    trace,
+                    scanCount,
+                    _backgroundScanIndex,
+                    [self activePhasePeriod]
+                );
+            }
+            (void)HDCVApplyButterworthBandpassByPhase(trace, scanCount, [self activePhasePeriod], _loadedFile.cvfHz);
+            displayCVScan[pointIndex] = HDCVAverageTraceInPhaseWindow(
+                trace,
+                scanCount,
+                _selectedScanIndex,
+                _activePhaseIndex,
+                [self activePhasePeriod],
+                HDCVCVSelectedHalfWindow
+            );
+        }
+    } else {
+        NSMutableData *selectedAverageData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+        NSMutableData *backgroundAverageData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+        if (![self copyAverageScanAroundIndex:_selectedScanIndex halfWindow:HDCVCVSelectedHalfWindow intoMutableData:selectedAverageData]) {
+            return NO;
+        }
+        const float *selectedAverage = selectedAverageData.bytes;
+        const float *backgroundAverage = NULL;
+        if (_backgroundSubtractEnabled) {
+            if (![self copyAverageScanAroundIndex:_backgroundScanIndex halfWindow:HDCVCVBackgroundHalfWindow intoMutableData:backgroundAverageData]) {
+                return NO;
+            }
+            backgroundAverage = backgroundAverageData.bytes;
+        }
+
+        for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+            displayCVScan[pointIndex] = selectedAverage[pointIndex] - ((backgroundAverage != NULL) ? backgroundAverage[pointIndex] : 0.0f);
+        }
+    }
+
+    if (_backgroundSubtractEnabled) {
+        HDCVApplyBackgroundSubtractedCVDenoise(displayCVScan, _loadedFile.voltageData.bytes, pointsPerScan);
+    }
+
+    HDCVRobustRange(_displayCVScanData.bytes, pointsPerScan, &_displayCVScanMin, &_displayCVScanMax);
+    return YES;
 }
 
 - (void)applyDisplayModes
@@ -1478,30 +3767,36 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     }
 
     const float *selectedRaw = _selectedRawScanData.bytes;
-    const float *background = _backgroundScanData.bytes;
+    const float *selectedPhaseBackground = _selectedPhaseBackgroundScanData.bytes;
     float *displayScan = _displayScanData.mutableBytes;
     NSUInteger pointsPerScan = _loadedFile.pointsPerScan;
     NSUInteger scanCount = _loadedFile.scanCount;
 
-    for (NSUInteger i = 0U; i < pointsPerScan; ++i) {
-        displayScan[i] = _backgroundSubtractEnabled ? (selectedRaw[i] - background[i]) : selectedRaw[i];
+    if (!(_bandpassFilterEnabled && [self copyBandpassFilteredSelectedScanIntoDisplayBuffer])) {
+        for (NSUInteger i = 0U; i < pointsPerScan; ++i) {
+            displayScan[i] = _backgroundSubtractEnabled ? (selectedRaw[i] - selectedPhaseBackground[i]) : selectedRaw[i];
+        }
+        HDCVRobustRange(_displayScanData.bytes, pointsPerScan, &_displayScanMin, &_displayScanMax);
     }
-    hdcv_analysis_compute_min_max(_displayScanData.bytes, pointsPerScan, &_displayScanMin, &_displayScanMax);
+
+    if (![self copyProcessedCVScanIntoDisplayBuffer]) {
+        memcpy(_displayCVScanData.mutableBytes, _displayScanData.bytes, pointsPerScan * sizeof(float));
+        _displayCVScanMin = _displayScanMin;
+        _displayCVScanMax = _displayScanMax;
+    }
 
     if (_rawPointTraceData.length >= scanCount * sizeof(float)) {
         const float *rawTrace = _rawPointTraceData.bytes;
         float *displayTrace = _displayPointTraceData.mutableBytes;
-        float backgroundValue = background[_selectedPointIndex];
         for (NSUInteger i = 0U; i < scanCount; ++i) {
-            displayTrace[i] = _backgroundSubtractEnabled ? (rawTrace[i] - backgroundValue) : rawTrace[i];
+            NSUInteger alignedIndex = [self phaseAlignedBackgroundScanIndexForScan:i];
+            displayTrace[i] = _backgroundSubtractEnabled ? (rawTrace[i] - rawTrace[alignedIndex]) : rawTrace[i];
         }
-        hdcv_analysis_compute_min_max(_displayPointTraceData.bytes, scanCount, &_displayTraceMin, &_displayTraceMax);
+        if (_bandpassFilterEnabled) {
+            (void)HDCVApplyButterworthBandpassByPhase(displayTrace, scanCount, [self activePhasePeriod], _loadedFile.cvfHz);
+        }
+        HDCVRobustRangeForPhase(_displayPointTraceData.bytes, scanCount, _activePhaseIndex, [self activePhasePeriod], &_displayTraceMin, &_displayTraceMax);
     }
-
-    _modeSummaryLabel.stringValue = [NSString stringWithFormat:
-        @"Display mode: %@. Background scan %lu is applied to the color plot, I-t plot, and CV plot.",
-        [self displayModeText],
-        (unsigned long)_backgroundScanIndex];
 
     [self refreshPlotTitles];
     [self refreshPlots];
@@ -1516,22 +3811,41 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         _timePlotView.subtitleText = @"";
         _cvPlotView.titleText = @"CV Plot";
         _cvPlotView.subtitleText = @"";
+        _waveformPlotView.titleText = @"FSCV Waveform";
+        _waveformPlotView.subtitleText = @"No file loaded";
         return;
     }
 
-    NSString *modeText = _backgroundSubtractEnabled ? @"Background Subtracted" : @"Raw Current";
     float selectedVoltage = [_loadedFile voltageAtPoint:_selectedPointIndex];
     double selectedTime = [self selectedScanTime];
-
+    double selectedWaveformTimeMs = [_loadedFile withinScanTimeSecondsAtPoint:_selectedPointIndex] * 1000.0;
+    const float *displayScan = _displayScanData.bytes;
+    const float *displayCVScan = _displayCVScanData.bytes;
+    float selectedCurrent = displayScan[_selectedPointIndex];
+    float selectedCVCurrent = displayCVScan[_selectedPointIndex];
+    float selectedTimeCurrent = selectedCurrent;
+    if (_displayPointTraceData.length >= (NSUInteger)_loadedFile.scanCount * sizeof(float)) {
+        const float *displayTrace = _displayPointTraceData.bytes;
+        selectedTimeCurrent = displayTrace[_selectedScanIndex];
+    }
+    NSString *colorSummary = [NSString stringWithFormat:@"[%.3f s ; %.3f V ; %.0f nA]", selectedTime, selectedVoltage, selectedCurrent];
+    NSString *timeSummary = [NSString stringWithFormat:@"[%.3f s ; %.0f nA]", selectedTime, selectedTimeCurrent];
+    NSString *cvSummary = [NSString stringWithFormat:@"[%.3f V ; %.0f nA]", selectedVoltage, selectedCVCurrent];
+    NSString *waveformSummary = [NSString stringWithFormat:@"[%.3f ms ; %.3f V]", selectedWaveformTimeMs, selectedVoltage];
     _heatmapView.titleText = @"Color Plot";
-    _heatmapView.subtitleText = [NSString stringWithFormat:@"%@  •  BG scan %lu", modeText, (unsigned long)_backgroundScanIndex];
+    _heatmapView.subtitleText = colorSummary;
 
     _timePlotView.titleText = @"I-t Plot";
-    _timePlotView.subtitleText = [NSString stringWithFormat:@"%@ at %.3f V", modeText, selectedVoltage];
-    _timePlotView.xLabelText = (_timeAxisControl.selectedSegment == HDCVTimeAxisModeExperiment) ? @"Experiment Time (s)" : @"Sequence Time (s)";
+    _timePlotView.subtitleText = timeSummary;
+    _timePlotView.xLabelText = @"Sequence Time (s)";
+    _timePlotView.yLabelText = @"Current (nA)";
 
     _cvPlotView.titleText = @"CV Plot";
-    _cvPlotView.subtitleText = [NSString stringWithFormat:@"%@ at %.3f s", modeText, selectedTime];
+    _cvPlotView.subtitleText = cvSummary;
+    _cvPlotView.yLabelText = @"Current (nA)";
+
+    _waveformPlotView.titleText = @"FSCV Waveform";
+    _waveformPlotView.subtitleText = waveformSummary;
 }
 
 - (void)refreshHeatmapTicks
@@ -1543,15 +3857,20 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     NSMutableArray<NSString *> *labels = [NSMutableArray array];
     NSMutableArray<NSNumber *> *fractions = [NSMutableArray array];
     NSUInteger tickCount = 5U;
-    NSUInteger scanCount = _loadedFile.scanCount;
+    NSUInteger minScan = _heatmapView.visibleScanMinIndex;
+    NSUInteger maxScan = _heatmapView.visibleScanMaxIndex;
+    if (maxScan == NSNotFound || maxScan >= _loadedFile.scanCount) {
+        maxScan = _loadedFile.scanCount - 1U;
+    }
+    minScan = MIN(minScan, maxScan);
 
     for (NSUInteger i = 0U; i < tickCount; ++i) {
         NSUInteger scanIndex = (tickCount == 1U)
-            ? 0U
-            : (NSUInteger)llround((double)i * (double)(scanCount - 1U) / (double)(tickCount - 1U));
+            ? minScan
+            : minScan + (NSUInteger)llround((double)i * (double)(maxScan - minScan) / (double)(tickCount - 1U));
         double timeValue = [self timeValueForScanIndex:scanIndex];
         [labels addObject:[NSString stringWithFormat:@"%.1f s", timeValue]];
-        [fractions addObject:@(scanCount > 1U ? (double)scanIndex / (double)(scanCount - 1U) : 0.0)];
+        [fractions addObject:@(maxScan > minScan ? (double)(scanIndex - minScan) / (double)(maxScan - minScan) : 0.0)];
     }
 
     _heatmapView.xTickLabels = labels;
@@ -1563,67 +3882,105 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     NSUInteger width = _loadedFile.overviewColumnCount;
     NSUInteger height = _loadedFile.pointsPerScan;
     const float *overview = _loadedFile.overviewData.bytes;
-    const float *background = _backgroundScanData.bytes;
+    NSMutableDictionary<NSNumber *, NSData *> *backgroundCache = [NSMutableDictionary dictionary];
+    NSMutableData *displayData = [NSMutableData dataWithLength:width * height * sizeof(float)];
+    float *displayValues = displayData.mutableBytes;
     NSMutableData *pixelData = [NSMutableData dataWithLength:width * height * 4U];
     unsigned char *pixels = pixelData.mutableBytes;
-    float minValue = _backgroundSubtractEnabled ? FLT_MAX : _loadedFile.overviewMinValue;
-    float maxValue = _backgroundSubtractEnabled ? -FLT_MAX : _loadedFile.overviewMaxValue;
     float scale;
 
-    if (_backgroundSubtractEnabled) {
-        for (NSUInteger pointIndex = 0U; pointIndex < height; ++pointIndex) {
-            float backgroundValue = background[pointIndex];
-            for (NSUInteger x = 0U; x < width; ++x) {
-                float adjusted = overview[pointIndex * width + x] - backgroundValue;
-                if (adjusted < minValue) {
-                    minValue = adjusted;
+    if (_backgroundSubtractEnabled || [self activePhasePeriod] > 1U) {
+        NSMutableData *scanData = [NSMutableData dataWithLength:height * sizeof(float)];
+        NSMutableData *sumsData = [NSMutableData dataWithLength:height * sizeof(double)];
+        double *sums = sumsData.mutableBytes;
+        NSUInteger period = [self activePhasePeriod];
+
+        for (NSUInteger x = 0U; x < width; ++x) {
+            NSUInteger startScan = (NSUInteger)(((uint64_t)x * (uint64_t)_loadedFile.scanCount) / (uint64_t)width);
+            NSUInteger endScan = (NSUInteger)(((uint64_t)(x + 1U) * (uint64_t)_loadedFile.scanCount) / (uint64_t)width);
+            NSUInteger usedScanCount = 0U;
+            if (endScan <= startScan) {
+                endScan = startScan + 1U;
+            }
+            endScan = MIN(endScan, (NSUInteger)_loadedFile.scanCount);
+            memset(sums, 0, height * sizeof(double));
+
+            for (NSUInteger scanIndex = startScan; scanIndex < endScan; ++scanIndex) {
+                if (!HDCVScanIndexMatchesPhase(scanIndex, _activePhaseIndex, period)) {
+                    continue;
                 }
-                if (adjusted > maxValue) {
-                    maxValue = adjusted;
+                if (![_loadedFile copyScanAtIndex:(uint32_t)scanIndex intoMutableData:scanData min:NULL max:NULL]) {
+                    continue;
                 }
+
+                NSUInteger backgroundIndex = [self phaseAlignedBackgroundScanIndexForScan:scanIndex];
+                NSData *backgroundData = _backgroundSubtractEnabled
+                    ? [self cachedBackgroundScanForIndex:backgroundIndex cache:backgroundCache]
+                    : nil;
+                const float *scan = scanData.bytes;
+                const float *background = backgroundData.bytes;
+                for (NSUInteger pointIndex = 0U; pointIndex < height; ++pointIndex) {
+                    float backgroundValue = (_backgroundSubtractEnabled && background != NULL) ? background[pointIndex] : 0.0f;
+                    sums[pointIndex] += (double)(scan[pointIndex] - backgroundValue);
+                }
+                usedScanCount += 1U;
+            }
+
+            if (usedScanCount == 0U) {
+                NSUInteger midpointScan = startScan + ((endScan - startScan) / 2U);
+                NSUInteger scanIndex = [self scanIndexNearestActivePhaseToScanIndex:midpointScan];
+                if ([_loadedFile copyScanAtIndex:(uint32_t)scanIndex intoMutableData:scanData min:NULL max:NULL]) {
+                    NSUInteger backgroundIndex = [self phaseAlignedBackgroundScanIndexForScan:scanIndex];
+                    NSData *backgroundData = _backgroundSubtractEnabled
+                        ? [self cachedBackgroundScanForIndex:backgroundIndex cache:backgroundCache]
+                        : nil;
+                    const float *scan = scanData.bytes;
+                    const float *background = backgroundData.bytes;
+                    for (NSUInteger pointIndex = 0U; pointIndex < height; ++pointIndex) {
+                        float backgroundValue = (_backgroundSubtractEnabled && background != NULL) ? background[pointIndex] : 0.0f;
+                        sums[pointIndex] += (double)(scan[pointIndex] - backgroundValue);
+                    }
+                    usedScanCount = 1U;
+                }
+            }
+
+            double invCount = 1.0 / (double)MAX((NSUInteger)1U, usedScanCount);
+            for (NSUInteger pointIndex = 0U; pointIndex < height; ++pointIndex) {
+                displayValues[pointIndex * width + x] = (float)(sums[pointIndex] * invCount);
+            }
+        }
+    } else {
+        for (NSUInteger x = 0U; x < width; ++x) {
+            for (NSUInteger pointIndex = 0U; pointIndex < height; ++pointIndex) {
+                displayValues[pointIndex * width + x] = overview[pointIndex * width + x];
             }
         }
     }
 
-    scale = MAX(fabsf(minValue), fabsf(maxValue));
-    if (scale < 1.0e-9f) {
-        scale = 1.0f;
+    if (_bandpassFilterEnabled) {
+        double duration = MAX([self timeValueForScanIndex:_loadedFile.scanCount - 1U] - [self timeValueForScanIndex:0U], 1.0e-9);
+        double overviewSampleRate = (double)width / duration;
+        for (NSUInteger pointIndex = 0U; pointIndex < height; ++pointIndex) {
+            (void)HDCVApplyButterworthBandpass(displayValues + (pointIndex * width), width, overviewSampleRate);
+        }
     }
 
+    scale = HDCVRobustAbsScale(displayValues, width * height);
+
     for (NSUInteger pointIndex = 0U; pointIndex < height; ++pointIndex) {
-        float backgroundValue = background[pointIndex];
         NSUInteger y = height - 1U - pointIndex;
         for (NSUInteger x = 0U; x < width; ++x) {
-            float rawValue = overview[pointIndex * width + x];
-            float value = _backgroundSubtractEnabled ? (rawValue - backgroundValue) : rawValue;
+            float value = displayValues[pointIndex * width + x];
+            if (!isfinite(value)) {
+                value = 0.0f;
+            }
             float normalized = MAX(-1.0f, MIN(1.0f, value / scale));
-            float t = (normalized + 1.0f) * 0.5f;
             NSUInteger offset = (y * width + x) * 4U;
             float r;
             float g;
             float b;
 
-            if (t < 0.25f) {
-                float local = t / 0.25f;
-                r = 0.04f + local * 0.06f;
-                g = 0.12f + local * 0.36f;
-                b = 0.28f + local * 0.52f;
-            } else if (t < 0.5f) {
-                float local = (t - 0.25f) / 0.25f;
-                r = 0.10f + local * 0.08f;
-                g = 0.48f + local * 0.36f;
-                b = 0.80f - local * 0.40f;
-            } else if (t < 0.75f) {
-                float local = (t - 0.5f) / 0.25f;
-                r = 0.18f + local * 0.55f;
-                g = 0.84f + local * 0.07f;
-                b = 0.40f - local * 0.24f;
-            } else {
-                float local = (t - 0.75f) / 0.25f;
-                r = 0.73f + local * 0.22f;
-                g = 0.91f - local * 0.56f;
-                b = 0.16f - local * 0.08f;
-            }
+            HDCVHeatmapRGBForNormalized(normalized, &r, &g, &b);
 
             pixels[offset + 0U] = (unsigned char)llroundf(r * 255.0f);
             pixels[offset + 1U] = (unsigned char)llroundf(g * 255.0f);
@@ -1647,6 +4004,7 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     CGImageRelease(imageRef);
     CGContextRelease(context);
     CGColorSpaceRelease(colorSpace);
+    _heatmapView.colorScaleMaxNA = (double)scale;
     return image;
 }
 
@@ -1663,15 +4021,50 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     if (_loadedFile == nil) {
         return 0.0;
     }
-    if (_timeAxisControl.selectedSegment == HDCVTimeAxisModeExperiment) {
-        return [_loadedFile experimentTimeSecondsAtScan:scanIndex];
-    }
     return [_loadedFile sequenceTimeSecondsAtScan:scanIndex];
 }
 
 - (double)selectedScanTime
 {
     return [self timeValueForScanIndex:_selectedScanIndex];
+}
+
+- (NSString *)fileSubtitleForLoadedFile:(HDCVLoadedFile *)loaded filename:(NSString *)filename
+{
+    double sampleRate = loaded.sampleRateHz;
+    NSString *sampleRateText;
+    double totalDuration = (double)loaded.scanCount * loaded.scanIntervalSeconds;
+
+    if (sampleRate >= 1000.0) {
+        sampleRateText = [NSString stringWithFormat:@"%.1f kHz", sampleRate / 1000.0];
+    } else {
+        sampleRateText = [NSString stringWithFormat:@"%.1f Hz", sampleRate];
+    }
+    return [NSString stringWithFormat:@"%@  |  %@  |  %.1f s", filename, sampleRateText, totalDuration];
+}
+
+- (void)refreshControlFields
+{
+    if (_loadedFile == nil) {
+        for (NSTextField *field in @[
+            _heatmapScanField, _heatmapPointField, _heatmapBackgroundField,
+            _timeScanField, _timeBackgroundField, _cvPointField
+        ]) {
+            field.stringValue = @"";
+        }
+        return;
+    }
+
+    NSString *scanText = [NSString stringWithFormat:@"%.3f", [self timeValueForScanIndex:_selectedScanIndex]];
+    NSString *pointText = [NSString stringWithFormat:@"%.3f", [_loadedFile voltageAtPoint:_selectedPointIndex]];
+    NSString *backgroundText = [NSString stringWithFormat:@"%.3f", [self timeValueForScanIndex:_backgroundScanIndex]];
+
+    _heatmapScanField.stringValue = scanText;
+    _timeScanField.stringValue = scanText;
+    _heatmapPointField.stringValue = pointText;
+    _cvPointField.stringValue = pointText;
+    _heatmapBackgroundField.stringValue = backgroundText;
+    _timeBackgroundField.stringValue = backgroundText;
 }
 
 - (void)refreshPlots
@@ -1682,95 +4075,106 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 
     _heatmapView.selectedScanIndex = _selectedScanIndex;
     _heatmapView.selectedPointIndex = _selectedPointIndex;
+    _heatmapView.backgroundScanIndex = _backgroundScanIndex;
+    _heatmapView.visibleScanMinIndex = _heatmapXManual
+        ? (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.scanCount - 1U), _heatmapXMinManual)))
+        : 0U;
+    _heatmapView.visibleScanMaxIndex = _heatmapXManual
+        ? (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.scanCount - 1U), _heatmapXMaxManual)))
+        : _loadedFile.scanCount - 1U;
+    if (_heatmapView.visibleScanMaxIndex <= _heatmapView.visibleScanMinIndex && _heatmapView.visibleScanMinIndex < _loadedFile.scanCount - 1U) {
+        _heatmapView.visibleScanMaxIndex = _heatmapView.visibleScanMinIndex + 1U;
+    }
+    _heatmapView.visiblePointMinIndex = _heatmapYManual
+        ? (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.pointsPerScan - 1U), _heatmapYMinManual)))
+        : 0U;
+    _heatmapView.visiblePointMaxIndex = _heatmapYManual
+        ? (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.pointsPerScan - 1U), _heatmapYMaxManual)))
+        : _loadedFile.pointsPerScan - 1U;
+    if (_heatmapView.visiblePointMaxIndex <= _heatmapView.visiblePointMinIndex && _heatmapView.visiblePointMinIndex < _loadedFile.pointsPerScan - 1U) {
+        _heatmapView.visiblePointMaxIndex = _heatmapView.visiblePointMinIndex + 1U;
+    }
+    [self refreshHeatmapTicks];
 
-    double yMin = (double)_displayScanMin;
-    double yMax = (double)_displayScanMax;
+    double yMin = (double)_displayCVScanMin;
+    double yMax = (double)_displayCVScanMax;
+    const float *voltage = _loadedFile.voltageData.bytes;
+    double voltageMin = (double)voltage[0];
+    double voltageMax = (double)voltage[0];
+    for (NSUInteger i = 1U; i < _loadedFile.pointsPerScan; ++i) {
+        voltageMin = MIN(voltageMin, (double)voltage[i]);
+        voltageMax = MAX(voltageMax, (double)voltage[i]);
+    }
     HDCVExpandRange(&yMin, &yMax);
-    _cvPlotView.xMin = -0.45;
-    _cvPlotView.xMax = 1.15;
-    _cvPlotView.yMin = yMin;
-    _cvPlotView.yMax = yMax;
+    HDCVExpandRange(&voltageMin, &voltageMax);
+    _cvPlotView.xMin = _cvXManual ? _cvXMinManual : voltageMin;
+    _cvPlotView.xMax = _cvXManual ? _cvXMaxManual : voltageMax;
+    _cvPlotView.yMin = _cvYManual ? _cvYMinManual : yMin;
+    _cvPlotView.yMax = _cvYManual ? _cvYMaxManual : yMax;
     _cvPlotView.selectedXValue = [_loadedFile voltageAtPoint:_selectedPointIndex];
-    _cvPlotView.selectedYValue = ((const float *)_displayScanData.bytes)[_selectedPointIndex];
+    _cvPlotView.selectedYValue = ((const float *)_displayCVScanData.bytes)[_selectedPointIndex];
     _cvPlotView.showsSelection = YES;
     _cvPlotView.showsBaseline = _backgroundSubtractEnabled;
+    _cvPlotView.showsBackgroundX = NO;
     _cvPlotView.baselineYValue = 0.0;
     [_cvPlotView setNeedsDisplay:YES];
 
     if (_displayPointTraceData.length >= _loadedFile.scanCount * sizeof(float)) {
         double traceMin = (double)_displayTraceMin;
         double traceMax = (double)_displayTraceMax;
+        NSUInteger phaseSampleCount = HDCVPhaseSampleCount((NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
+        NSUInteger firstPhaseScan = HDCVScanIndexForPhaseSample(0U, (NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
+        NSUInteger lastPhaseScan = HDCVScanIndexForPhaseSample(phaseSampleCount > 0U ? phaseSampleCount - 1U : 0U, (NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
+        double traceXMin = [self timeValueForScanIndex:firstPhaseScan];
+        double traceXMax = [self timeValueForScanIndex:lastPhaseScan];
         HDCVExpandRange(&traceMin, &traceMax);
-        _timePlotView.xMin = [self timeValueForScanIndex:0U];
-        _timePlotView.xMax = [self timeValueForScanIndex:_loadedFile.scanCount - 1U];
-        _timePlotView.yMin = traceMin;
-        _timePlotView.yMax = traceMax;
+        _timePlotView.xMin = _timeXManual ? _timeXMinManual : traceXMin;
+        _timePlotView.xMax = _timeXManual ? _timeXMaxManual : traceXMax;
+        _timePlotView.yMin = _timeYManual ? _timeYMinManual : traceMin;
+        _timePlotView.yMax = _timeYManual ? _timeYMaxManual : traceMax;
         _timePlotView.selectedXValue = [self selectedScanTime];
         _timePlotView.selectedYValue = ((const float *)_displayPointTraceData.bytes)[_selectedScanIndex];
         _timePlotView.showsSelection = YES;
         _timePlotView.showsBaseline = _backgroundSubtractEnabled;
+        _timePlotView.showsBackgroundX = YES;
+        _timePlotView.backgroundXValue = [self timeValueForScanIndex:_backgroundScanIndex];
         _timePlotView.baselineYValue = 0.0;
         [_timePlotView setNeedsDisplay:YES];
     }
+
+    {
+        double waveformXMin = 0.0;
+        double waveformXMax = _loadedFile.waveformCycleDurationSeconds * 1000.0;
+        const float *waveform = _loadedFile.waveformData.bytes;
+        double waveformYMin = (double)waveform[0];
+        double waveformYMax = (double)waveform[0];
+        for (NSUInteger i = 1U; i < _loadedFile.waveformPointCount; ++i) {
+            waveformYMin = MIN(waveformYMin, (double)waveform[i]);
+            waveformYMax = MAX(waveformYMax, (double)waveform[i]);
+        }
+        HDCVExpandRange(&waveformYMin, &waveformYMax);
+        _waveformPlotView.xMin = _waveformXManual ? _waveformXMinManual : waveformXMin;
+        _waveformPlotView.xMax = _waveformXManual ? _waveformXMaxManual : waveformXMax;
+        _waveformPlotView.yMin = _waveformYManual ? _waveformYMinManual : waveformYMin;
+        _waveformPlotView.yMax = _waveformYManual ? _waveformYMaxManual : waveformYMax;
+        _waveformPlotView.selectedXValue = [_loadedFile withinScanTimeSecondsAtPoint:_selectedPointIndex] * 1000.0;
+        _waveformPlotView.selectedYValue = [_loadedFile voltageAtPoint:_selectedPointIndex];
+        _waveformPlotView.showsSelection = YES;
+        _waveformPlotView.showsBaseline = NO;
+        _waveformPlotView.showsBackgroundX = NO;
+        [_waveformPlotView setNeedsDisplay:YES];
+    }
+
+    [self refreshControlFields];
 }
 
 - (void)refreshSelectionReadout
 {
     if (_loadedFile == nil) {
-        _selectionHeadlineLabel.stringValue = @"No active selection.";
-        _selectionDetail1Label.stringValue = @"";
-        _selectionDetail2Label.stringValue = @"";
-        _selectionDetail3Label.stringValue = @"";
-        _selectionDetail4Label.stringValue = @"";
+        [self refreshControlFields];
         return;
     }
-
-    const float *selectedRaw = _selectedRawScanData.bytes;
-    const float *background = _backgroundScanData.bytes;
-    const float *displayScan = _displayScanData.bytes;
-    const float *displayTrace = _displayPointTraceData.bytes;
-    float selectedVoltage = [_loadedFile voltageAtPoint:_selectedPointIndex];
-    double selectedTimeSeq = [_loadedFile sequenceTimeSecondsAtScan:_selectedScanIndex];
-    double selectedTimeExp = [_loadedFile experimentTimeSecondsAtScan:_selectedScanIndex];
-    double backgroundTimeSeq = [_loadedFile sequenceTimeSecondsAtScan:_backgroundScanIndex];
-    double backgroundTimeExp = [_loadedFile experimentTimeSecondsAtScan:_backgroundScanIndex];
-    float rawCurrent = selectedRaw[_selectedPointIndex];
-    float backgroundCurrent = background[_selectedPointIndex];
-    float displayCurrent = displayScan[_selectedPointIndex];
-
-    _selectionHeadlineLabel.stringValue = [NSString stringWithFormat:@"Scan %lu • Point %lu • %.3f V",
-                                           (unsigned long)_selectedScanIndex,
-                                           (unsigned long)_selectedPointIndex,
-                                           selectedVoltage];
-    _selectionDetail1Label.stringValue = [NSString stringWithFormat:@"Sequence %.3f s • Experiment %.3f s • Within scan %.3f ms",
-                                          selectedTimeSeq,
-                                          selectedTimeExp,
-                                          [_loadedFile withinScanTimeSecondsAtPoint:_selectedPointIndex] * 1000.0];
-    _selectionDetail2Label.stringValue = [NSString stringWithFormat:@"Raw current %.3f • Background current %.3f • Display current %.3f",
-                                          rawCurrent,
-                                          backgroundCurrent,
-                                          displayCurrent];
-    _selectionDetail3Label.stringValue = [NSString stringWithFormat:@"Background scan %lu • Sequence %.3f s • Experiment %.3f s",
-                                          (unsigned long)_backgroundScanIndex,
-                                          backgroundTimeSeq,
-                                          backgroundTimeExp];
-    if (_displayPointTraceData.length >= _loadedFile.scanCount * sizeof(float)) {
-        _selectionDetail4Label.stringValue = [NSString stringWithFormat:@"I-t sample at selected point: %.3f (%@)",
-                                              displayTrace[_selectedScanIndex],
-                                              [self displayModeText]];
-    } else {
-        _selectionDetail4Label.stringValue = @"I-t trace is being computed for the selected voltage point.";
-    }
-
-    _scanControlLabel.stringValue = [NSString stringWithFormat:@"Selected scan: %lu of %u",
-                                     (unsigned long)_selectedScanIndex,
-                                     _loadedFile.scanCount - 1U];
-    _pointControlLabel.stringValue = [NSString stringWithFormat:@"Selected voltage point: %lu of %u",
-                                      (unsigned long)_selectedPointIndex,
-                                      _loadedFile.pointsPerScan - 1U];
-    _backgroundControlLabel.stringValue = [NSString stringWithFormat:@"Background scan: %lu of %u",
-                                           (unsigned long)_backgroundScanIndex,
-                                           _loadedFile.scanCount - 1U];
+    [self refreshControlFields];
 }
 
 - (void)requestPointTraceRefresh
@@ -1802,7 +4206,7 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
             self->_rawPointTraceData = traceData;
             [self applyDisplayModes];
             [self refreshSelectionReadout];
-            self->_heroStatusLabel.stringValue = @"Interactive FSCV plots are live. Use the color plot, I-t plot, CV plot, or sliders to move crosshairs and select a background.";
+            self->_heroStatusLabel.stringValue = @"Interactive FSCV plots are live. Grab crosshair lines to move scan, point, or background positions.";
         });
     });
 }
@@ -1824,41 +4228,258 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     }
 }
 
-- (void)scanSliderChanged:(id)sender
+- (BOOL)parseUnsignedIntegerFromField:(NSTextField *)field maxValue:(NSUInteger)maxValue outValue:(NSUInteger *)outValue
 {
-    (void)sender;
-    if (_loadedFile == nil) {
-        return;
+    const char *text = field.stringValue.UTF8String;
+    char *endptr = NULL;
+    unsigned long long parsed = strtoull(text, &endptr, 10);
+    if (endptr == text) {
+        return NO;
     }
-    _selectedScanIndex = (NSUInteger)llround(_scanSlider.doubleValue);
-    _scanSlider.doubleValue = (double)_selectedScanIndex;
-    [self openOrRefreshAfterSelectionChangeNeedsTrace:NO];
+    while (*endptr != '\0') {
+        if (!isspace((unsigned char)*endptr)) {
+            return NO;
+        }
+        endptr += 1;
+    }
+    *outValue = (NSUInteger)MIN(parsed, (unsigned long long)maxValue);
+    return YES;
 }
 
-- (void)pointSliderChanged:(id)sender
+- (void)controlTextDidEndEditing:(NSNotification *)notification
 {
-    (void)sender;
-    if (_loadedFile == nil) {
+    NSTextField *field = notification.object;
+    if (![field isKindOfClass:NSTextField.class]) {
         return;
     }
-    _selectedPointIndex = (NSUInteger)llround(_pointSlider.doubleValue);
-    _pointSlider.doubleValue = (double)_selectedPointIndex;
-    [self openOrRefreshAfterSelectionChangeNeedsTrace:YES];
+    if (field == _heatmapScanField || field == _timeScanField ||
+        field == _heatmapPointField || field == _cvPointField ||
+        field == _heatmapBackgroundField || field == _timeBackgroundField) {
+        [self selectionFieldChanged:field];
+    }
 }
 
-- (void)backgroundSliderChanged:(id)sender
+- (void)selectionFieldChanged:(id)sender
 {
-    (void)sender;
+    if (_loadedFile == nil || ![sender isKindOfClass:NSTextField.class]) {
+        return;
+    }
+
+    NSTextField *field = sender;
+    double value = 0.0;
+
+    if (field == _heatmapScanField || field == _timeScanField) {
+        if (!HDCVParseLeadingDouble(field.stringValue, &value)) {
+            [self refreshControlFields];
+            return;
+        }
+        _selectedScanIndex = [self scanIndexNearestTimeValue:value];
+        [self openOrRefreshAfterSelectionChangeNeedsTrace:NO];
+    } else if (field == _heatmapPointField || field == _cvPointField) {
+        if (!HDCVParseLeadingDouble(field.stringValue, &value)) {
+            [self refreshControlFields];
+            return;
+        }
+        _selectedPointIndex = [self pointIndexNearestVoltageValue:value];
+        [self openOrRefreshAfterSelectionChangeNeedsTrace:YES];
+    } else if (field == _heatmapBackgroundField || field == _timeBackgroundField) {
+        if (!HDCVParseLeadingDouble(field.stringValue, &value)) {
+            [self refreshControlFields];
+            return;
+        }
+        _backgroundScanIndex = [self scanIndexNearestTimeValue:value];
+        [self copyBackgroundScan];
+        [self copyPhaseAlignedBackgroundScanForSelectedScan];
+        [self applyDisplayModes];
+        [self rebuildHeatmapImage];
+        [self refreshSelectionReadout];
+        _heroStatusLabel.stringValue = [NSString stringWithFormat:@"Background time set to %.3f s.", [self timeValueForScanIndex:_backgroundScanIndex]];
+    }
+}
+
+- (NSUInteger)scanIndexNearestTimeValue:(double)xValue
+{
+    if (_loadedFile == nil || _loadedFile.scanCount == 0U) {
+        return 0U;
+    }
+    double interval = MAX(_loadedFile.scanIntervalSeconds, 1.0e-12);
+    double scanValue = xValue / interval;
+    NSUInteger rawNearest = (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.scanCount - 1U), scanValue)));
+    return [self scanIndexNearestActivePhaseToScanIndex:rawNearest];
+}
+
+- (NSUInteger)pointIndexForHeatmapAxisValue:(double)value
+{
+    if (_loadedFile == nil || _loadedFile.pointsPerScan == 0U) {
+        return 0U;
+    }
+
+    if (fabs(value) > 5.0) {
+        return (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.pointsPerScan - 1U), value)));
+    }
+
+    const float *voltage = _loadedFile.voltageData.bytes;
+    NSUInteger bestIndex = 0U;
+    double bestDistance = DBL_MAX;
+    NSUInteger referencePoint = MIN(_selectedPointIndex, (NSUInteger)_loadedFile.pointsPerScan - 1U);
+    for (NSUInteger pointIndex = 0U; pointIndex < _loadedFile.pointsPerScan; ++pointIndex) {
+        double distance = fabs((double)voltage[pointIndex] - value);
+        if (distance < bestDistance ||
+            (fabs(distance - bestDistance) <= 1.0e-9 &&
+             llabs((long long)pointIndex - (long long)referencePoint) < llabs((long long)bestIndex - (long long)referencePoint))) {
+            bestDistance = distance;
+            bestIndex = pointIndex;
+        }
+    }
+    return bestIndex;
+}
+
+- (NSUInteger)pointIndexNearestVoltageValue:(double)value
+{
+    if (_loadedFile == nil || _loadedFile.pointsPerScan == 0U) {
+        return 0U;
+    }
+
+    const float *voltage = _loadedFile.voltageData.bytes;
+    NSUInteger bestIndex = 0U;
+    double bestDistance = DBL_MAX;
+    for (NSUInteger pointIndex = 0U; pointIndex < _loadedFile.pointsPerScan; ++pointIndex) {
+        double distance = fabs((double)voltage[pointIndex] - value);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = pointIndex;
+        }
+    }
+    return bestIndex;
+}
+
+- (BOOL)applyRangeEditTarget:(HDCVAxisEditTarget)target
+                       value:(double)value
+                     minSlot:(double *)minSlot
+                     maxSlot:(double *)maxSlot
+                  manualFlag:(BOOL *)manualFlag
+                  currentMin:(double)currentMin
+                  currentMax:(double)currentMax
+{
+    double newMin = currentMin;
+    double newMax = currentMax;
+
+    if (target == HDCVAxisEditTargetXMin || target == HDCVAxisEditTargetYMin) {
+        newMin = value;
+    } else if (target == HDCVAxisEditTargetXMax || target == HDCVAxisEditTargetYMax) {
+        newMax = value;
+    }
+
+    if (!isfinite(newMin) || !isfinite(newMax) || newMax <= newMin) {
+        _heroStatusLabel.stringValue = @"Axis range needs a numeric min smaller than max.";
+        return NO;
+    }
+
+    *manualFlag = YES;
+    *minSlot = newMin;
+    *maxSlot = newMax;
+    return YES;
+}
+
+- (void)syncTimeRangeToHeatmap
+{
+    if (_loadedFile == nil || !_timeXManual) {
+        return;
+    }
+    NSUInteger minScan = [self scanIndexNearestTimeValue:_timeXMinManual];
+    NSUInteger maxScan = [self scanIndexNearestTimeValue:_timeXMaxManual];
+    if (maxScan <= minScan && minScan < _loadedFile.scanCount - 1U) {
+        maxScan = minScan + 1U;
+    }
+    _heatmapXManual = YES;
+    _heatmapXMinManual = (double)minScan;
+    _heatmapXMaxManual = (double)maxScan;
+}
+
+- (void)syncHeatmapRangeToTime
+{
+    if (_loadedFile == nil || !_heatmapXManual) {
+        return;
+    }
+    NSUInteger minScan = (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.scanCount - 1U), _heatmapXMinManual)));
+    NSUInteger maxScan = (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.scanCount - 1U), _heatmapXMaxManual)));
+    if (maxScan <= minScan && minScan < _loadedFile.scanCount - 1U) {
+        maxScan = minScan + 1U;
+    }
+    _timeXManual = YES;
+    _timeXMinManual = [self timeValueForScanIndex:minScan];
+    _timeXMaxManual = [self timeValueForScanIndex:maxScan];
+}
+
+- (void)heatmapView:(HDCVHeatmapView *)view didEditAxisTarget:(HDCVAxisEditTarget)target value:(double)value
+{
+    (void)view;
     if (_loadedFile == nil) {
         return;
     }
-    _backgroundScanIndex = (NSUInteger)llround(_backgroundSlider.doubleValue);
-    _backgroundSlider.doubleValue = (double)_backgroundScanIndex;
-    [self copyBackgroundScan];
-    [self applyDisplayModes];
-    [self rebuildHeatmapImage];
-    [self refreshSelectionReadout];
-    _heroStatusLabel.stringValue = [NSString stringWithFormat:@"Background scan set to %lu.", (unsigned long)_backgroundScanIndex];
+
+    if (target == HDCVAxisEditTargetXMin || target == HDCVAxisEditTargetXMax) {
+        double minScan = _heatmapXManual ? _heatmapXMinManual : 0.0;
+        double maxScan = _heatmapXManual ? _heatmapXMaxManual : (double)(_loadedFile.scanCount - 1U);
+        double editedScan = (double)[self scanIndexNearestTimeValue:value];
+        if (![self applyRangeEditTarget:target value:editedScan minSlot:&_heatmapXMinManual maxSlot:&_heatmapXMaxManual manualFlag:&_heatmapXManual currentMin:minScan currentMax:maxScan]) {
+            return;
+        }
+        [self syncHeatmapRangeToTime];
+    } else if (target == HDCVAxisEditTargetYMin || target == HDCVAxisEditTargetYMax) {
+        double minPoint = _heatmapYManual ? _heatmapYMinManual : 0.0;
+        double maxPoint = _heatmapYManual ? _heatmapYMaxManual : (double)(_loadedFile.pointsPerScan - 1U);
+        double editedPoint = (double)[self pointIndexForHeatmapAxisValue:value];
+        if (![self applyRangeEditTarget:target value:editedPoint minSlot:&_heatmapYMinManual maxSlot:&_heatmapYMaxManual manualFlag:&_heatmapYManual currentMin:minPoint currentMax:maxPoint]) {
+            return;
+        }
+    }
+
+    [self refreshPlots];
+    _heroStatusLabel.stringValue = @"Axis range updated from the plot.";
+}
+
+- (void)linePlotView:(HDCVLinePlotView *)view didEditAxisTarget:(HDCVAxisEditTarget)target value:(double)value
+{
+    if (_loadedFile == nil) {
+        return;
+    }
+
+    if (view == _timePlotView) {
+        if (target == HDCVAxisEditTargetXMin || target == HDCVAxisEditTargetXMax) {
+            if (![self applyRangeEditTarget:target value:value minSlot:&_timeXMinManual maxSlot:&_timeXMaxManual manualFlag:&_timeXManual currentMin:_timePlotView.xMin currentMax:_timePlotView.xMax]) {
+                return;
+            }
+            [self syncTimeRangeToHeatmap];
+        } else {
+            if (![self applyRangeEditTarget:target value:value minSlot:&_timeYMinManual maxSlot:&_timeYMaxManual manualFlag:&_timeYManual currentMin:_timePlotView.yMin currentMax:_timePlotView.yMax]) {
+                return;
+            }
+        }
+    } else if (view == _cvPlotView) {
+        if (target == HDCVAxisEditTargetXMin || target == HDCVAxisEditTargetXMax) {
+            if (![self applyRangeEditTarget:target value:value minSlot:&_cvXMinManual maxSlot:&_cvXMaxManual manualFlag:&_cvXManual currentMin:_cvPlotView.xMin currentMax:_cvPlotView.xMax]) {
+                return;
+            }
+        } else {
+            if (![self applyRangeEditTarget:target value:value minSlot:&_cvYMinManual maxSlot:&_cvYMaxManual manualFlag:&_cvYManual currentMin:_cvPlotView.yMin currentMax:_cvPlotView.yMax]) {
+                return;
+            }
+        }
+    } else if (view == _waveformPlotView) {
+        if (target == HDCVAxisEditTargetXMin || target == HDCVAxisEditTargetXMax) {
+            if (![self applyRangeEditTarget:target value:value minSlot:&_waveformXMinManual maxSlot:&_waveformXMaxManual manualFlag:&_waveformXManual currentMin:_waveformPlotView.xMin currentMax:_waveformPlotView.xMax]) {
+                return;
+            }
+        } else {
+            if (![self applyRangeEditTarget:target value:value minSlot:&_waveformYMinManual maxSlot:&_waveformYMaxManual manualFlag:&_waveformYManual currentMin:_waveformPlotView.yMin currentMax:_waveformPlotView.yMax]) {
+                return;
+            }
+        }
+    }
+
+    [self refreshPlots];
+    _heroStatusLabel.stringValue = @"Axis range updated from the plot.";
 }
 
 - (void)backgroundSubtractToggled:(id)sender
@@ -1867,13 +4488,28 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
     if (_loadedFile == nil) {
         return;
     }
-    _backgroundSubtractEnabled = (_backgroundSubtractCheckbox.state == NSControlStateValueOn);
+    _backgroundSubtractEnabled = _backgroundSubtractSwitch.on;
     [self applyDisplayModes];
     [self rebuildHeatmapImage];
     [self refreshSelectionReadout];
     _heroStatusLabel.stringValue = _backgroundSubtractEnabled
         ? @"Background subtraction is enabled across the color plot, I-t plot, and CV plot."
         : @"Background subtraction is disabled. The plots are showing raw current.";
+}
+
+- (void)bandpassFilterToggled:(id)sender
+{
+    (void)sender;
+    if (_loadedFile == nil) {
+        return;
+    }
+    _bandpassFilterEnabled = _bandpassFilterSwitch.on;
+    [self applyDisplayModes];
+    [self rebuildHeatmapImage];
+    [self refreshSelectionReadout];
+    _heroStatusLabel.stringValue = _bandpassFilterEnabled
+        ? @"Butterworth bandpass is enabled across the color plot, I-t plot, and CV plot."
+        : @"Butterworth bandpass is disabled.";
 }
 
 - (void)useSelectedScanAsBackground:(id)sender
@@ -1883,70 +4519,83 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         return;
     }
     _backgroundScanIndex = _selectedScanIndex;
-    _backgroundSlider.doubleValue = (double)_backgroundScanIndex;
     [self copyBackgroundScan];
+    [self copyPhaseAlignedBackgroundScanForSelectedScan];
     [self applyDisplayModes];
     [self rebuildHeatmapImage];
     [self refreshSelectionReadout];
     _heroStatusLabel.stringValue = [NSString stringWithFormat:@"Background scan updated to the selected scan %lu.", (unsigned long)_backgroundScanIndex];
 }
 
-- (void)timeAxisModeChanged:(id)sender
-{
-    (void)sender;
-    if (_loadedFile == nil) {
-        return;
-    }
-    [self refreshHeatmapTicks];
-    [self refreshPlotTitles];
-    [self refreshPlots];
-    [self refreshSelectionReadout];
-}
-
-- (void)heatmapView:(HDCVHeatmapView *)view didSelectScanIndex:(NSUInteger)scanIndex pointIndex:(NSUInteger)pointIndex
+- (void)heatmapView:(HDCVHeatmapView *)view didDragSelectionScanIndex:(NSUInteger)scanIndex pointIndex:(NSUInteger)pointIndex updateScan:(BOOL)updateScan updatePoint:(BOOL)updatePoint
 {
     (void)view;
     if (_loadedFile == nil) {
         return;
     }
-    _selectedScanIndex = MIN(scanIndex, _loadedFile.scanCount - 1U);
-    _selectedPointIndex = MIN(pointIndex, _loadedFile.pointsPerScan - 1U);
-    _scanSlider.doubleValue = (double)_selectedScanIndex;
-    _pointSlider.doubleValue = (double)_selectedPointIndex;
-    [self openOrRefreshAfterSelectionChangeNeedsTrace:YES];
+    if (updateScan) {
+        _selectedScanIndex = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, _loadedFile.scanCount - 1U)];
+    }
+    if (updatePoint) {
+        _selectedPointIndex = MIN(pointIndex, _loadedFile.pointsPerScan - 1U);
+    }
+    [self openOrRefreshAfterSelectionChangeNeedsTrace:updatePoint];
 }
 
-- (void)linePlotView:(HDCVLinePlotView *)view didSelectXValue:(double)xValue
+- (void)heatmapView:(HDCVHeatmapView *)view didDragBackgroundScanIndex:(NSUInteger)scanIndex
+{
+    (void)view;
+    if (_loadedFile == nil) {
+        return;
+    }
+    _backgroundScanIndex = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, _loadedFile.scanCount - 1U)];
+    [self copyBackgroundScan];
+    [self copyPhaseAlignedBackgroundScanForSelectedScan];
+    [self applyDisplayModes];
+    [self rebuildHeatmapImage];
+    [self refreshSelectionReadout];
+}
+
+- (void)linePlotView:(HDCVLinePlotView *)view didDragXValue:(double)xValue yValue:(double)yValue target:(HDCVLinePlotDragTarget)target
 {
     if (_loadedFile == nil) {
         return;
     }
 
     if (view == _timePlotView) {
-        NSUInteger bestScanIndex = 0U;
-        double bestDistance = DBL_MAX;
-        for (NSUInteger scanIndex = 0U; scanIndex < _loadedFile.scanCount; ++scanIndex) {
-            double distance = fabs([self timeValueForScanIndex:scanIndex] - xValue);
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                bestScanIndex = scanIndex;
-            }
+        NSUInteger bestScanIndex = [self scanIndexNearestTimeValue:xValue];
+        if (target == HDCVLinePlotDragTargetBackgroundX) {
+            _backgroundScanIndex = bestScanIndex;
+            [self copyBackgroundScan];
+            [self copyPhaseAlignedBackgroundScanForSelectedScan];
+            [self applyDisplayModes];
+            [self rebuildHeatmapImage];
+            [self refreshSelectionReadout];
+        } else {
+            _selectedScanIndex = bestScanIndex;
+            [self openOrRefreshAfterSelectionChangeNeedsTrace:NO];
         }
-        _selectedScanIndex = bestScanIndex;
-        _scanSlider.doubleValue = (double)_selectedScanIndex;
-        [self openOrRefreshAfterSelectionChangeNeedsTrace:NO];
     } else if (view == _cvPlotView) {
         NSUInteger bestPointIndex = 0U;
         double bestDistance = DBL_MAX;
+        double xRange = MAX(_cvPlotView.xMax - _cvPlotView.xMin, 1.0e-9);
+        double yRange = MAX(_cvPlotView.yMax - _cvPlotView.yMin, 1.0e-9);
+        const float *displayCVScan = _displayCVScanData.bytes;
         for (NSUInteger pointIndex = 0U; pointIndex < _loadedFile.pointsPerScan; ++pointIndex) {
-            double distance = fabs((double)[_loadedFile voltageAtPoint:pointIndex] - xValue);
+            double dx = ((double)[_loadedFile voltageAtPoint:pointIndex] - xValue) / xRange;
+            double dy = ((double)displayCVScan[pointIndex] - yValue) / yRange;
+            double distance = (dx * dx) + (dy * dy);
             if (distance < bestDistance) {
                 bestDistance = distance;
                 bestPointIndex = pointIndex;
             }
         }
         _selectedPointIndex = bestPointIndex;
-        _pointSlider.doubleValue = (double)_selectedPointIndex;
+        [self openOrRefreshAfterSelectionChangeNeedsTrace:YES];
+    } else if (view == _waveformPlotView) {
+        double pointValue = (xValue / 1000.0) * _loadedFile.sampleRateHz;
+        NSUInteger pointIndex = (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.pointsPerScan - 1U), pointValue)));
+        _selectedPointIndex = pointIndex;
         [self openOrRefreshAfterSelectionChangeNeedsTrace:YES];
     }
 }
@@ -1957,10 +4606,13 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
         return 0U;
     }
     if (view == _timePlotView) {
-        return _loadedFile.scanCount;
+        return HDCVPhaseSampleCount((NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
     }
     if (view == _cvPlotView) {
         return _loadedFile.pointsPerScan;
+    }
+    if (view == _waveformPlotView) {
+        return _loadedFile.waveformPointCount;
     }
     return 0U;
 }
@@ -1968,10 +4620,14 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 - (double)linePlotView:(HDCVLinePlotView *)view xValueAtIndex:(NSUInteger)index
 {
     if (view == _timePlotView) {
-        return [self timeValueForScanIndex:index];
+        NSUInteger scanIndex = HDCVScanIndexForPhaseSample(index, (NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
+        return [self timeValueForScanIndex:scanIndex];
     }
     if (view == _cvPlotView) {
         return [_loadedFile voltageAtPoint:index];
+    }
+    if (view == _waveformPlotView) {
+        return ((double)index / _loadedFile.sampleRateHz) * 1000.0;
     }
     return 0.0;
 }
@@ -1980,11 +4636,16 @@ static void HDCVExpandRange(double *minValue, double *maxValue)
 {
     if (view == _timePlotView) {
         const float *trace = _displayPointTraceData.bytes;
-        return trace[index];
+        NSUInteger scanIndex = HDCVScanIndexForPhaseSample(index, (NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
+        return trace[scanIndex];
     }
     if (view == _cvPlotView) {
-        const float *scan = _displayScanData.bytes;
+        const float *scan = _displayCVScanData.bytes;
         return scan[index];
+    }
+    if (view == _waveformPlotView) {
+        const float *waveform = _loadedFile.waveformData.bytes;
+        return waveform[index];
     }
     return 0.0;
 }
