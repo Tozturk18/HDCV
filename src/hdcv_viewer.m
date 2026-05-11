@@ -46,11 +46,13 @@ typedef NS_OPTIONS(NSUInteger, HDCVExportOptions) {
 };
 
 static const NSUInteger HDCVCVSelectedHalfWindow = 1U;
-static const NSUInteger HDCVCVBackgroundHalfWindow = 5U;
+static const NSUInteger HDCVWaveformProgramVoltageRows = 10U;
+static const NSUInteger HDCVWaveformProgramIntervalRows = 9U;
 
 @class HDCVDropHostView;
 @class HDCVHeatmapView;
 @class HDCVLinePlotView;
+@class HDCVWaveformProgramView;
 @class HDCVSwitchControl;
 
 @protocol HDCVDropHostViewDelegate <NSObject>
@@ -128,6 +130,12 @@ static const NSUInteger HDCVCVBackgroundHalfWindow = 5U;
 @property(nonatomic) BOOL showsBackgroundX;
 @end
 
+@interface HDCVWaveformProgramView : NSView
+@property(nonatomic, copy) NSArray<NSDictionary<NSString *, NSString *> *> *rows;
+@property(nonatomic, copy) NSString *summaryText;
+- (CGFloat)preferredContentHeight;
+@end
+
 @interface HDCVLoadedFile : NSObject
 - (instancetype)initWithPath:(NSString *)path maxOverviewColumns:(NSUInteger)maxOverviewColumns error:(NSError **)error;
 - (uint32_t)scanCount;
@@ -150,7 +158,9 @@ static const NSUInteger HDCVCVBackgroundHalfWindow = 5U;
 - (double)sequenceTimeSecondsAtScan:(NSUInteger)scanIndex;
 - (double)experimentTimeSecondsAtScan:(NSUInteger)scanIndex;
 - (uint32_t)waveformPointCount;
+- (uint32_t)waveformFullPointCount;
 - (double)waveformCycleDurationSeconds;
+- (double)waveformFullDurationSeconds;
 - (NSData *)voltageData;
 - (NSData *)waveformData;
 - (NSData *)overviewData;
@@ -738,6 +748,342 @@ static int HDCVVoltageStepDirection(float previous, float current, float epsilon
         return -1;
     }
     return 0;
+}
+
+static void HDCVExpandRangeToIncludeZero(double *minValue, double *maxValue)
+{
+    if (minValue == NULL || maxValue == NULL) {
+        return;
+    }
+    if (*minValue > 0.0) {
+        *minValue = 0.0;
+    }
+    if (*maxValue < 0.0) {
+        *maxValue = 0.0;
+    }
+}
+
+static void HDCVAddUniqueDoubleTick(NSMutableArray<NSNumber *> *ticks, double value, double epsilon)
+{
+    for (NSNumber *tick in ticks) {
+        if (fabs(tick.doubleValue - value) <= epsilon) {
+            return;
+        }
+    }
+    [ticks addObject:@(value)];
+}
+
+static NSInteger HDCVCompareNSNumberDouble(id a, id b, void *context)
+{
+    (void)context;
+    double first = [a doubleValue];
+    double second = [b doubleValue];
+    if (first < second) {
+        return NSOrderedAscending;
+    }
+    if (first > second) {
+        return NSOrderedDescending;
+    }
+    return NSOrderedSame;
+}
+
+static NSArray<NSNumber *> *HDCVAxisTickValues(double minValue, double maxValue, NSUInteger baseTickCount, BOOL includeZero)
+{
+    NSMutableArray<NSNumber *> *ticks = [NSMutableArray array];
+    double range = maxValue - minValue;
+    double epsilon = MAX(fabs(range) * 1.0e-9, 1.0e-9);
+
+    if (baseTickCount == 0U || range <= 0.0 || !isfinite(range)) {
+        return @[];
+    }
+
+    if (baseTickCount == 1U) {
+        HDCVAddUniqueDoubleTick(ticks, minValue, epsilon);
+    } else {
+        for (NSUInteger tick = 0U; tick < baseTickCount; ++tick) {
+            double fraction = (double)tick / (double)(baseTickCount - 1U);
+            HDCVAddUniqueDoubleTick(ticks, minValue + (range * fraction), epsilon);
+        }
+    }
+
+    if (includeZero && minValue <= 0.0 && maxValue >= 0.0) {
+        NSUInteger nearestInteriorIndex = NSNotFound;
+        double nearestInteriorDistance = DBL_MAX;
+        for (NSUInteger index = 0U; index < ticks.count; ++index) {
+            double tickValue = ticks[index].doubleValue;
+            if (fabs(tickValue) <= epsilon) {
+                return [ticks sortedArrayUsingFunction:HDCVCompareNSNumberDouble context:NULL];
+            }
+            if (index > 0U && index + 1U < ticks.count && fabs(tickValue) < nearestInteriorDistance) {
+                nearestInteriorDistance = fabs(tickValue);
+                nearestInteriorIndex = index;
+            }
+        }
+        if (nearestInteriorIndex != NSNotFound && nearestInteriorDistance <= range * 0.12) {
+            ticks[nearestInteriorIndex] = @0.0;
+        } else {
+            HDCVAddUniqueDoubleTick(ticks, 0.0, epsilon);
+        }
+    }
+
+    return [ticks sortedArrayUsingFunction:HDCVCompareNSNumberDouble context:NULL];
+}
+
+static float HDCVWaveformProgramVoltageAtIndex(const float *voltage, NSUInteger count, NSUInteger index)
+{
+    if (voltage == NULL || count == 0U) {
+        return 0.0f;
+    }
+    return (index < count) ? voltage[index] : voltage[0];
+}
+
+static NSString *HDCVFormatWaveformVoltage(double value)
+{
+    return [NSString stringWithFormat:@"%.3f", value];
+}
+
+static NSString *HDCVFormatWaveformDuration(double milliseconds)
+{
+    if (milliseconds <= 0.0005) {
+        return @"0";
+    }
+    if (milliseconds < 0.01) {
+        return [NSString stringWithFormat:@"%.4f", milliseconds];
+    }
+    return [NSString stringWithFormat:@"%.3f", milliseconds];
+}
+
+static NSString *HDCVFormatWaveformRate(double voltsPerSecond, BOOL isStep)
+{
+    double magnitude = fabs(voltsPerSecond);
+
+    if (isStep) {
+        return @"step";
+    }
+    if (magnitude >= 100.0) {
+        return [NSString stringWithFormat:@"%.0f", voltsPerSecond];
+    }
+    if (magnitude >= 10.0) {
+        return [NSString stringWithFormat:@"%.1f", voltsPerSecond];
+    }
+    return [NSString stringWithFormat:@"%.2f", voltsPerSecond];
+}
+
+static double HDCVWaveformFullDisplayDurationMs(NSUInteger activePointCount, NSUInteger fullPointCount, double sampleRateHz)
+{
+    if (fullPointCount > 0U && sampleRateHz > 0.0) {
+        return ((double)fullPointCount * 1000.0) / sampleRateHz;
+    }
+    if (activePointCount > 1U && sampleRateHz > 0.0) {
+        return ((double)(activePointCount - 1U) * 1000.0) / sampleRateHz;
+    }
+    return 0.0;
+}
+
+static NSUInteger HDCVWaveformDisplayPointCount(NSUInteger activePointCount, NSUInteger fullPointCount, double sampleRateHz)
+{
+    NSUInteger displayPointCount;
+    double displayDurationMs;
+
+    if (activePointCount == 0U || sampleRateHz <= 0.0) {
+        return activePointCount;
+    }
+
+    displayDurationMs = HDCVWaveformFullDisplayDurationMs(activePointCount, fullPointCount, sampleRateHz);
+    if (displayDurationMs <= 0.0) {
+        return activePointCount;
+    }
+
+    displayPointCount = (NSUInteger)llround((displayDurationMs / 1000.0) * sampleRateHz) + 1U;
+    return MAX(activePointCount, displayPointCount);
+}
+
+static NSArray<NSDictionary<NSString *, NSString *> *> *HDCVBuildWaveformProgramRows(
+    const float *voltage,
+    NSUInteger count,
+    double sampleRateHz,
+    double displayDurationMs,
+    NSString **outSummary
+)
+{
+    NSMutableArray<NSDictionary<NSString *, NSNumber *> *> *rawSegments = [NSMutableArray array];
+    NSMutableArray<NSDictionary<NSString *, NSNumber *> *> *intervals = [NSMutableArray array];
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *rows = [NSMutableArray array];
+    float voltageMin;
+    float voltageMax;
+    float epsilon;
+    double sampleIntervalMs;
+    double minimumHoldMs;
+    double maxAbsRate = 0.0;
+    double programmedDurationMs = 0.0;
+    NSUInteger parseCount;
+    NSUInteger segmentStart;
+    NSUInteger currentIntervalStart;
+    int segmentDirection;
+    BOOL hasSegment = NO;
+
+    if (outSummary != NULL) {
+        *outSummary = @"No waveform loaded";
+    }
+    if (voltage == NULL || count == 0U || sampleRateHz <= 0.0) {
+        return @[];
+    }
+
+    voltageMin = voltage[0];
+    voltageMax = voltage[0];
+    for (NSUInteger index = 1U; index < count; ++index) {
+        voltageMin = MIN(voltageMin, voltage[index]);
+        voltageMax = MAX(voltageMax, voltage[index]);
+    }
+    epsilon = MAX(1.0e-6f, (voltageMax - voltageMin) * 1.0e-5f);
+    sampleIntervalMs = 1000.0 / sampleRateHz;
+    minimumHoldMs = MAX(sampleIntervalMs * 1.5, 0.05);
+    parseCount = count;
+    if (displayDurationMs > ((double)count * sampleIntervalMs) + (sampleIntervalMs * 0.5)) {
+        parseCount += 1U;
+    }
+
+    segmentStart = 0U;
+    segmentDirection = 0;
+    for (NSUInteger index = 1U; index < parseCount; ++index) {
+        float previous = HDCVWaveformProgramVoltageAtIndex(voltage, count, index - 1U);
+        float current = HDCVWaveformProgramVoltageAtIndex(voltage, count, index);
+        int direction = HDCVVoltageStepDirection(previous, current, epsilon);
+        if (!hasSegment) {
+            segmentDirection = direction;
+            hasSegment = YES;
+            continue;
+        }
+
+        if (direction != segmentDirection) {
+            [rawSegments addObject:@{
+                @"start": @(segmentStart),
+                @"end": @(index - 1U),
+                @"direction": @(segmentDirection)
+            }];
+            segmentStart = index - 1U;
+            segmentDirection = direction;
+        }
+    }
+
+    if (hasSegment) {
+        [rawSegments addObject:@{
+            @"start": @(segmentStart),
+            @"end": @(parseCount - 1U),
+            @"direction": @(segmentDirection)
+        }];
+    }
+
+    currentIntervalStart = 0U;
+    for (NSDictionary<NSString *, NSNumber *> *segment in rawSegments) {
+        NSUInteger segmentEnd = segment[@"end"].unsignedIntegerValue;
+        int direction = segment[@"direction"].intValue;
+        double durationMs = ((double)(segmentEnd - currentIntervalStart) * 1000.0) / sampleRateHz;
+        float startVoltage;
+        float endVoltage;
+
+        if (segmentEnd <= currentIntervalStart) {
+            continue;
+        }
+        if (direction == 0 && durationMs < minimumHoldMs) {
+            currentIntervalStart = segmentEnd;
+            continue;
+        }
+
+        startVoltage = HDCVWaveformProgramVoltageAtIndex(voltage, count, currentIntervalStart);
+        endVoltage = HDCVWaveformProgramVoltageAtIndex(voltage, count, segmentEnd);
+        [intervals addObject:@{
+            @"start": @(currentIntervalStart),
+            @"end": @(segmentEnd),
+            @"direction": @(HDCVVoltageStepDirection(startVoltage, endVoltage, epsilon))
+        }];
+        programmedDurationMs += durationMs;
+        currentIntervalStart = segmentEnd;
+    }
+
+    for (NSDictionary<NSString *, NSNumber *> *interval in intervals) {
+        NSUInteger startIndex = interval[@"start"].unsignedIntegerValue;
+        NSUInteger endIndex = interval[@"end"].unsignedIntegerValue;
+        double durationMs = ((double)(endIndex - startIndex) * 1000.0) / sampleRateHz;
+        double deltaV = (double)HDCVWaveformProgramVoltageAtIndex(voltage, count, endIndex)
+            - (double)HDCVWaveformProgramVoltageAtIndex(voltage, count, startIndex);
+        BOOL isStep = durationMs <= sampleIntervalMs * 1.5 && fabs(deltaV) > (double)epsilon;
+        double rate = isStep ? 0.0 : deltaV / (durationMs / 1000.0);
+        if (!isStep) {
+            maxAbsRate = MAX(maxAbsRate, fabs(rate));
+        }
+    }
+
+    for (NSUInteger rowIndex = 0U; rowIndex < HDCVWaveformProgramVoltageRows; ++rowIndex) {
+        BOOL intervalRow = rowIndex < intervals.count && rowIndex < HDCVWaveformProgramIntervalRows;
+        BOOL endpointRow = rowIndex == intervals.count && intervals.count < HDCVWaveformProgramVoltageRows;
+        BOOL rowActive = intervalRow || endpointRow;
+        NSUInteger pointIndex = 0U;
+        NSString *voltageText = @"--";
+        NSString *timeText = @"";
+        NSString *rateText = @"";
+
+        if (intervalRow) {
+            NSDictionary<NSString *, NSNumber *> *interval = intervals[rowIndex];
+            NSUInteger startIndex = interval[@"start"].unsignedIntegerValue;
+            NSUInteger endIndex = interval[@"end"].unsignedIntegerValue;
+            double durationMs = ((double)(endIndex - startIndex) * 1000.0) / sampleRateHz;
+            double deltaV = (double)HDCVWaveformProgramVoltageAtIndex(voltage, count, endIndex)
+                - (double)HDCVWaveformProgramVoltageAtIndex(voltage, count, startIndex);
+            BOOL isStep = durationMs <= sampleIntervalMs * 1.5 && fabs(deltaV) > (double)epsilon;
+            double rate = isStep ? 0.0 : deltaV / (durationMs / 1000.0);
+
+            if (isStep) {
+                durationMs = 0.0;
+            }
+            pointIndex = startIndex;
+            voltageText = HDCVFormatWaveformVoltage((double)HDCVWaveformProgramVoltageAtIndex(voltage, count, pointIndex));
+            timeText = HDCVFormatWaveformDuration(durationMs);
+            rateText = HDCVFormatWaveformRate(rate, isStep);
+        } else if (endpointRow) {
+            if (intervals.count > 0U) {
+                pointIndex = intervals.lastObject[@"end"].unsignedIntegerValue;
+            }
+            voltageText = HDCVFormatWaveformVoltage((double)HDCVWaveformProgramVoltageAtIndex(voltage, count, pointIndex));
+        } else if (!rowActive && rowIndex < HDCVWaveformProgramIntervalRows) {
+            timeText = @"--";
+            rateText = @"--";
+        }
+
+        [rows addObject:@{
+            @"active": rowActive ? @"1" : @"0",
+            @"time": timeText,
+            @"rate": rateText,
+            @"voltage": voltageText
+        }];
+    }
+
+    if (outSummary != NULL) {
+        NSUInteger activeIntervalCount = MIN(intervals.count, HDCVWaveformProgramIntervalRows);
+        NSUInteger activeVoltageCount = MIN(intervals.count + 1U, HDCVWaveformProgramVoltageRows);
+        double holdMs = MAX(0.0, displayDurationMs - programmedDurationMs);
+        if (intervals.count > HDCVWaveformProgramIntervalRows) {
+            *outSummary = [NSString stringWithFormat:@"%lu active times, showing first %lu",
+                           (unsigned long)intervals.count,
+                           (unsigned long)HDCVWaveformProgramIntervalRows];
+        } else if (holdMs > sampleIntervalMs) {
+            *outSummary = [NSString stringWithFormat:@"%lu active voltages / %lu times / %@ ms hold",
+                           (unsigned long)activeVoltageCount,
+                           (unsigned long)activeIntervalCount,
+                           HDCVFormatWaveformDuration(holdMs)];
+        } else if (maxAbsRate > 0.0) {
+            *outSummary = [NSString stringWithFormat:@"%lu active voltages / %lu times / max %.0f V/s",
+                           (unsigned long)activeVoltageCount,
+                           (unsigned long)activeIntervalCount,
+                           maxAbsRate];
+        } else {
+            *outSummary = [NSString stringWithFormat:@"%lu active voltages / %lu times",
+                           (unsigned long)activeVoltageCount,
+                           (unsigned long)activeIntervalCount];
+        }
+    }
+
+    return rows;
 }
 
 static void HDCVSmoothCVSegment(
@@ -1334,6 +1680,99 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     return MAX(maxPoint, minPoint + (minPoint < fallback ? 1U : 0U));
 }
 
+- (void)addVoltageTickPointIndex:(NSUInteger)pointIndex
+                         toArray:(NSMutableArray<NSNumber *> *)indexes
+                         minPoint:(NSUInteger)minPoint
+                         maxPoint:(NSUInteger)maxPoint
+{
+    if (pointIndex < minPoint || pointIndex > maxPoint) {
+        return;
+    }
+    for (NSNumber *number in indexes) {
+        if (number.unsignedIntegerValue == pointIndex) {
+            return;
+        }
+    }
+    [indexes addObject:@(pointIndex)];
+}
+
+- (NSUInteger)pointIndexNearestVoltageValue:(double)value minPoint:(NSUInteger)minPoint maxPoint:(NSUInteger)maxPoint
+{
+    const float *voltage = self.voltageData.bytes;
+    NSUInteger bestIndex = minPoint;
+    double bestDistance = DBL_MAX;
+
+    for (NSUInteger pointIndex = minPoint; pointIndex <= maxPoint; ++pointIndex) {
+        double distance = fabs((double)voltage[pointIndex] - value);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = pointIndex;
+        }
+    }
+
+    return bestIndex;
+}
+
+- (NSArray<NSNumber *> *)voltageTickPointIndexesFromMinPoint:(NSUInteger)minPoint maxPoint:(NSUInteger)maxPoint
+{
+    const float *voltage = self.voltageData.bytes;
+    NSMutableArray<NSNumber *> *indexes = [NSMutableArray array];
+    float voltageMin = voltage[minPoint];
+    float voltageMax = voltage[minPoint];
+    float epsilon;
+    int segmentDirection = 0;
+    BOOL hasSegment = NO;
+
+    [self addVoltageTickPointIndex:minPoint toArray:indexes minPoint:minPoint maxPoint:maxPoint];
+    [self addVoltageTickPointIndex:maxPoint toArray:indexes minPoint:minPoint maxPoint:maxPoint];
+
+    for (NSUInteger pointIndex = minPoint + 1U; pointIndex <= maxPoint; ++pointIndex) {
+        voltageMin = MIN(voltageMin, voltage[pointIndex]);
+        voltageMax = MAX(voltageMax, voltage[pointIndex]);
+    }
+
+    epsilon = MAX(1.0e-6f, (voltageMax - voltageMin) * 1.0e-5f);
+    [self addVoltageTickPointIndex:[self pointIndexNearestVoltageValue:voltageMin minPoint:minPoint maxPoint:maxPoint]
+                           toArray:indexes
+                          minPoint:minPoint
+                          maxPoint:maxPoint];
+    [self addVoltageTickPointIndex:[self pointIndexNearestVoltageValue:voltageMax minPoint:minPoint maxPoint:maxPoint]
+                           toArray:indexes
+                          minPoint:minPoint
+                          maxPoint:maxPoint];
+    if (voltageMin <= 0.0f && voltageMax >= 0.0f) {
+        [self addVoltageTickPointIndex:[self pointIndexNearestVoltageValue:0.0 minPoint:minPoint maxPoint:maxPoint]
+                               toArray:indexes
+                              minPoint:minPoint
+                              maxPoint:maxPoint];
+    }
+
+    for (NSUInteger pointIndex = minPoint + 1U; pointIndex <= maxPoint; ++pointIndex) {
+        int direction = HDCVVoltageStepDirection(voltage[pointIndex - 1U], voltage[pointIndex], epsilon);
+        if (!hasSegment) {
+            segmentDirection = direction;
+            hasSegment = YES;
+            continue;
+        }
+        if (direction != segmentDirection) {
+            [self addVoltageTickPointIndex:pointIndex - 1U toArray:indexes minPoint:minPoint maxPoint:maxPoint];
+            segmentDirection = direction;
+        }
+    }
+
+    if (indexes.count < 6U) {
+        NSUInteger tickCount = MIN((NSUInteger)6U, maxPoint - minPoint + 1U);
+        for (NSUInteger tick = 0U; tick < tickCount; ++tick) {
+            NSUInteger pointIndex = (tickCount == 1U)
+                ? minPoint
+                : minPoint + (NSUInteger)llround((double)tick * (double)(maxPoint - minPoint) / (double)(tickCount - 1U));
+            [self addVoltageTickPointIndex:pointIndex toArray:indexes minPoint:minPoint maxPoint:maxPoint];
+        }
+    }
+
+    return [indexes sortedArrayUsingFunction:HDCVCompareNSNumberDouble context:NULL];
+}
+
 - (BOOL)scanIndex:(NSUInteger *)outScanIndex pointIndex:(NSUInteger *)outPointIndex fromPoint:(NSPoint)point
 {
     NSRect plotRect = [self plotRect];
@@ -1712,16 +2151,14 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         const float *voltage = self.voltageData.bytes;
         NSUInteger minPoint = [self normalizedVisiblePointMin];
         NSUInteger maxPoint = [self normalizedVisiblePointMax];
-        NSUInteger tickCount = MIN((NSUInteger)6U, maxPoint - minPoint + 1U);
-        for (NSUInteger i = 0U; i < tickCount; ++i) {
-            NSUInteger pointIndex = (tickCount == 1U)
-                ? minPoint
-                : minPoint + (NSUInteger)llround((double)i * (double)(maxPoint - minPoint) / (double)(tickCount - 1U));
+        NSArray<NSNumber *> *tickIndexes = [self voltageTickPointIndexesFromMinPoint:minPoint maxPoint:maxPoint];
+        CGFloat lastLabelY = -CGFLOAT_MAX;
+        for (NSNumber *tickIndex in tickIndexes) {
+            NSUInteger pointIndex = tickIndex.unsignedIntegerValue;
             CGFloat fraction = (maxPoint > minPoint) ? (CGFloat)(pointIndex - minPoint) / (CGFloat)(maxPoint - minPoint) : 0.0;
             CGFloat y = plotRect.origin.y + plotRect.size.height - (fraction * plotRect.size.height);
             NSString *label = [NSString stringWithFormat:@"%.2f V", voltage[pointIndex]];
             NSSize size = [label sizeWithAttributes:tickAttrs];
-            [label drawAtPoint:NSMakePoint(6.0, y - size.height * 0.5) withAttributes:tickAttrs];
 
             NSBezierPath *grid = [NSBezierPath bezierPath];
             [grid moveToPoint:NSMakePoint(plotRect.origin.x, y)];
@@ -1729,6 +2166,11 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             grid.lineWidth = 0.5;
             [HDCVSoftGridColor() setStroke];
             [grid stroke];
+
+            if (fabs(y - lastLabelY) >= 15.0 || pointIndex == minPoint || pointIndex == maxPoint) {
+                [label drawAtPoint:NSMakePoint(6.0, y - size.height * 0.5) withAttributes:tickAttrs];
+                lastLabelY = y;
+            }
         }
     }
 }
@@ -2094,16 +2536,15 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     xRange = xMax - xMin;
     yRange = yMax - yMin;
 
-    for (NSUInteger tick = 0U; tick < 5U; ++tick) {
-        CGFloat fraction = (CGFloat)tick / 4.0;
-        double xValue = xMin + (xRange * fraction);
-        double yValue = yMax - (yRange * fraction);
+    NSArray<NSNumber *> *xTicks = HDCVAxisTickValues(xMin, xMax, 5U, YES);
+    NSArray<NSNumber *> *yTicks = HDCVAxisTickValues(yMin, yMax, 5U, YES);
+
+    for (NSNumber *tickValue in xTicks) {
+        double xValue = tickValue.doubleValue;
+        CGFloat fraction = (CGFloat)((xValue - xMin) / xRange);
         NSString *xLabel = [NSString stringWithFormat:self.xTickFormat, xValue];
-        NSString *yLabel = [NSString stringWithFormat:self.yTickFormat, yValue];
         NSSize xSize = [xLabel sizeWithAttributes:tickAttrs];
-        NSSize ySize = [yLabel sizeWithAttributes:tickAttrs];
         CGFloat x = plotRect.origin.x + (fraction * plotRect.size.width);
-        CGFloat y = plotRect.origin.y + (fraction * plotRect.size.height);
 
         [HDCVSoftGridColor() setStroke];
         NSBezierPath *verticalGrid = [NSBezierPath bezierPath];
@@ -2112,13 +2553,23 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         verticalGrid.lineWidth = 0.5;
         [verticalGrid stroke];
 
+        [xLabel drawAtPoint:NSMakePoint(x - xSize.width * 0.5, NSMaxY(plotRect) + 20.0) withAttributes:tickAttrs];
+    }
+
+    for (NSNumber *tickValue in yTicks) {
+        double yValue = tickValue.doubleValue;
+        CGFloat fraction = (CGFloat)((yValue - yMin) / yRange);
+        NSString *yLabel = [NSString stringWithFormat:self.yTickFormat, yValue];
+        NSSize ySize = [yLabel sizeWithAttributes:tickAttrs];
+        CGFloat y = plotRect.origin.y + plotRect.size.height - (fraction * plotRect.size.height);
+
+        [HDCVSoftGridColor() setStroke];
         NSBezierPath *horizontalGrid = [NSBezierPath bezierPath];
         [horizontalGrid moveToPoint:NSMakePoint(plotRect.origin.x, y)];
         [horizontalGrid lineToPoint:NSMakePoint(NSMaxX(plotRect), y)];
         horizontalGrid.lineWidth = 0.5;
         [horizontalGrid stroke];
 
-        [xLabel drawAtPoint:NSMakePoint(x - xSize.width * 0.5, NSMaxY(plotRect) + 20.0) withAttributes:tickAttrs];
         [yLabel drawAtPoint:NSMakePoint(6.0, y - ySize.height * 0.5) withAttributes:tickAttrs];
     }
 
@@ -2359,6 +2810,131 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
 @end
 
+@implementation HDCVWaveformProgramView
+
+- (instancetype)initWithFrame:(NSRect)frameRect
+{
+    self = [super initWithFrame:frameRect];
+    if (self != nil) {
+        _rows = @[];
+        _summaryText = @"No waveform loaded";
+        self.wantsLayer = YES;
+        self.layer.backgroundColor = NSColor.clearColor.CGColor;
+    }
+    return self;
+}
+
+- (BOOL)isFlipped
+{
+    return YES;
+}
+
+- (void)setRows:(NSArray<NSDictionary<NSString *,NSString *> *> *)rows
+{
+    _rows = [rows copy];
+    [self invalidateIntrinsicContentSize];
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setSummaryText:(NSString *)summaryText
+{
+    _summaryText = [summaryText copy];
+    [self setNeedsDisplay:YES];
+}
+
+- (CGFloat)preferredContentHeight
+{
+    return 54.0 + (CGFloat)MAX(self.rows.count, HDCVWaveformProgramVoltageRows) * 24.0 + 12.0;
+}
+
+- (NSSize)intrinsicContentSize
+{
+    return NSMakeSize(NSViewNoIntrinsicMetric, [self preferredContentHeight]);
+}
+
+- (NSDictionary<NSAttributedStringKey, id> *)textAttributesWithColor:(NSColor *)color size:(CGFloat)size weight:(NSFontWeight)weight
+{
+    return @{
+        NSFontAttributeName: [NSFont systemFontOfSize:size weight:weight],
+        NSForegroundColorAttributeName: color
+    };
+}
+
+- (void)drawRect:(NSRect)dirtyRect
+{
+    (void)dirtyRect;
+    NSRect bounds = self.bounds;
+    CGFloat width = bounds.size.width;
+    CGFloat titleY = 4.0;
+    CGFloat headerY = 34.0;
+    CGFloat rowY = 54.0;
+    CGFloat rowHeight = 24.0;
+    CGFloat voltageX = 12.0;
+    CGFloat timeX = MAX(118.0, width * 0.34);
+    CGFloat rateX = MAX(222.0, width * 0.64);
+    NSDictionary *titleAttrs = [self textAttributesWithColor:NSColor.blackColor size:12.0 weight:NSFontWeightSemibold];
+    NSDictionary *summaryAttrs = [self textAttributesWithColor:HDCVMutedText() size:9.5 weight:NSFontWeightRegular];
+    NSDictionary *headerAttrs = [self textAttributesWithColor:HDCVMutedText() size:9.0 weight:NSFontWeightSemibold];
+    NSDictionary *cellAttrs = @{
+        NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:10.5 weight:NSFontWeightRegular],
+        NSForegroundColorAttributeName: [NSColor colorWithWhite:0.13 alpha:1.0]
+    };
+    NSDictionary *mutedCellAttrs = @{
+        NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:10.5 weight:NSFontWeightRegular],
+        NSForegroundColorAttributeName: [NSColor colorWithWhite:0.66 alpha:1.0]
+    };
+
+    [NSColor.whiteColor setFill];
+    NSRectFill(bounds);
+
+    [@"Waveform Program" drawAtPoint:NSMakePoint(voltageX, titleY) withAttributes:titleAttrs];
+    if (self.summaryText.length > 0U) {
+        [self.summaryText drawAtPoint:NSMakePoint(voltageX, titleY + 17.0) withAttributes:summaryAttrs];
+    }
+
+    [@"Voltage (V)" drawAtPoint:NSMakePoint(voltageX, headerY) withAttributes:headerAttrs];
+    [@"Time (ms)" drawAtPoint:NSMakePoint(timeX, headerY) withAttributes:headerAttrs];
+    [@"Rate (V/s)" drawAtPoint:NSMakePoint(rateX, headerY) withAttributes:headerAttrs];
+
+    [HDCVSoftGridColor() setStroke];
+    NSBezierPath *divider = [NSBezierPath bezierPath];
+    [divider moveToPoint:NSMakePoint(voltageX, headerY + 17.0)];
+    [divider lineToPoint:NSMakePoint(MAX(voltageX, width - 10.0), headerY + 17.0)];
+    divider.lineWidth = 0.7;
+    [divider stroke];
+
+    if (self.rows.count == 0U) {
+        [@"-" drawAtPoint:NSMakePoint(voltageX, rowY) withAttributes:mutedCellAttrs];
+        return;
+    }
+
+    for (NSUInteger rowIndex = 0U; rowIndex < self.rows.count; ++rowIndex) {
+        CGFloat y = rowY + ((CGFloat)rowIndex * rowHeight);
+        NSDictionary<NSString *, NSString *> *row = self.rows[rowIndex];
+        BOOL active = row[@"active"] == nil || row[@"active"].boolValue;
+        NSDictionary *attributes = active ? cellAttrs : mutedCellAttrs;
+        if (y > NSMaxY(bounds)) {
+            break;
+        }
+        if ((rowIndex % 2U) == 0U) {
+            [[NSColor colorWithWhite:(active ? 0.965 : 0.982) alpha:1.0] setFill];
+            NSRectFill(NSMakeRect(6.0, y - 2.0, MAX(0.0, width - 12.0), rowHeight));
+        } else if (!active) {
+            [[NSColor colorWithWhite:0.988 alpha:1.0] setFill];
+            NSRectFill(NSMakeRect(6.0, y - 2.0, MAX(0.0, width - 12.0), rowHeight));
+        }
+
+        NSString *voltageText = row[@"voltage"] != nil ? row[@"voltage"] : @"";
+        NSString *timeText = row[@"time"] != nil ? row[@"time"] : @"";
+        NSString *rateText = row[@"rate"] != nil ? row[@"rate"] : @"";
+        [voltageText drawAtPoint:NSMakePoint(voltageX, y + 3.0) withAttributes:attributes];
+        [timeText drawAtPoint:NSMakePoint(timeX, y + 3.0) withAttributes:attributes];
+        [rateText drawAtPoint:NSMakePoint(rateX, y + 3.0) withAttributes:attributes];
+    }
+}
+
+@end
+
 @implementation HDCVLoadedFile {
     hdcv_reader _reader;
     BOOL _isOpen;
@@ -2367,7 +2943,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSData *_overviewData;
     uint32_t _overviewColumnCount;
     uint32_t _waveformPointCount;
+    uint32_t _waveformFullPointCount;
     double _waveformCycleDurationSeconds;
+    double _waveformFullDurationSeconds;
     float _overviewMinValue;
     float _overviewMaxValue;
 }
@@ -2401,9 +2979,13 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     _voltageData = [voltageBuffer copy];
     _waveformPointCount = _reader.layout.points_per_scan;
+    _waveformFullPointCount = _reader.layout.waveform_full_points;
     _waveformCycleDurationSeconds = (_waveformPointCount > 0U)
         ? (double)(_waveformPointCount - 1U) / _reader.layout.sample_rate_hz
         : 0.0;
+    _waveformFullDurationSeconds = (_waveformFullPointCount > 0U && _reader.layout.sample_rate_hz > 0.0)
+        ? (double)_waveformFullPointCount / _reader.layout.sample_rate_hz
+        : _waveformCycleDurationSeconds;
     _waveformData = _voltageData;
 
     {
@@ -2457,7 +3039,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (double)runDurationSeconds { return _reader.layout.run_duration_s; }
 - (double)delayBetweenRunsSeconds { return _reader.layout.delay_between_runs_s; }
 - (uint32_t)waveformPointCount { return _waveformPointCount; }
+- (uint32_t)waveformFullPointCount { return _waveformFullPointCount; }
 - (double)waveformCycleDurationSeconds { return _waveformCycleDurationSeconds; }
+- (double)waveformFullDurationSeconds { return _waveformFullDurationSeconds; }
 - (NSData *)voltageData { return _voltageData; }
 - (NSData *)waveformData { return _waveformData; }
 - (NSData *)overviewData { return _overviewData; }
@@ -2515,6 +3099,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 	    HDCVLinePlotView *_timePlotView;
 	    HDCVLinePlotView *_cvPlotView;
 	    HDCVLinePlotView *_waveformPlotView;
+	    HDCVWaveformProgramView *_waveformProgramView;
+	    NSScrollView *_waveformProgramScrollView;
 	    NSTextField *_heroTitleLabel;
 	    NSTextField *_heroStatusLabel;
 	    NSTextField *_fileLabel;
@@ -2933,7 +3519,13 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     NSView *waveformPanel = HDCVPanelContainer();
     [sidebarColumn addArrangedSubview:waveformPanel];
-    [waveformPanel.heightAnchor constraintGreaterThanOrEqualToConstant:420.0].active = YES;
+    [waveformPanel.heightAnchor constraintGreaterThanOrEqualToConstant:600.0].active = YES;
+
+    NSStackView *waveformStack = [[NSStackView alloc] init];
+    waveformStack.translatesAutoresizingMaskIntoConstraints = NO;
+    waveformStack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    waveformStack.spacing = 8.0;
+    [waveformPanel addSubview:waveformStack];
 
     _waveformPlotView = [[HDCVLinePlotView alloc] initWithFrame:NSZeroRect];
     _waveformPlotView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2947,13 +3539,26 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _waveformPlotView.xTickFormat = @"%.2f";
     _waveformPlotView.yTickFormat = @"%.2f";
     _waveformPlotView.strokeColor = HDCVAccentTeal();
-    [waveformPanel addSubview:_waveformPlotView];
+    [waveformStack addArrangedSubview:_waveformPlotView];
+
+    _waveformProgramView = [[HDCVWaveformProgramView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 360.0, 306.0)];
+    _waveformProgramView.autoresizingMask = NSViewWidthSizable;
+    _waveformProgramScrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    _waveformProgramScrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    _waveformProgramScrollView.borderType = NSNoBorder;
+    _waveformProgramScrollView.drawsBackground = NO;
+    _waveformProgramScrollView.hasVerticalScroller = NO;
+    _waveformProgramScrollView.hasHorizontalScroller = NO;
+    _waveformProgramScrollView.documentView = _waveformProgramView;
+    [waveformStack addArrangedSubview:_waveformProgramScrollView];
 
     [NSLayoutConstraint activateConstraints:@[
-        [_waveformPlotView.leadingAnchor constraintEqualToAnchor:waveformPanel.leadingAnchor constant:8.0],
-        [_waveformPlotView.trailingAnchor constraintEqualToAnchor:waveformPanel.trailingAnchor constant:-8.0],
-        [_waveformPlotView.topAnchor constraintEqualToAnchor:waveformPanel.topAnchor constant:8.0],
-        [_waveformPlotView.bottomAnchor constraintEqualToAnchor:waveformPanel.bottomAnchor constant:-8.0],
+        [waveformStack.leadingAnchor constraintEqualToAnchor:waveformPanel.leadingAnchor constant:8.0],
+        [waveformStack.trailingAnchor constraintEqualToAnchor:waveformPanel.trailingAnchor constant:-8.0],
+        [waveformStack.topAnchor constraintEqualToAnchor:waveformPanel.topAnchor constant:8.0],
+        [waveformStack.bottomAnchor constraintEqualToAnchor:waveformPanel.bottomAnchor constant:-8.0],
+        [_waveformPlotView.heightAnchor constraintGreaterThanOrEqualToConstant:254.0],
+        [_waveformProgramScrollView.heightAnchor constraintEqualToConstant:306.0],
     ]];
 }
 
@@ -3126,12 +3731,21 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 {
     NSUInteger scanCount = loadedFile.scanCount;
     NSUInteger pointsPerScan = loadedFile.pointsPerScan;
+    NSUInteger selectedCenter = HDCVNearestScanIndexForPhase(scanIndex, scanCount, activePhaseIndex, phasePeriod);
+    NSUInteger backgroundCenter = HDCVNearestScanIndexForPhase(backgroundScanIndex, scanCount, activePhaseIndex, phasePeriod);
     FILE *file = HDCVOpenCSVFile(url, error);
     if (file == NULL) {
         return NO;
     }
 
     fprintf(file, "voltage_V,current_nA\n");
+    if (backgroundSubtractEnabled && selectedCenter == backgroundCenter) {
+        for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
+            fprintf(file, "%.9g,0\n", (double)[loadedFile voltageAtPoint:pointIndex]);
+        }
+        return HDCVCloseCSVFile(file, url, error);
+    }
+
     if (bandpassFilterEnabled) {
         NSMutableData *traceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
         NSMutableData *sourceTraceData = backgroundSubtractEnabled ? [NSMutableData dataWithLength:scanCount * sizeof(float)] : nil;
@@ -3160,7 +3774,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             float current = HDCVAverageTraceInPhaseWindow(
                 trace,
                 scanCount,
-                scanIndex,
+                selectedCenter,
                 activePhaseIndex,
                 phasePeriod,
                 HDCVCVSelectedHalfWindow
@@ -3231,7 +3845,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         }
 
         if (backgroundSubtractEnabled) {
-            if (!copyAverageScan(backgroundScanIndex, HDCVCVBackgroundHalfWindow, backgroundAverage)) {
+            if (!copyAverageScan(backgroundCenter, HDCVCVSelectedHalfWindow, backgroundAverage)) {
                 fclose(file);
                 HDCVSetCSVError(error, url, @"Could not read the phase-aligned background average for CV export.");
                 return NO;
@@ -3576,6 +4190,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [self applyDisplayModes];
     [self rebuildHeatmapImage];
     [self refreshHeatmapTicks];
+    [self refreshWaveformProgram];
     [self refreshPlotTitles];
     [self refreshSelectionReadout];
     [self requestPointTraceRefresh];
@@ -3766,7 +4381,17 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     NSUInteger scanCount = _loadedFile.scanCount;
     NSUInteger pointsPerScan = _loadedFile.pointsPerScan;
+    NSUInteger period = [self activePhasePeriod];
+    NSUInteger selectedCenter = HDCVNearestScanIndexForPhase(_selectedScanIndex, scanCount, _activePhaseIndex, period);
+    NSUInteger backgroundCenter = HDCVNearestScanIndexForPhase(_backgroundScanIndex, scanCount, _activePhaseIndex, period);
     float *displayCVScan = _displayCVScanData.mutableBytes;
+
+    if (_backgroundSubtractEnabled && selectedCenter == backgroundCenter) {
+        memset(displayCVScan, 0, pointsPerScan * sizeof(float));
+        _displayCVScanMin = 0.0f;
+        _displayCVScanMax = 0.0f;
+        return YES;
+    }
 
     if (_bandpassFilterEnabled) {
         NSMutableData *traceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
@@ -3792,9 +4417,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             displayCVScan[pointIndex] = HDCVAverageTraceInPhaseWindow(
                 trace,
                 scanCount,
-                _selectedScanIndex,
+                selectedCenter,
                 _activePhaseIndex,
-                [self activePhasePeriod],
+                period,
                 HDCVCVSelectedHalfWindow
             );
         }
@@ -3807,7 +4432,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         const float *selectedAverage = selectedAverageData.bytes;
         const float *backgroundAverage = NULL;
         if (_backgroundSubtractEnabled) {
-            if (![self copyAverageScanAroundIndex:_backgroundScanIndex halfWindow:HDCVCVBackgroundHalfWindow intoMutableData:backgroundAverageData]) {
+            if (![self copyAverageScanAroundIndex:backgroundCenter halfWindow:HDCVCVSelectedHalfWindow intoMutableData:backgroundAverageData]) {
                 return NO;
             }
             backgroundAverage = backgroundAverageData.bytes;
@@ -3941,6 +4566,35 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     _heatmapView.xTickLabels = labels;
     _heatmapView.xTickFractions = fractions;
+}
+
+- (void)refreshWaveformProgram
+{
+    if (_waveformProgramView == nil) {
+        return;
+    }
+
+    if (_loadedFile == nil || _loadedFile.waveformData.length == 0U) {
+        _waveformProgramView.rows = @[];
+        _waveformProgramView.summaryText = @"No waveform loaded";
+    } else {
+        NSString *summary = nil;
+        NSArray<NSDictionary<NSString *, NSString *> *> *rows = HDCVBuildWaveformProgramRows(
+            _loadedFile.waveformData.bytes,
+            (NSUInteger)_loadedFile.waveformPointCount,
+            _loadedFile.sampleRateHz,
+            _loadedFile.waveformFullDurationSeconds * 1000.0,
+            &summary
+        );
+        _waveformProgramView.rows = rows;
+        _waveformProgramView.summaryText = (summary != nil) ? summary : @"";
+    }
+
+    if (_waveformProgramScrollView != nil) {
+        CGFloat width = MAX(_waveformProgramScrollView.contentSize.width, 340.0);
+        CGFloat height = MAX(_waveformProgramScrollView.contentSize.height, [_waveformProgramView preferredContentHeight]);
+        _waveformProgramView.frame = NSMakeRect(0.0, 0.0, width, height);
+    }
 }
 
 - (NSImage *)buildHeatmapImage
@@ -4180,6 +4834,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
     HDCVExpandRange(&yMin, &yMax);
     HDCVExpandRange(&voltageMin, &voltageMax);
+    HDCVExpandRangeToIncludeZero(&yMin, &yMax);
+    HDCVExpandRangeToIncludeZero(&voltageMin, &voltageMax);
     _cvPlotView.xMin = _cvXManual ? _cvXMinManual : voltageMin;
     _cvPlotView.xMax = _cvXManual ? _cvXMaxManual : voltageMax;
     _cvPlotView.yMin = _cvYManual ? _cvYMinManual : yMin;
@@ -4201,6 +4857,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         double traceXMin = [self timeValueForScanIndex:firstPhaseScan];
         double traceXMax = [self timeValueForScanIndex:lastPhaseScan];
         HDCVExpandRange(&traceMin, &traceMax);
+        HDCVExpandRangeToIncludeZero(&traceXMin, &traceXMax);
+        HDCVExpandRangeToIncludeZero(&traceMin, &traceMax);
         _timePlotView.xMin = _timeXManual ? _timeXMinManual : traceXMin;
         _timePlotView.xMax = _timeXManual ? _timeXMaxManual : traceXMax;
         _timePlotView.yMin = _timeYManual ? _timeYMinManual : traceMin;
@@ -4217,7 +4875,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     {
         double waveformXMin = 0.0;
-        double waveformXMax = _loadedFile.waveformCycleDurationSeconds * 1000.0;
+        double waveformXMax = HDCVWaveformFullDisplayDurationMs(
+            (NSUInteger)_loadedFile.waveformPointCount,
+            (NSUInteger)_loadedFile.waveformFullPointCount,
+            _loadedFile.sampleRateHz);
         const float *waveform = _loadedFile.waveformData.bytes;
         double waveformYMin = (double)waveform[0];
         double waveformYMax = (double)waveform[0];
@@ -4226,6 +4887,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             waveformYMax = MAX(waveformYMax, (double)waveform[i]);
         }
         HDCVExpandRange(&waveformYMin, &waveformYMax);
+        HDCVExpandRangeToIncludeZero(&waveformXMin, &waveformXMax);
+        HDCVExpandRangeToIncludeZero(&waveformYMin, &waveformYMax);
         _waveformPlotView.xMin = _waveformXManual ? _waveformXMinManual : waveformXMin;
         _waveformPlotView.xMax = _waveformXManual ? _waveformXMaxManual : waveformXMax;
         _waveformPlotView.yMin = _waveformYManual ? _waveformYMinManual : waveformYMin;
@@ -4700,7 +5363,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         return _loadedFile.pointsPerScan;
     }
     if (view == _waveformPlotView) {
-        return _loadedFile.waveformPointCount;
+        return HDCVWaveformDisplayPointCount(
+            (NSUInteger)_loadedFile.waveformPointCount,
+            (NSUInteger)_loadedFile.waveformFullPointCount,
+            _loadedFile.sampleRateHz);
     }
     return 0U;
 }
@@ -4733,7 +5399,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
     if (view == _waveformPlotView) {
         const float *waveform = _loadedFile.waveformData.bytes;
-        return waveform[index];
+        if (index < _loadedFile.waveformPointCount) {
+            return waveform[index];
+        }
+        return waveform[0];
     }
     return 0.0;
 }

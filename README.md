@@ -95,7 +95,8 @@ Current GUI features:
 - overview color plot built from a downsampled scan matrix
 - selected `I-t` plot at the chosen waveform point
 - selected `CV` plot at the chosen scan, preserving the full active waveform including custom repeated triangle cycles
-- constant FSCV waveform plot from the decoded active voltage waveform
+- constant FSCV waveform plot from the decoded active voltage waveform, shown across the parser-reported full-cycle duration
+- waveform-program table with WaveNeuro-style 10 voltage rows and 9 time rows; meaningful hold intervals are preserved and inactive entries are greyed out
 - numeric crosshair controls in plot headers using axis units: time in seconds and voltage in volts
 - direct axis editing by double-clicking visible plot min/max tick labels, typing a value, and pressing Return
 - phase-aligned background subtraction applied coherently to color plot, `I-t`, and `CV`
@@ -126,11 +127,13 @@ FSCV-specific interaction model:
 - sequence time remains contiguous by scan index
 - plot subtitles use compact coordinates: color plot `[time ; voltage ; current]`, `I-t` `[time ; current]`, and `CV` `[voltage ; current]`
 - plot axis ranges are edited by double-clicking visible min/max tick labels; the color plot's current scale is edited the same way from the color legend labels
+- color-plot voltage ticks prioritize waveform extrema and breakpoint/hold voltages; `I-t`, `CV`, and waveform plot ticks include `0` on visible axes
 - the color plot uses independent positive and negative current limits so asymmetric data ranges such as `+20 nA / -10 nA` are represented honestly instead of being forced into a symmetric legend
 - the viewer preserves the full active voltage waveform reported by the parser, including custom repeated triangle cycles, and plots a single scan phase by default so `I-t` traces do not interleave multiple baseline families
 - when background subtraction is enabled, the visible background marker remains user-selected inside the active phase, and subtraction uses the nearest background scan with the same scan modulo waveform-count phase as the displayed scan; color plot overview columns average per-scan, phase-aligned subtraction rather than subtracting from a pre-averaged column
-- the `CV` plot keeps the full active waveform intact, including custom repeated triangle cycles; to reduce point jitter without cropping, it averages 3 same-phase scans around the selected time and, when background subtraction is on, 11 same-phase scans around the background time, then applies a narrow branch-preserving denoise along each waveform ramp
-- the waveform plot uses the active voltage axis decoded by the C reader; the current matrix remains stored for the active FSCV segment
+- the `CV` plot keeps the full active waveform intact, including custom repeated triangle cycles; to reduce point jitter without cropping, it averages matching 3-scan same-phase windows for the selected and background times, so selecting the same scan as background produces an exactly zero CV
+- the waveform plot uses the active voltage axis decoded by the C reader; its display length comes from `waveform_full_points / sample_rate_hz`, and any time after the active custom waveform is shown as a hold at the first voltage
+- the waveform-program table is read-only and inferred from voltage-axis intervals, matching WaveNeuro's 10-voltage/9-time custom-waveform convention without turning the viewer into waveform-authoring software; real holds become `0 V/s` rows, while tiny one-sample plateaus are suppressed
 - editing the color-plot time bounds also updates the linked `I-t` time range, and editing the `I-t` time range updates the color-plot scan crop
 - the bandpass filter uses a zero-phase two-pole high-pass and low-pass cascade; for interleaved phase files it filters each phase family independently at that phase family's effective sampling rate
 - `Export Data` writes simple CSV files using the current plot processing state and active phase: color plot rows are `time_s,current_nA,voltage_V`, `I-t` rows are `time_s,current_nA` at the selected voltage crosshair, and `CV` rows are `voltage_V,current_nA` at the selected time crosshair
