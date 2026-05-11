@@ -35,6 +35,8 @@ typedef NS_ENUM(NSInteger, HDCVAxisEditTarget) {
     HDCVAxisEditTargetXMax = 2,
     HDCVAxisEditTargetYMin = 3,
     HDCVAxisEditTargetYMax = 4,
+    HDCVAxisEditTargetColorMin = 5,
+    HDCVAxisEditTargetColorMax = 6,
 };
 
 typedef NS_OPTIONS(NSUInteger, HDCVExportOptions) {
@@ -98,6 +100,7 @@ static const NSUInteger HDCVCVBackgroundHalfWindow = 5U;
 @property(nonatomic) NSUInteger visiblePointMaxIndex;
 @property(nonatomic, copy) NSString *titleText;
 @property(nonatomic, copy) NSString *subtitleText;
+@property(nonatomic) double colorScaleMinNA;
 @property(nonatomic) double colorScaleMaxNA;
 @end
 
@@ -248,6 +251,67 @@ static void HDCVHeatmapRGBForNormalized(float normalized, float *outR, float *ou
     *outR = r;
     *outG = g;
     *outB = b;
+}
+
+static BOOL HDCVFiniteRange(const float *values, size_t count, float *outMin, float *outMax)
+{
+    BOOL found = NO;
+    float minValue = 0.0f;
+    float maxValue = 0.0f;
+
+    for (size_t i = 0U; i < count; ++i) {
+        float value = values[i];
+        if (!isfinite(value)) {
+            continue;
+        }
+        if (!found || value < minValue) {
+            minValue = value;
+        }
+        if (!found || value > maxValue) {
+            maxValue = value;
+        }
+        found = YES;
+    }
+
+    if (!found) {
+        return NO;
+    }
+    if (outMin != NULL) {
+        *outMin = minValue;
+    }
+    if (outMax != NULL) {
+        *outMax = maxValue;
+    }
+    return YES;
+}
+
+static void HDCVNormalizeDivergingColorLimits(double *minValue, double *maxValue)
+{
+    double positive = MAX(isfinite(*maxValue) ? *maxValue : 0.0, 0.0);
+    double negative = MIN(isfinite(*minValue) ? *minValue : 0.0, 0.0);
+    double fallback = MAX(MAX(fabs(positive), fabs(negative)), 1.0);
+
+    if (positive <= 1.0e-12) {
+        positive = fallback;
+    }
+    if (negative >= -1.0e-12) {
+        negative = -fallback;
+    }
+
+    *minValue = negative;
+    *maxValue = positive;
+}
+
+static float HDCVNormalizeCurrentForColor(float value, double minValue, double maxValue)
+{
+    double denominator = (value >= 0.0f) ? maxValue : -minValue;
+    if (!isfinite(value)) {
+        return 0.0f;
+    }
+    if (denominator <= 1.0e-12) {
+        denominator = 1.0;
+    }
+    return (float)MAX(-1.0, MIN(1.0, (double)value / denominator));
 }
 
 static NSView *HDCVPanelContainer(void)
@@ -662,36 +726,6 @@ static int HDCVCompareFloat(const void *a, const void *b)
     float fa = *(const float *)a;
     float fb = *(const float *)b;
     return (fa > fb) - (fa < fb);
-}
-
-static float HDCVRobustAbsScale(const float *values, size_t count)
-{
-    size_t stride = MAX((size_t)1U, count / 65536U);
-    size_t sampleCapacity = (count + stride - 1U) / stride;
-    float *samples = (float *)malloc(sampleCapacity * sizeof(*samples));
-    size_t sampleCount = 0U;
-    float scale;
-
-    if (samples == NULL) {
-        return 1.0f;
-    }
-
-    for (size_t i = 0U; i < count; i += stride) {
-        float value = values[i];
-        if (isfinite(value)) {
-            samples[sampleCount++] = fabsf(value);
-        }
-    }
-
-    if (sampleCount == 0U) {
-        free(samples);
-        return 1.0f;
-    }
-
-    qsort(samples, sampleCount, sizeof(*samples), HDCVCompareFloat);
-    scale = samples[(size_t)floor((double)(sampleCount - 1U) * 0.99)];
-    free(samples);
-    return MAX(scale, 1.0e-6f);
 }
 
 static int HDCVVoltageStepDirection(float previous, float current, float epsilon)
@@ -1119,6 +1153,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _titleText = @"Color Plot";
         _subtitleText = @"No file loaded";
         _backgroundScanIndex = NSNotFound;
+        _colorScaleMinNA = -1.0;
         _colorScaleMaxNA = 1.0;
         _visibleScanMinIndex = 0U;
         _visibleScanMaxIndex = NSNotFound;
@@ -1223,6 +1258,12 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (void)setColorScaleMaxNA:(double)colorScaleMaxNA
 {
     _colorScaleMaxNA = colorScaleMaxNA;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setColorScaleMinNA:(double)colorScaleMinNA
+{
+    _colorScaleMinNA = colorScaleMinNA;
     [self setNeedsDisplay:YES];
 }
 
@@ -1335,7 +1376,18 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             return [NSString stringWithFormat:@"%.3f V", voltage[maxPoint]];
         }
     }
+    if (target == HDCVAxisEditTargetColorMax) {
+        return [NSString stringWithFormat:@"%.3f nA", self.colorScaleMaxNA];
+    }
+    if (target == HDCVAxisEditTargetColorMin) {
+        return [NSString stringWithFormat:@"%.3f nA", self.colorScaleMinNA];
+    }
     return @"0";
+}
+
+- (NSRect)legendRectForPlotRect:(NSRect)plotRect
+{
+    return NSMakeRect(NSMaxX(plotRect) + 14.0, plotRect.origin.y, 14.0, plotRect.size.height);
 }
 
 - (NSRect)axisEditRectForTarget:(HDCVAxisEditTarget)target
@@ -1344,6 +1396,14 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 {
     NSString *label = [self axisEditStringForTarget:target];
     NSSize size = [label sizeWithAttributes:attributes];
+
+    if (target == HDCVAxisEditTargetColorMax || target == HDCVAxisEditTargetColorMin) {
+        NSRect legendRect = [self legendRectForPlotRect:plotRect];
+        CGFloat y = (target == HDCVAxisEditTargetColorMax)
+            ? legendRect.origin.y - 3.0
+            : NSMaxY(legendRect) - size.height - 1.0;
+        return NSInsetRect(NSMakeRect(NSMaxX(legendRect) + 4.0, y, MAX(size.width, 62.0), MAX(size.height, 16.0)), -12.0, -8.0);
+    }
 
     if ((target == HDCVAxisEditTargetXMin || target == HDCVAxisEditTargetXMax) &&
         self.xTickFractions.count > 0U) {
@@ -1373,7 +1433,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         HDCVAxisEditTargetXMin,
         HDCVAxisEditTargetXMax,
         HDCVAxisEditTargetYMin,
-        HDCVAxisEditTargetYMax
+        HDCVAxisEditTargetYMax,
+        HDCVAxisEditTargetColorMin,
+        HDCVAxisEditTargetColorMax
     };
 
     for (NSUInteger i = 0U; i < sizeof(targets) / sizeof(targets[0]); ++i) {
@@ -1564,7 +1626,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
 
     {
-        NSRect legendRect = NSMakeRect(NSMaxX(plotRect) + 14.0, plotRect.origin.y, 14.0, plotRect.size.height);
+        NSRect legendRect = [self legendRectForPlotRect:plotRect];
         NSUInteger steps = MAX((NSUInteger)plotRect.size.height, 1U);
         for (NSUInteger i = 0U; i < steps; ++i) {
             CGFloat fraction = steps > 1U ? (CGFloat)i / (CGFloat)(steps - 1U) : 0.0;
@@ -1580,9 +1642,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         legendBorder.lineWidth = 0.8;
         [legendBorder stroke];
 
-        NSString *topLabel = [NSString stringWithFormat:@"+%.0f nA", self.colorScaleMaxNA];
+        NSString *topLabel = [NSString stringWithFormat:@"%+.0f nA", self.colorScaleMaxNA];
         NSString *middleLabel = @"0 nA";
-        NSString *bottomLabel = [NSString stringWithFormat:@"-%.0f nA", self.colorScaleMaxNA];
+        NSString *bottomLabel = [NSString stringWithFormat:@"%+.0f nA", self.colorScaleMinNA];
         [@"Current (nA)" drawAtPoint:NSMakePoint(NSMaxX(plotRect) + 2.0, plotRect.origin.y - 18.0) withAttributes:tickAttrs];
         [topLabel drawAtPoint:NSMakePoint(NSMaxX(legendRect) + 5.0, legendRect.origin.y - 2.0) withAttributes:tickAttrs];
         [middleLabel drawAtPoint:NSMakePoint(NSMaxX(legendRect) + 5.0, NSMidY(legendRect) - 6.0) withAttributes:tickAttrs];
@@ -2492,6 +2554,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 	    BOOL _exportInProgress;
 	    BOOL _heatmapXManual;
 	    BOOL _heatmapYManual;
+	    BOOL _heatmapColorManual;
 	    BOOL _timeXManual;
 	    BOOL _timeYManual;
 	    BOOL _cvXManual;
@@ -2502,6 +2565,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 	    double _heatmapXMaxManual;
 	    double _heatmapYMinManual;
 	    double _heatmapYMaxManual;
+	    double _heatmapColorMinManual;
+	    double _heatmapColorMaxManual;
 	    double _timeXMinManual;
 	    double _timeXMaxManual;
 	    double _timeYMinManual;
@@ -3481,6 +3546,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _bandpassFilterEnabled = NO;
     _heatmapXManual = NO;
     _heatmapYManual = NO;
+    _heatmapColorManual = NO;
     _timeXManual = NO;
     _timeYManual = NO;
     _cvXManual = NO;
@@ -3887,7 +3953,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     float *displayValues = displayData.mutableBytes;
     NSMutableData *pixelData = [NSMutableData dataWithLength:width * height * 4U];
     unsigned char *pixels = pixelData.mutableBytes;
-    float scale;
+    float dataMin = 0.0f;
+    float dataMax = 0.0f;
+    double colorMin;
+    double colorMax;
 
     if (_backgroundSubtractEnabled || [self activePhasePeriod] > 1U) {
         NSMutableData *scanData = [NSMutableData dataWithLength:height * sizeof(float)];
@@ -3965,16 +4034,19 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         }
     }
 
-    scale = HDCVRobustAbsScale(displayValues, width * height);
+    if (!HDCVFiniteRange(displayValues, width * height, &dataMin, &dataMax)) {
+        dataMin = -1.0f;
+        dataMax = 1.0f;
+    }
+    colorMin = _heatmapColorManual ? _heatmapColorMinManual : (double)dataMin;
+    colorMax = _heatmapColorManual ? _heatmapColorMaxManual : (double)dataMax;
+    HDCVNormalizeDivergingColorLimits(&colorMin, &colorMax);
 
     for (NSUInteger pointIndex = 0U; pointIndex < height; ++pointIndex) {
         NSUInteger y = height - 1U - pointIndex;
         for (NSUInteger x = 0U; x < width; ++x) {
             float value = displayValues[pointIndex * width + x];
-            if (!isfinite(value)) {
-                value = 0.0f;
-            }
-            float normalized = MAX(-1.0f, MIN(1.0f, value / scale));
+            float normalized = HDCVNormalizeCurrentForColor(value, colorMin, colorMax);
             NSUInteger offset = (y * width + x) * 4U;
             float r;
             float g;
@@ -4004,7 +4076,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     CGImageRelease(imageRef);
     CGContextRelease(context);
     CGColorSpaceRelease(colorSpace);
-    _heatmapView.colorScaleMaxNA = (double)scale;
+    _heatmapView.colorScaleMinNA = colorMin;
+    _heatmapView.colorScaleMaxNA = colorMax;
     return image;
 }
 
@@ -4433,6 +4506,21 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         if (![self applyRangeEditTarget:target value:editedPoint minSlot:&_heatmapYMinManual maxSlot:&_heatmapYMaxManual manualFlag:&_heatmapYManual currentMin:minPoint currentMax:maxPoint]) {
             return;
         }
+    } else if (target == HDCVAxisEditTargetColorMin || target == HDCVAxisEditTargetColorMax) {
+        double colorMin = _heatmapColorManual ? _heatmapColorMinManual : _heatmapView.colorScaleMinNA;
+        double colorMax = _heatmapColorManual ? _heatmapColorMaxManual : _heatmapView.colorScaleMaxNA;
+        if (target == HDCVAxisEditTargetColorMin) {
+            colorMin = (value > 0.0) ? -value : value;
+        } else {
+            colorMax = fabs(value);
+        }
+        HDCVNormalizeDivergingColorLimits(&colorMin, &colorMax);
+        _heatmapColorMinManual = colorMin;
+        _heatmapColorMaxManual = colorMax;
+        _heatmapColorManual = YES;
+        [self rebuildHeatmapImage];
+        _heroStatusLabel.stringValue = @"Color scale updated from the legend.";
+        return;
     }
 
     [self refreshPlots];

@@ -80,6 +80,13 @@ A native macOS AppKit viewer is now built with the same verified C parser:
 ./build/hdcv_viewer DA_5uM_1.hdcv
 ```
 
+Release builds also produce a compact macOS app bundle:
+
+```bash
+open -n "build/HDCV Viewer.app"
+open -n "build/HDCV Viewer.app" --args DA_5uM_1.hdcv
+```
+
 The viewer is optimized for the current system and uses the C reader directly rather than the old Python GUI path.
 
 Current GUI features:
@@ -98,7 +105,7 @@ Current GUI features:
 - synchronized vertical and horizontal crosshair lines across the plots
 - drag-to-move crosshair lines on the color plot, `I-t`, and `CV` plots
 - sequence-time plotting
-- color legend in nA for the overview color plot
+- editable color legend in nA for the overview color plot
 
 Performance notes:
 
@@ -118,7 +125,8 @@ FSCV-specific interaction model:
 - the background scan can be chosen explicitly, dragged in the color plot and `I-t` plot, or set from the current selected scan
 - sequence time remains contiguous by scan index
 - plot subtitles use compact coordinates: color plot `[time ; voltage ; current]`, `I-t` `[time ; current]`, and `CV` `[voltage ; current]`
-- display ranges use robust percentile scaling so occasional phase/outlier points do not flatten the plots
+- plot axis ranges are edited by double-clicking visible min/max tick labels; the color plot's current scale is edited the same way from the color legend labels
+- the color plot uses independent positive and negative current limits so asymmetric data ranges such as `+20 nA / -10 nA` are represented honestly instead of being forced into a symmetric legend
 - the viewer preserves the full active voltage waveform reported by the parser, including custom repeated triangle cycles, and plots a single scan phase by default so `I-t` traces do not interleave multiple baseline families
 - when background subtraction is enabled, the visible background marker remains user-selected inside the active phase, and subtraction uses the nearest background scan with the same scan modulo waveform-count phase as the displayed scan; color plot overview columns average per-scan, phase-aligned subtraction rather than subtracting from a pre-averaged column
 - the `CV` plot keeps the full active waveform intact, including custom repeated triangle cycles; to reduce point jitter without cropping, it averages 3 same-phase scans around the selected time and, when background subtraction is on, 11 same-phase scans around the background time, then applies a narrow branch-preserving denoise along each waveform ramp
