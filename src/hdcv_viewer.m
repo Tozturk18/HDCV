@@ -43,11 +43,13 @@ typedef NS_OPTIONS(NSUInteger, HDCVExportOptions) {
     HDCVExportOptionColorPlot = 1U << 0U,
     HDCVExportOptionTimePlot = 1U << 1U,
     HDCVExportOptionCVPlot = 1U << 2U,
+    HDCVExportOptionBackgroundCVPlot = 1U << 3U,
 };
 
 static const NSUInteger HDCVCVSelectedHalfWindow = 1U;
 static const NSUInteger HDCVWaveformProgramVoltageRows = 10U;
 static const NSUInteger HDCVWaveformProgramIntervalRows = 9U;
+static NSString *const HDCVExportOptionsDefaultsKey = @"HDCVExportOptions";
 
 @class HDCVDropHostView;
 @class HDCVHeatmapView;
@@ -74,6 +76,8 @@ static const NSUInteger HDCVWaveformProgramIntervalRows = 9U;
 @protocol HDCVLinePlotViewDelegate <NSObject>
 - (void)linePlotView:(HDCVLinePlotView *)view didDragXValue:(double)xValue yValue:(double)yValue target:(HDCVLinePlotDragTarget)target;
 - (void)linePlotView:(HDCVLinePlotView *)view didEditAxisTarget:(HDCVAxisEditTarget)target value:(double)value;
+- (void)linePlotView:(HDCVLinePlotView *)view didNavigateToXMin:(double)xMin xMax:(double)xMax yMin:(double)yMin yMax:(double)yMax;
+- (void)linePlotViewDidRequestResetView:(HDCVLinePlotView *)view;
 @end
 
 @interface HDCVDropHostView : NSView <NSDraggingDestination>
@@ -110,6 +114,7 @@ static const NSUInteger HDCVWaveformProgramIntervalRows = 9U;
 @property(nonatomic, weak) id<HDCVLinePlotDataSource> dataSource;
 @property(nonatomic, weak) id<HDCVLinePlotViewDelegate> delegate;
 @property(nonatomic) HDCVLinePlotInteractionMode interactionMode;
+@property(nonatomic) BOOL viewNavigationEnabled;
 @property(nonatomic, copy) NSString *titleText;
 @property(nonatomic, copy) NSString *subtitleText;
 @property(nonatomic, copy) NSString *xLabelText;
@@ -1760,7 +1765,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         }
     }
 
-    if (indexes.count < 6U) {
+    {
         NSUInteger tickCount = MIN((NSUInteger)6U, maxPoint - minPoint + 1U);
         for (NSUInteger tick = 0U; tick < tickCount; ++tick) {
             NSUInteger pointIndex = (tickCount == 1U)
@@ -2233,6 +2238,12 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     HDCVAxisEditTarget _activeAxisEditTarget;
     NSTextField *_axisEditor;
     NSTrackingArea *_trackingArea;
+    BOOL _activePanDrag;
+    NSPoint _panStartPoint;
+    double _panStartXMin;
+    double _panStartXMax;
+    double _panStartYMin;
+    double _panStartYMax;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect
@@ -2247,6 +2258,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _xTickFormat = @"%.2f";
         _yTickFormat = @"%.2f";
         _activeDragTarget = HDCVLinePlotDragTargetNone;
+        _activePanDrag = NO;
         self.wantsLayer = YES;
         self.layer.backgroundColor = NSColor.whiteColor.CGColor;
     }
@@ -2308,6 +2320,61 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (CGFloat)xPositionForValue:(double)xValue inPlotRect:(NSRect)plotRect xMin:(double)xMin xRange:(double)xRange
 {
     return plotRect.origin.x + (CGFloat)((xValue - xMin) / xRange) * plotRect.size.width;
+}
+
+- (BOOL)pointIsInPlotRect:(NSPoint)point
+{
+    return NSPointInRect(point, [self plotRect]);
+}
+
+- (void)dispatchNavigationXMin:(double)xMin xMax:(double)xMax yMin:(double)yMin yMax:(double)yMax
+{
+    double minRange = 1.0e-12;
+    if (!self.viewNavigationEnabled ||
+        !isfinite(xMin) || !isfinite(xMax) || !isfinite(yMin) || !isfinite(yMax) ||
+        xMax - xMin <= minRange || yMax - yMin <= minRange) {
+        return;
+    }
+    [self.delegate linePlotView:self didNavigateToXMin:xMin xMax:xMax yMin:yMin yMax:yMax];
+}
+
+- (void)dispatchPanFromPoint:(NSPoint)point
+{
+    NSRect plotRect = [self plotRect];
+    double xRange = _panStartXMax - _panStartXMin;
+    double yRange = _panStartYMax - _panStartYMin;
+    double dx = ((double)(point.x - _panStartPoint.x) / MAX((double)plotRect.size.width, 1.0)) * xRange;
+    double dy = ((double)(point.y - _panStartPoint.y) / MAX((double)plotRect.size.height, 1.0)) * yRange;
+    [self dispatchNavigationXMin:_panStartXMin - dx
+                            xMax:_panStartXMax - dx
+                            yMin:_panStartYMin + dy
+                            yMax:_panStartYMax + dy];
+}
+
+- (void)dispatchZoomWithFactor:(double)factor aroundPoint:(NSPoint)point
+{
+    NSRect plotRect = [self plotRect];
+    double xRange = self.xMax - self.xMin;
+    double yRange = self.yMax - self.yMin;
+    double xFraction = ((double)(point.x - plotRect.origin.x) / MAX((double)plotRect.size.width, 1.0));
+    double yFraction = 1.0 - ((double)(point.y - plotRect.origin.y) / MAX((double)plotRect.size.height, 1.0));
+    double anchorX;
+    double anchorY;
+
+    if (!NSPointInRect(point, plotRect)) {
+        xFraction = 0.5;
+        yFraction = 0.5;
+    }
+    xFraction = MAX(0.0, MIN(1.0, xFraction));
+    yFraction = MAX(0.0, MIN(1.0, yFraction));
+    factor = MAX(0.05, MIN(20.0, factor));
+
+    anchorX = self.xMin + (xRange * xFraction);
+    anchorY = self.yMin + (yRange * yFraction);
+    [self dispatchNavigationXMin:anchorX - ((anchorX - self.xMin) * factor)
+                            xMax:anchorX + ((self.xMax - anchorX) * factor)
+                            yMin:anchorY - ((anchorY - self.yMin) * factor)
+                            yMax:anchorY + ((self.yMax - anchorY) * factor)];
 }
 
 - (NSString *)axisEditStringForTarget:(HDCVAxisEditTarget)target
@@ -2471,10 +2538,11 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (void)updateCursorForEvent:(NSEvent *)event
 {
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
-    if ([self dragTargetForPoint:point] == HDCVLinePlotDragTargetNone) {
-        [NSCursor.arrowCursor set];
-    } else {
+    if ([self dragTargetForPoint:point] != HDCVLinePlotDragTargetNone ||
+        (self.viewNavigationEnabled && [self pointIsInPlotRect:point])) {
         [NSCursor.openHandCursor set];
+    } else {
+        [NSCursor.arrowCursor set];
     }
 }
 
@@ -2780,6 +2848,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (void)mouseDown:(NSEvent *)event
 {
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    [self.window makeFirstResponder:self];
     if (event.clickCount >= 2) {
         NSRect editorRect = NSZeroRect;
         HDCVAxisEditTarget target = [self axisEditTargetForPoint:point editorRect:&editorRect];
@@ -2791,6 +2860,16 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _activeDragTarget = [self dragTargetForPoint:point];
     if (_activeDragTarget != HDCVLinePlotDragTargetNone) {
         [NSCursor.closedHandCursor set];
+        return;
+    }
+    if (self.viewNavigationEnabled && [self pointIsInPlotRect:point]) {
+        _activePanDrag = YES;
+        _panStartPoint = point;
+        _panStartXMin = self.xMin;
+        _panStartXMax = self.xMax;
+        _panStartYMin = self.yMin;
+        _panStartYMax = self.yMax;
+        [NSCursor.closedHandCursor set];
     }
 }
 
@@ -2798,14 +2877,66 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 {
     if (_activeDragTarget != HDCVLinePlotDragTargetNone) {
         [NSCursor.closedHandCursor set];
+        [self dispatchSelectionForEvent:event];
+        return;
     }
-    [self dispatchSelectionForEvent:event];
+    if (_activePanDrag) {
+        NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+        [NSCursor.closedHandCursor set];
+        [self dispatchPanFromPoint:point];
+        return;
+    }
 }
 
 - (void)mouseUp:(NSEvent *)event
 {
     (void)event;
     _activeDragTarget = HDCVLinePlotDragTargetNone;
+    _activePanDrag = NO;
+}
+
+- (void)scrollWheel:(NSEvent *)event
+{
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    double deltaY = event.scrollingDeltaY;
+    NSEventModifierFlags modifiers = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+
+    if (!self.viewNavigationEnabled || ![self pointIsInPlotRect:point]) {
+        [super scrollWheel:event];
+        return;
+    }
+
+    if ((modifiers & (NSEventModifierFlagOption | NSEventModifierFlagCommand)) != 0U) {
+        [self finishAxisEditing];
+        if (!event.hasPreciseScrollingDeltas) {
+            deltaY *= 8.0;
+        }
+        double zoomFactor = exp(-deltaY * 0.018);
+        [self dispatchZoomWithFactor:zoomFactor aroundPoint:point];
+    } else {
+        [super scrollWheel:event];
+    }
+}
+
+- (void)magnifyWithEvent:(NSEvent *)event
+{
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    if (!self.viewNavigationEnabled) {
+        [super magnifyWithEvent:event];
+        return;
+    }
+    [self finishAxisEditing];
+    [self dispatchZoomWithFactor:exp(-event.magnification) aroundPoint:point];
+}
+
+- (void)smartMagnifyWithEvent:(NSEvent *)event
+{
+    (void)event;
+    if (!self.viewNavigationEnabled) {
+        [super smartMagnifyWithEvent:event];
+        return;
+    }
+    [self.delegate linePlotViewDidRequestResetView:self];
 }
 
 @end
@@ -3115,6 +3246,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 	    HDCVSwitchControl *_backgroundSubtractSwitch;
 	    HDCVSwitchControl *_bandpassFilterSwitch;
 	    NSButton *_useSelectedAsBackgroundButton;
+	    NSButton *_timeResetViewButton;
+	    NSButton *_cvResetViewButton;
 	    NSButton *_exportButton;
 	    NSProgressIndicator *_progressIndicator;
 	    HDCVLoadedFile *_loadedFile;
@@ -3138,6 +3271,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 	    BOOL _backgroundSubtractEnabled;
 	    BOOL _bandpassFilterEnabled;
 	    BOOL _exportInProgress;
+	    HDCVExportOptions _lastExportOptions;
 	    BOOL _heatmapXManual;
 	    BOOL _heatmapYManual;
 	    BOOL _heatmapColorManual;
@@ -3181,6 +3315,18 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _activePhaseIndex = 0U;
         _backgroundSubtractEnabled = NO;
         _bandpassFilterEnabled = NO;
+        _lastExportOptions = HDCVExportOptionColorPlot | HDCVExportOptionTimePlot | HDCVExportOptionCVPlot;
+        id storedExportOptions = [NSUserDefaults.standardUserDefaults objectForKey:HDCVExportOptionsDefaultsKey];
+        if ([storedExportOptions isKindOfClass:NSNumber.class]) {
+            HDCVExportOptions storedOptions = (HDCVExportOptions)[storedExportOptions unsignedIntegerValue];
+            HDCVExportOptions supportedOptions = HDCVExportOptionColorPlot |
+                HDCVExportOptionTimePlot |
+                HDCVExportOptionCVPlot |
+                HDCVExportOptionBackgroundCVPlot;
+            if ((storedOptions & supportedOptions) != 0U) {
+                _lastExportOptions = storedOptions & supportedOptions;
+            }
+        }
     }
     return self;
 }
@@ -3190,6 +3336,18 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (arguments.count > 1U) {
         _pendingOpenPath = arguments[1];
     }
+}
+
+- (void)openFilePathFromSystem:(NSString *)path
+{
+    if (path.length == 0U) {
+        return;
+    }
+    if (_window == nil) {
+        _pendingOpenPath = path;
+        return;
+    }
+    [self loadFileAtPath:path];
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
@@ -3203,6 +3361,35 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         [self loadFileAtPath:_pendingOpenPath];
     } else {
         _heroStatusLabel.stringValue = @"Open or drag an HDCV FSCV file into the window to begin.";
+    }
+}
+
+- (BOOL)application:(NSApplication *)sender openFile:(NSString *)filename
+{
+    (void)sender;
+    [self openFilePathFromSystem:filename];
+    return YES;
+}
+
+- (void)application:(NSApplication *)sender openFiles:(NSArray<NSString *> *)filenames
+{
+    (void)sender;
+    if (filenames.count == 0U) {
+        [NSApp replyToOpenOrPrint:NSApplicationDelegateReplyFailure];
+        return;
+    }
+    [self openFilePathFromSystem:filenames.firstObject];
+    [NSApp replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
+}
+
+- (void)application:(NSApplication *)sender openURLs:(NSArray<NSURL *> *)urls
+{
+    (void)sender;
+    for (NSURL *url in urls) {
+        if (url.isFileURL) {
+            [self openFilePathFromSystem:url.path];
+            return;
+        }
     }
 }
 
@@ -3263,6 +3450,37 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     return button;
 }
 
+- (void)styleButton:(NSButton *)button
+              title:(NSString *)title
+          fillColor:(NSColor *)fillColor
+          textColor:(NSColor *)textColor
+               size:(CGFloat)fontSize
+{
+    NSDictionary<NSAttributedStringKey, id> *attributes = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:fontSize weight:NSFontWeightSemibold],
+        NSForegroundColorAttributeName: textColor
+    };
+    NSAttributedString *attributedTitle = [[NSAttributedString alloc] initWithString:title attributes:attributes];
+    button.title = title;
+    button.font = attributes[NSFontAttributeName];
+    button.attributedTitle = attributedTitle;
+    button.attributedAlternateTitle = attributedTitle;
+    if (@available(macOS 11.0, *)) {
+        button.bezelColor = fillColor;
+        button.contentTintColor = textColor;
+    }
+}
+
+- (void)styleResetButton:(NSButton *)button
+{
+    [self styleButton:button
+                title:@"Reset"
+            fillColor:[NSColor colorWithRed:0.86 green:0.93 blue:1.0 alpha:1.0]
+            textColor:HDCVAccentBlue()
+                 size:10.5];
+    [button.widthAnchor constraintGreaterThanOrEqualToConstant:58.0].active = YES;
+}
+
 - (void)setInputControlsEnabled:(BOOL)enabled
 {
     for (NSTextField *field in @[
@@ -3274,6 +3492,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _backgroundSubtractSwitch.enabled = enabled;
     _bandpassFilterSwitch.enabled = enabled;
     _useSelectedAsBackgroundButton.enabled = enabled;
+    _timeResetViewButton.enabled = enabled;
+    _cvResetViewButton.enabled = enabled;
     _exportButton.enabled = enabled && !_exportInProgress && _loadedFile != nil;
 }
 
@@ -3316,21 +3536,21 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSButton *openButton = [NSButton buttonWithTitle:@"Import FSCV File" target:self action:@selector(openDocument:)];
     openButton.translatesAutoresizingMaskIntoConstraints = NO;
     openButton.bezelStyle = NSBezelStyleRounded;
-    openButton.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightSemibold];
-    if (@available(macOS 11.0, *)) {
-        openButton.bezelColor = [NSColor colorWithRed:0.96 green:0.98 blue:1.0 alpha:1.0];
-        openButton.contentTintColor = HDCVHeroColor();
-    }
+    [self styleButton:openButton
+                title:@"Import FSCV File"
+            fillColor:NSColor.whiteColor
+            textColor:HDCVHeroColor()
+                 size:13.0];
 
     _exportButton = [NSButton buttonWithTitle:@"Export Data" target:self action:@selector(exportData:)];
     _exportButton.translatesAutoresizingMaskIntoConstraints = NO;
     _exportButton.bezelStyle = NSBezelStyleRounded;
-    _exportButton.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightSemibold];
     _exportButton.enabled = NO;
-    if (@available(macOS 11.0, *)) {
-        _exportButton.bezelColor = [NSColor colorWithRed:0.96 green:0.98 blue:1.0 alpha:1.0];
-        _exportButton.contentTintColor = HDCVHeroColor();
-    }
+    [self styleButton:_exportButton
+                title:@"Export Data"
+            fillColor:[NSColor colorWithRed:0.68 green:0.93 blue:0.88 alpha:1.0]
+            textColor:HDCVHeroColor()
+                 size:13.0];
 
     NSStackView *heroActions = [[NSStackView alloc] init];
     heroActions.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3452,6 +3672,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _timePlotView.dataSource = self;
     _timePlotView.delegate = self;
     _timePlotView.interactionMode = HDCVLinePlotInteractionModeSelectX;
+    _timePlotView.viewNavigationEnabled = YES;
     _timePlotView.titleText = @"I-t Plot";
     _timePlotView.xLabelText = @"Sequence Time (s)";
     _timePlotView.yLabelText = @"Current (nA)";
@@ -3465,6 +3686,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _cvPlotView.dataSource = self;
     _cvPlotView.delegate = self;
     _cvPlotView.interactionMode = HDCVLinePlotInteractionModeSelectX;
+    _cvPlotView.viewNavigationEnabled = YES;
     _cvPlotView.titleText = @"CV Plot";
     _cvPlotView.xLabelText = @"Voltage (V)";
     _cvPlotView.yLabelText = @"Current (nA)";
@@ -3484,37 +3706,48 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         [_cvPlotView.bottomAnchor constraintEqualToAnchor:cvPanel.bottomAnchor constant:-8.0],
     ]];
 
-    _timeBackgroundField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:68.0];
-    _timeScanField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:68.0];
+    _timeBackgroundField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:58.0];
+    _timeScanField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:58.0];
     _bandpassFilterSwitch = [[HDCVSwitchControl alloc] initWithFrame:NSZeroRect];
     _bandpassFilterSwitch.translatesAutoresizingMaskIntoConstraints = NO;
     _bandpassFilterSwitch.target = self;
     _bandpassFilterSwitch.action = @selector(bandpassFilterToggled:);
     [_bandpassFilterSwitch.widthAnchor constraintEqualToConstant:48.0].active = YES;
     [_bandpassFilterSwitch.heightAnchor constraintEqualToConstant:28.0].active = YES;
-    _bandpassFilterLabel = HDCVLabel(@"Bandpass", [NSFont systemFontOfSize:10.0 weight:NSFontWeightSemibold], HDCVMutedText());
+    _bandpassFilterLabel = HDCVLabel(@"BP", [NSFont systemFontOfSize:10.0 weight:NSFontWeightSemibold], HDCVMutedText());
+    _timeResetViewButton = [self smallActionButtonWithTitle:@"Reset" action:@selector(resetTimePlotView:)];
+    [self styleResetButton:_timeResetViewButton];
 
     NSStackView *timePrimaryControls = [self compactControlsStack];
     [timePrimaryControls addArrangedSubview:[self controlPairWithLabel:@"BG s" field:_timeBackgroundField]];
     [timePrimaryControls addArrangedSubview:[self controlPairWithLabel:@"Time s" field:_timeScanField]];
     [timePrimaryControls addArrangedSubview:_bandpassFilterLabel];
     [timePrimaryControls addArrangedSubview:_bandpassFilterSwitch];
+    [timePrimaryControls addArrangedSubview:_timeResetViewButton];
     [timePanel addSubview:timePrimaryControls];
 
-    _cvPointField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:68.0];
+    _cvPointField = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:58.0];
+    _cvResetViewButton = [self smallActionButtonWithTitle:@"Reset" action:@selector(resetCVPlotView:)];
+    [self styleResetButton:_cvResetViewButton];
 
     NSStackView *cvPrimaryControls = [self compactControlsStack];
     [cvPrimaryControls addArrangedSubview:[self controlPairWithLabel:@"Volt V" field:_cvPointField]];
+    [cvPrimaryControls addArrangedSubview:_cvResetViewButton];
     [cvPanel addSubview:cvPrimaryControls];
+
+    NSLayoutConstraint *timeControlsLeading = [timePrimaryControls.leadingAnchor constraintGreaterThanOrEqualToAnchor:timePanel.leadingAnchor constant:112.0];
+    NSLayoutConstraint *cvControlsLeading = [cvPrimaryControls.leadingAnchor constraintGreaterThanOrEqualToAnchor:cvPanel.leadingAnchor constant:112.0];
+    timeControlsLeading.priority = NSLayoutPriorityDefaultLow;
+    cvControlsLeading.priority = NSLayoutPriorityDefaultLow;
 
     [NSLayoutConstraint activateConstraints:@[
         [timePrimaryControls.trailingAnchor constraintEqualToAnchor:timePanel.trailingAnchor constant:-32.0],
         [timePrimaryControls.topAnchor constraintEqualToAnchor:timePanel.topAnchor constant:13.0],
-        [timePrimaryControls.leadingAnchor constraintGreaterThanOrEqualToAnchor:timePanel.leadingAnchor constant:132.0],
+        timeControlsLeading,
 
         [cvPrimaryControls.trailingAnchor constraintEqualToAnchor:cvPanel.trailingAnchor constant:-32.0],
         [cvPrimaryControls.topAnchor constraintEqualToAnchor:cvPanel.topAnchor constant:13.0],
-        [cvPrimaryControls.leadingAnchor constraintGreaterThanOrEqualToAnchor:cvPanel.leadingAnchor constant:132.0],
+        cvControlsLeading,
     ]];
 
     NSView *waveformPanel = HDCVPanelContainer();
@@ -3598,24 +3831,27 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSAlert *alert = [[NSAlert alloc] init];
     alert.alertStyle = NSAlertStyleInformational;
     alert.messageText = @"Export FSCV plot data";
-    alert.informativeText = @"Exports use the current background subtraction and bandpass settings. I-t uses the selected voltage; CV uses the selected time.";
+    alert.informativeText = @"Exports use the current plot state and active phase. I-t uses the selected voltage; CV uses the selected time; background CV uses the background line.";
     [alert addButtonWithTitle:@"Export"];
     [alert addButtonWithTitle:@"Cancel"];
 
     NSButton *colorCheck = [NSButton checkboxWithTitle:@"Color plot data (t, I, V)" target:nil action:nil];
     NSButton *timeCheck = [NSButton checkboxWithTitle:@"I-t plot (t, I)" target:nil action:nil];
     NSButton *cvCheck = [NSButton checkboxWithTitle:@"CV plot (V, I)" target:nil action:nil];
-    colorCheck.state = NSControlStateValueOn;
-    timeCheck.state = NSControlStateValueOn;
-    cvCheck.state = NSControlStateValueOn;
+    NSButton *backgroundCVCheck = [NSButton checkboxWithTitle:@"Background CV plot (V, I)" target:nil action:nil];
+    colorCheck.state = ((_lastExportOptions & HDCVExportOptionColorPlot) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
+    timeCheck.state = ((_lastExportOptions & HDCVExportOptionTimePlot) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
+    cvCheck.state = ((_lastExportOptions & HDCVExportOptionCVPlot) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
+    backgroundCVCheck.state = ((_lastExportOptions & HDCVExportOptionBackgroundCVPlot) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
 
-    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 330.0, 82.0)];
+    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 330.0, 112.0)];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
     stack.spacing = 8.0;
     [stack addArrangedSubview:colorCheck];
     [stack addArrangedSubview:timeCheck];
     [stack addArrangedSubview:cvCheck];
+    [stack addArrangedSubview:backgroundCVCheck];
     alert.accessoryView = stack;
 
     [alert beginSheetModalForWindow:_window completionHandler:^(NSModalResponse response) {
@@ -3637,6 +3873,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             options |= HDCVExportOptionCVPlot;
             selectedCount += 1U;
         }
+        if (backgroundCVCheck.state == NSControlStateValueOn) {
+            options |= HDCVExportOptionBackgroundCVPlot;
+            selectedCount += 1U;
+        }
 
         if (selectedCount == 0U) {
             NSAlert *emptyAlert = [[NSAlert alloc] init];
@@ -3645,6 +3885,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             [emptyAlert beginSheetModalForWindow:self->_window completionHandler:nil];
             return;
         }
+        self->_lastExportOptions = options;
+        [NSUserDefaults.standardUserDefaults setInteger:(NSInteger)options forKey:HDCVExportOptionsDefaultsKey];
 
         NSSavePanel *savePanel = [NSSavePanel savePanel];
         NSString *baseName = self->_pendingOpenPath.lastPathComponent.stringByDeletingPathExtension;
@@ -4071,6 +4313,25 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
                                  scanIndex:selectedScanIndex
                        backgroundScanIndex:backgroundScanIndex
                 backgroundSubtractEnabled:backgroundSubtractEnabled
+                     bandpassFilterEnabled:bandpassFilterEnabled
+                          activePhaseIndex:activePhaseIndex
+                               phasePeriod:phasePeriod
+                                     error:&error]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self finishExportWithError:error writtenURLs:writtenURLs];
+                });
+                return;
+            }
+            [writtenURLs addObject:url];
+        }
+
+        if ((options & HDCVExportOptionBackgroundCVPlot) != 0U) {
+            NSURL *url = HDCVExportURLForSuffix(baseURL, @"cv_bg", singleFile);
+            if (![self writeCVPlotCSVToURL:url
+                                loadedFile:loadedFile
+                                 scanIndex:backgroundScanIndex
+                       backgroundScanIndex:backgroundScanIndex
+                backgroundSubtractEnabled:NO
                      bandpassFilterEnabled:bandpassFilterEnabled
                           activePhaseIndex:activePhaseIndex
                                phasePeriod:phasePeriod
@@ -4519,9 +4780,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         const float *displayTrace = _displayPointTraceData.bytes;
         selectedTimeCurrent = displayTrace[_selectedScanIndex];
     }
-    NSString *colorSummary = [NSString stringWithFormat:@"[%.3f s ; %.3f V ; %.0f nA]", selectedTime, selectedVoltage, selectedCurrent];
-    NSString *timeSummary = [NSString stringWithFormat:@"[%.3f s ; %.0f nA]", selectedTime, selectedTimeCurrent];
-    NSString *cvSummary = [NSString stringWithFormat:@"[%.3f V ; %.0f nA]", selectedVoltage, selectedCVCurrent];
+    NSString *colorSummary = [NSString stringWithFormat:@"[%.3f s ; %.3f V ; %.3f nA]", selectedTime, selectedVoltage, selectedCurrent];
+    NSString *timeSummary = [NSString stringWithFormat:@"[%.3f s ; %.3f nA]", selectedTime, selectedTimeCurrent];
+    NSString *cvSummary = [NSString stringWithFormat:@"[%.3f V ; %.3f nA]", selectedVoltage, selectedCVCurrent];
     NSString *waveformSummary = [NSString stringWithFormat:@"[%.3f ms ; %.3f V]", selectedWaveformTimeMs, selectedVoltage];
     _heatmapView.titleText = @"Color Plot";
     _heatmapView.subtitleText = colorSummary;
@@ -4858,7 +5119,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         double traceXMax = [self timeValueForScanIndex:lastPhaseScan];
         HDCVExpandRange(&traceMin, &traceMax);
         HDCVExpandRangeToIncludeZero(&traceXMin, &traceXMax);
-        HDCVExpandRangeToIncludeZero(&traceMin, &traceMax);
+        if (_backgroundSubtractEnabled) {
+            HDCVExpandRangeToIncludeZero(&traceMin, &traceMax);
+        }
         _timePlotView.xMin = _timeXManual ? _timeXMinManual : traceXMin;
         _timePlotView.xMax = _timeXManual ? _timeXMaxManual : traceXMax;
         _timePlotView.yMin = _timeYManual ? _timeYMinManual : traceMin;
@@ -5231,6 +5494,70 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     [self refreshPlots];
     _heroStatusLabel.stringValue = @"Axis range updated from the plot.";
+}
+
+- (void)linePlotView:(HDCVLinePlotView *)view didNavigateToXMin:(double)xMin xMax:(double)xMax yMin:(double)yMin yMax:(double)yMax
+{
+    if (_loadedFile == nil) {
+        return;
+    }
+
+    if (view == _timePlotView) {
+        _timeXManual = YES;
+        _timeYManual = YES;
+        _timeXMinManual = xMin;
+        _timeXMaxManual = xMax;
+        _timeYMinManual = yMin;
+        _timeYMaxManual = yMax;
+        [self syncTimeRangeToHeatmap];
+        _heroStatusLabel.stringValue = @"I-t view adjusted. Use Reset View to return to automatic scaling.";
+    } else if (view == _cvPlotView) {
+        _cvXManual = YES;
+        _cvYManual = YES;
+        _cvXMinManual = xMin;
+        _cvXMaxManual = xMax;
+        _cvYMinManual = yMin;
+        _cvYMaxManual = yMax;
+        _heroStatusLabel.stringValue = @"CV view adjusted. Use Reset View to return to automatic scaling.";
+    } else {
+        return;
+    }
+
+    [self refreshPlots];
+}
+
+- (void)linePlotViewDidRequestResetView:(HDCVLinePlotView *)view
+{
+    if (view == _timePlotView) {
+        [self resetTimePlotView:nil];
+    } else if (view == _cvPlotView) {
+        [self resetCVPlotView:nil];
+    }
+}
+
+- (void)resetTimePlotView:(id)sender
+{
+    (void)sender;
+    if (_loadedFile == nil) {
+        return;
+    }
+    _timeXManual = NO;
+    _timeYManual = NO;
+    _heatmapXManual = NO;
+    [self refreshPlots];
+    _heroStatusLabel.stringValue = @"I-t view reset to automatic scaling.";
+}
+
+- (void)resetCVPlotView:(id)sender
+{
+    (void)sender;
+    if (_loadedFile == nil) {
+        return;
+    }
+    _cvXManual = NO;
+    _cvYManual = NO;
+    [self refreshPlots];
+    _heroStatusLabel.stringValue = @"CV view reset to automatic scaling.";
 }
 
 - (void)backgroundSubtractToggled:(id)sender

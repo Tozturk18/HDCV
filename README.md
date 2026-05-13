@@ -50,6 +50,7 @@ Inspect a file:
 ```bash
 ./build/hdcv_reader info DA_5uM_1.hdcv
 ./build/hdcv_reader info DA_5uM_1.hdcv --json
+./build/hdcv DA_5uM_1.hdcv --info
 ```
 
 Export a single scan:
@@ -71,6 +72,22 @@ Benchmark the scan-matrix stream:
 ./build/hdcv_reader benchmark DA_5uM_1.hdcv
 ```
 
+Launch the native viewer or export MATLAB-ready CV files through the higher-level `hdcv` command:
+
+```bash
+./build/hdcv DA_5uM_1.hdcv
+./build/hdcv DA_5uM_1.hdcv --cv 100,200,300 --out exports
+./build/hdcv DA_5uM_1.hdcv -cv "[100, 200, 300]" --bg-cv 50 --out exports
+```
+
+`hdcv --cv` exports one `voltage_V,current_nA` CSV per requested sequence-time value, using the nearest scan in the selected phase family. The default phase is `0`, matching the viewer's single-phase default for interleaved WaveNeuro files; use `--phase <index>` when a different phase family is scientifically intended.
+
+To make the command available as `hdcv` from Terminal, symlink the built binary into a directory on your `PATH`; because the symlink resolves back into `build/`, the command can still find the adjacent app bundle for GUI launches:
+
+```bash
+ln -sf "$(pwd)/build/hdcv" /usr/local/bin/hdcv
+```
+
 ## Native GUI
 
 A native macOS AppKit viewer is now built with the same verified C parser:
@@ -85,7 +102,10 @@ Release builds also produce a compact macOS app bundle:
 ```bash
 open -n "build/HDCV Viewer.app"
 open -n "build/HDCV Viewer.app" --args DA_5uM_1.hdcv
+open -n -a "build/HDCV Viewer.app" DA_5uM_1.hdcv
 ```
+
+The app bundle registers `.hdcv` files, so Finder double-click and Open With launch paths load the selected file directly.
 
 The viewer is optimized for the current system and uses the C reader directly rather than the old Python GUI path.
 
@@ -101,7 +121,7 @@ Current GUI features:
 - direct axis editing by double-clicking visible plot min/max tick labels, typing a value, and pressing Return
 - phase-aligned background subtraction applied coherently to color plot, `I-t`, and `CV`
 - optional zero-phase Butterworth-style bandpass filter for the color plot, `I-t`, and `CV`
-- MATLAB-friendly CSV export for the color plot, selected-voltage `I-t`, and selected-time `CV`
+- MATLAB-friendly CSV export for the color plot, selected-voltage `I-t`, selected-time `CV`, and raw background `CV`
 - single-phase plotting for files that contain repeated interleaved WaveNeuro waveform phases
 - synchronized vertical and horizontal crosshair lines across the plots
 - drag-to-move crosshair lines on the color plot, `I-t`, and `CV` plots
@@ -122,12 +142,14 @@ FSCV-specific interaction model:
 - dragging color-plot crosshair lines updates both the `I-t` and `CV` plots
 - dragging the `I-t` vertical crosshair moves the selected scan
 - dragging the `CV` vertical crosshair moves the waveform point
+- dragging inside the `I-t` or `CV` plot pans the visible axis range; MacBook trackpad pinch zooms around the pointer, and Option-scroll/Command-scroll zooms as a fallback
+- each `I-t` and `CV` plot header includes a `Reset` button to return quickly to automatic scaling; trackpad smart zoom also resets the active line plot
 - the waveform plot crosshair follows the selected waveform point; dragging its vertical line also moves the selected waveform point
 - the background scan can be chosen explicitly, dragged in the color plot and `I-t` plot, or set from the current selected scan
 - sequence time remains contiguous by scan index
-- plot subtitles use compact coordinates: color plot `[time ; voltage ; current]`, `I-t` `[time ; current]`, and `CV` `[voltage ; current]`
+- plot subtitles use compact coordinates with three decimal places: color plot `[time ; voltage ; current]`, `I-t` `[time ; current]`, and `CV` `[voltage ; current]`
 - plot axis ranges are edited by double-clicking visible min/max tick labels; the color plot's current scale is edited the same way from the color legend labels
-- color-plot voltage ticks prioritize waveform extrema and breakpoint/hold voltages; `I-t`, `CV`, and waveform plot ticks include `0` on visible axes
+- color-plot voltage ticks prioritize waveform extrema and breakpoint/hold voltages while still adding proportional intermediate ticks; raw `I-t` current ranges are not forced to include zero, while background-subtracted `I-t` and the waveform plot keep zero visible when appropriate
 - the color plot uses independent positive and negative current limits so asymmetric data ranges such as `+20 nA / -10 nA` are represented honestly instead of being forced into a symmetric legend
 - the viewer preserves the full active voltage waveform reported by the parser, including custom repeated triangle cycles, and plots a single scan phase by default so `I-t` traces do not interleave multiple baseline families
 - when background subtraction is enabled, the visible background marker remains user-selected inside the active phase, and subtraction uses the nearest background scan with the same scan modulo waveform-count phase as the displayed scan; color plot overview columns average per-scan, phase-aligned subtraction rather than subtracting from a pre-averaged column
@@ -136,7 +158,7 @@ FSCV-specific interaction model:
 - the waveform-program table is read-only and inferred from voltage-axis intervals, matching WaveNeuro's 10-voltage/9-time custom-waveform convention without turning the viewer into waveform-authoring software; real holds become `0 V/s` rows, while tiny one-sample plateaus are suppressed
 - editing the color-plot time bounds also updates the linked `I-t` time range, and editing the `I-t` time range updates the color-plot scan crop
 - the bandpass filter uses a zero-phase two-pole high-pass and low-pass cascade; for interleaved phase files it filters each phase family independently at that phase family's effective sampling rate
-- `Export Data` writes simple CSV files using the current plot processing state and active phase: color plot rows are `time_s,current_nA,voltage_V`, `I-t` rows are `time_s,current_nA` at the selected voltage crosshair, and `CV` rows are `voltage_V,current_nA` at the selected time crosshair
+- `Export Data` remembers the last selected plot checkboxes across launches and writes simple CSV files using the current plot processing state and active phase: color plot rows are `time_s,current_nA,voltage_V`, `I-t` rows are `time_s,current_nA` at the selected voltage crosshair, selected `CV` rows are `voltage_V,current_nA` at the selected time crosshair, and background `CV` rows are raw `voltage_V,current_nA` at the background line
 
 ## Validation Workflow
 

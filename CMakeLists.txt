@@ -45,6 +45,13 @@ add_executable(hdcv_reader
 target_link_libraries(hdcv_reader PRIVATE hdcv_core)
 target_compile_options(hdcv_reader PRIVATE ${HDCV_COMMON_WARNINGS})
 
+add_executable(hdcv
+  src/hdcv_cli.c
+)
+
+target_link_libraries(hdcv PRIVATE hdcv_core)
+target_compile_options(hdcv PRIVATE ${HDCV_COMMON_WARNINGS})
+
 set(HDCV_VIEWER_FRAMEWORKS
   "-framework AppKit"
   "-framework CoreGraphics"
@@ -88,21 +95,25 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   target_compile_options(hdcv_core PRIVATE -O0 -g3 -fno-omit-frame-pointer)
   target_compile_options(hdcv_reader PRIVATE -O0 -g3 -fno-omit-frame-pointer)
+  target_compile_options(hdcv PRIVATE -O0 -g3 -fno-omit-frame-pointer)
   foreach(viewer_target IN LISTS HDCV_VIEWER_TARGETS)
     target_compile_options(${viewer_target} PRIVATE -O0 -g3 -fno-omit-frame-pointer)
   endforeach()
   if(CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
     target_compile_options(hdcv_core PRIVATE -fsanitize=address,undefined)
     target_compile_options(hdcv_reader PRIVATE -fsanitize=address,undefined)
+    target_compile_options(hdcv PRIVATE -fsanitize=address,undefined)
     foreach(viewer_target IN LISTS HDCV_VIEWER_TARGETS)
       target_compile_options(${viewer_target} PRIVATE -fsanitize=address,undefined)
       target_link_options(${viewer_target} PRIVATE -fsanitize=address,undefined)
     endforeach()
     target_link_options(hdcv_reader PRIVATE -fsanitize=address,undefined)
+    target_link_options(hdcv PRIVATE -fsanitize=address,undefined)
   endif()
 else()
   target_compile_options(hdcv_core PRIVATE -O3)
   target_compile_options(hdcv_reader PRIVATE -O3)
+  target_compile_options(hdcv PRIVATE -O3)
   foreach(viewer_target IN LISTS HDCV_VIEWER_TARGETS)
     target_compile_options(${viewer_target} PRIVATE -O3)
   endforeach()
