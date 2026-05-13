@@ -3353,6 +3353,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
 {
     (void)notification;
+    [self buildMainMenu];
     [self buildWindow];
     [_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
@@ -3397,6 +3398,153 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 {
     (void)sender;
     return YES;
+}
+
+- (NSString *)commandLineToolInstallDestination
+{
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    if ([fileManager isWritableFileAtPath:@"/usr/local/bin"]) {
+        return @"/usr/local/bin/hdcv";
+    }
+    if ([fileManager isWritableFileAtPath:@"/opt/homebrew/bin"]) {
+        return @"/opt/homebrew/bin/hdcv";
+    }
+    return @"/usr/local/bin/hdcv";
+}
+
+- (NSString *)bundledCommandLineToolPath
+{
+    NSString *resourcePath = NSBundle.mainBundle.resourcePath;
+    if (resourcePath.length > 0U) {
+        NSString *bundledPath = [resourcePath stringByAppendingPathComponent:@"bin/hdcv"];
+        if ([NSFileManager.defaultManager isExecutableFileAtPath:bundledPath]) {
+            return bundledPath;
+        }
+    }
+
+    NSString *executablePath = NSBundle.mainBundle.executablePath;
+    NSString *buildPath = [executablePath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"hdcv"];
+    if ([NSFileManager.defaultManager isExecutableFileAtPath:buildPath]) {
+        return buildPath;
+    }
+    return nil;
+}
+
+- (void)showCommandLineToolAlertWithTitle:(NSString *)title message:(NSString *)message
+{
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleInformational;
+    alert.messageText = title;
+    alert.informativeText = message;
+    [alert beginSheetModalForWindow:_window completionHandler:nil];
+}
+
+- (void)installCommandLineTool:(id)sender
+{
+    (void)sender;
+    NSString *sourcePath = [self bundledCommandLineToolPath];
+    NSString *destinationPath = [self commandLineToolInstallDestination];
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSError *error = nil;
+
+    if (sourcePath.length == 0U) {
+        [self showCommandLineToolAlertWithTitle:@"Could not find hdcv"
+                                        message:@"The command line tool is not embedded in this app bundle or adjacent to this debug build."];
+        return;
+    }
+
+    NSString *destinationDirectory = destinationPath.stringByDeletingLastPathComponent;
+    if (![fileManager createDirectoryAtPath:destinationDirectory withIntermediateDirectories:YES attributes:nil error:&error]) {
+        NSString *command = [NSString stringWithFormat:@"sudo mkdir -p \"%@\" && sudo ln -sf \"%@\" \"%@\"", destinationDirectory, sourcePath, destinationPath];
+        [self showCommandLineToolAlertWithTitle:@"Install needs permission"
+                                        message:[NSString stringWithFormat:@"Could not create %@.\n\nRun this in Terminal:\n%@", destinationDirectory, command]];
+        return;
+    }
+
+    NSString *existingLinkDestination = [fileManager destinationOfSymbolicLinkAtPath:destinationPath error:nil];
+    BOOL destinationExists = [fileManager fileExistsAtPath:destinationPath] || existingLinkDestination != nil;
+    if (destinationExists) {
+        if (existingLinkDestination == nil) {
+            [self showCommandLineToolAlertWithTitle:@"Cannot replace existing file"
+                                            message:[NSString stringWithFormat:@"%@ already exists and is not a symlink. Move it first, then install again.", destinationPath]];
+            return;
+        }
+        if (![fileManager removeItemAtPath:destinationPath error:&error]) {
+            NSString *command = [NSString stringWithFormat:@"sudo ln -sf \"%@\" \"%@\"", sourcePath, destinationPath];
+            [self showCommandLineToolAlertWithTitle:@"Install needs permission"
+                                            message:[NSString stringWithFormat:@"Could not replace %@.\n\nRun this in Terminal:\n%@", destinationPath, command]];
+            return;
+        }
+    }
+
+    if (![fileManager createSymbolicLinkAtPath:destinationPath withDestinationPath:sourcePath error:&error]) {
+        NSString *command = [NSString stringWithFormat:@"sudo ln -sf \"%@\" \"%@\"", sourcePath, destinationPath];
+        [self showCommandLineToolAlertWithTitle:@"Install needs permission"
+                                        message:[NSString stringWithFormat:@"Could not install %@.\n\nRun this in Terminal:\n%@", destinationPath, command]];
+        return;
+    }
+
+    [self showCommandLineToolAlertWithTitle:@"hdcv command installed"
+                                    message:[NSString stringWithFormat:@"You can now run:\n\nhdcv file.hdcv\nhdcv file.hdcv --cv 100,200,300 --out exports\n\nInstalled symlink:\n%@ -> %@", destinationPath, sourcePath]];
+}
+
+- (void)uninstallCommandLineTool:(id)sender
+{
+    (void)sender;
+    NSString *destinationPath = [self commandLineToolInstallDestination];
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSError *error = nil;
+    NSString *existingLinkDestination = [fileManager destinationOfSymbolicLinkAtPath:destinationPath error:nil];
+    BOOL destinationExists = [fileManager fileExistsAtPath:destinationPath] || existingLinkDestination != nil;
+
+    if (!destinationExists) {
+        [self showCommandLineToolAlertWithTitle:@"hdcv command is not installed"
+                                        message:[NSString stringWithFormat:@"%@ does not exist.", destinationPath]];
+        return;
+    }
+    if (existingLinkDestination == nil) {
+        [self showCommandLineToolAlertWithTitle:@"Cannot remove existing file"
+                                        message:[NSString stringWithFormat:@"%@ exists and is not a symlink, so HDCV Viewer did not remove it.", destinationPath]];
+        return;
+    }
+    if (![fileManager removeItemAtPath:destinationPath error:&error]) {
+        NSString *command = [NSString stringWithFormat:@"sudo rm \"%@\"", destinationPath];
+        [self showCommandLineToolAlertWithTitle:@"Uninstall needs permission"
+                                        message:[NSString stringWithFormat:@"Could not remove %@.\n\nRun this in Terminal:\n%@", destinationPath, command]];
+        return;
+    }
+    [self showCommandLineToolAlertWithTitle:@"hdcv command removed"
+                                    message:[NSString stringWithFormat:@"Removed %@.", destinationPath]];
+}
+
+- (void)buildMainMenu
+{
+    NSMenu *mainMenu = [[NSMenu alloc] initWithTitle:@""];
+    NSMenuItem *appItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"HDCV Viewer"];
+    NSMenuItem *fileItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
+
+    [mainMenu addItem:appItem];
+    appItem.submenu = appMenu;
+    [appMenu addItemWithTitle:@"About HDCV Viewer" action:@selector(orderFrontStandardAboutPanel:) keyEquivalent:@""];
+    [appMenu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *installItem = [appMenu addItemWithTitle:@"Install hdcv Command in PATH…" action:@selector(installCommandLineTool:) keyEquivalent:@""];
+    installItem.target = self;
+    NSMenuItem *uninstallItem = [appMenu addItemWithTitle:@"Uninstall hdcv Command…" action:@selector(uninstallCommandLineTool:) keyEquivalent:@""];
+    uninstallItem.target = self;
+    [appMenu addItem:NSMenuItem.separatorItem];
+    [appMenu addItemWithTitle:@"Quit HDCV Viewer" action:@selector(terminate:) keyEquivalent:@"q"];
+
+    [mainMenu addItem:fileItem];
+    fileItem.submenu = fileMenu;
+    NSMenuItem *openItem = [fileMenu addItemWithTitle:@"Open…" action:@selector(openDocument:) keyEquivalent:@"o"];
+    openItem.target = self;
+    NSMenuItem *exportItem = [fileMenu addItemWithTitle:@"Export Data…" action:@selector(exportData:) keyEquivalent:@"e"];
+    exportItem.target = self;
+    exportItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+
+    NSApp.mainMenu = mainMenu;
 }
 
 - (NSTextField *)compactInputFieldWithAction:(SEL)action width:(CGFloat)width

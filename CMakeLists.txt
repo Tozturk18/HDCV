@@ -90,6 +90,12 @@ if(APPLE)
     MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1.0"
     XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.hdcv.viewer"
   )
+  add_dependencies(hdcv_viewer_app hdcv)
+  add_custom_command(TARGET hdcv_viewer_app POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:hdcv_viewer_app>/Contents/Resources/bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:hdcv>" "$<TARGET_BUNDLE_DIR:hdcv_viewer_app>/Contents/Resources/bin/hdcv"
+    COMMENT "Embedding hdcv command line tool in HDCV Viewer.app"
+  )
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")

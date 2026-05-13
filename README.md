@@ -78,15 +78,19 @@ Launch the native viewer or export MATLAB-ready CV files through the higher-leve
 ./build/hdcv DA_5uM_1.hdcv
 ./build/hdcv DA_5uM_1.hdcv --cv 100,200,300 --out exports
 ./build/hdcv DA_5uM_1.hdcv -cv "[100, 200, 300]" --bg-cv 50 --out exports
+./build/hdcv DA_5uM_1.hdcv --it 0.65 --bg-time 50 --bg-subtract --bandpass --out exports
+./build/hdcv DA_5uM_1.hdcv --color --time-range 100:300 --point-range 0:1500 --out exports
 ```
 
-`hdcv --cv` exports one `voltage_V,current_nA` CSV per requested sequence-time value, using the nearest scan in the selected phase family. The default phase is `0`, matching the viewer's single-phase default for interleaved WaveNeuro files; use `--phase <index>` when a different phase family is scientifically intended.
+`hdcv --cv` exports one `voltage_V,current_nA` CSV per requested sequence-time value, using the nearest scan in the selected phase family. `--bg-cv` exports raw background CV files, `--it` exports selected-voltage `time_s,current_nA` traces, and `--color` exports long-form `time_s,current_nA,voltage_V` color plot data. `--bg-time`, `--bg-subtract`, and `--bandpass` apply the same phase-aware background subtraction and Butterworth processing model used by the viewer. The default phase is `0`, matching the viewer's single-phase default for interleaved WaveNeuro files; use `--phase <index>` when a different phase family is scientifically intended.
 
-To make the command available as `hdcv` from Terminal, symlink the built binary into a directory on your `PATH`; because the symlink resolves back into `build/`, the command can still find the adjacent app bundle for GUI launches:
+Release app bundles include the `hdcv` command inside `HDCV Viewer.app/Contents/Resources/bin/hdcv`. To make the command available as `hdcv` from Terminal, use `HDCV Viewer > Install hdcv Command in PATH...` from the app menu, or run:
 
 ```bash
-ln -sf "$(pwd)/build/hdcv" /usr/local/bin/hdcv
+./build/hdcv --install-command
 ```
+
+The installer creates a VS Code-style symlink in the first writable standard `PATH` location and points it back to the command bundled with the app or the current debug build. It prefers `/usr/local/bin/hdcv`; on Apple Silicon systems where that is not writable but `/opt/homebrew/bin` is available, it uses `/opt/homebrew/bin/hdcv` automatically. Remove it with `HDCV Viewer > Uninstall hdcv Command...` or `hdcv --uninstall-command`.
 
 ## Native GUI
 
@@ -106,6 +110,7 @@ open -n -a "build/HDCV Viewer.app" DA_5uM_1.hdcv
 ```
 
 The app bundle registers `.hdcv` files, so Finder double-click and Open With launch paths load the selected file directly.
+It also embeds the `hdcv` command line tool and provides app-menu actions to install or uninstall the shell command in `/usr/local/bin`, similar to VS Code's `code` command workflow.
 
 The viewer is optimized for the current system and uses the C reader directly rather than the old Python GUI path.
 
@@ -122,6 +127,7 @@ Current GUI features:
 - phase-aligned background subtraction applied coherently to color plot, `I-t`, and `CV`
 - optional zero-phase Butterworth-style bandpass filter for the color plot, `I-t`, and `CV`
 - MATLAB-friendly CSV export for the color plot, selected-voltage `I-t`, selected-time `CV`, and raw background `CV`
+- bundled `hdcv` shell command for launching files and batch-exporting processed CV, background CV, `I-t`, and color plot CSVs from Terminal or MATLAB
 - single-phase plotting for files that contain repeated interleaved WaveNeuro waveform phases
 - synchronized vertical and horizontal crosshair lines across the plots
 - drag-to-move crosshair lines on the color plot, `I-t`, and `CV` plots
