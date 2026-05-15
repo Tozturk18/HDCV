@@ -41,6 +41,7 @@ typedef struct {
     int has_point_range;
     uint32_t point_min;
     uint32_t point_max;
+    int stdout_export;
 } hdcv_cli_options;
 
 static void usage(FILE *stream)
@@ -52,6 +53,8 @@ static void usage(FILE *stream)
     fputs("  hdcv <file.hdcv> --it 0.65 [--bg-time 50 --bg-subtract] [--bandpass] [--out exports]\n", stream);
     fputs("  hdcv <file.hdcv> --color [--time-range 100:300] [--point-range 0:1500] [--out exports]\n", stream);
     fputs("  hdcv <file.hdcv> -cv [100, 200, 300] --bg-cv 50 [--phase 0]\n", stream);
+    fputs("  hdcv <file.hdcv> --cv 100 --stdout\n", stream);
+    fputs("  hdcv <file.hdcv> --it 0.65 --stdout\n", stream);
     fputs("  hdcv --install-command [--install-destination /path/to/hdcv]\n", stream);
     fputs("  hdcv --uninstall-command [--install-destination /path/to/hdcv]\n", stream);
     fputs("\n", stream);
@@ -574,6 +577,10 @@ static uint32_t nearest_point_for_voltage(const float *voltage, uint32_t point_c
 
 static FILE *open_csv_file(const char *path)
 {
+    if (strcmp(path, "-") == 0) {
+        return stdout;
+    }
+
     FILE *stream = fopen(path, "w");
     if (stream == NULL) {
         fprintf(stderr, "Could not create %s: %s\n", path, strerror(errno));
@@ -585,6 +592,10 @@ static FILE *open_csv_file(const char *path)
 
 static int close_csv_file(FILE *stream, const char *path)
 {
+    if (strcmp(path, "-") == 0) {
+        return fflush(stream) == 0;
+    }
+
     int had_write_error = ferror(stream);
     int close_result = fclose(stream);
     if (had_write_error != 0 || close_result != 0) {
@@ -786,16 +797,26 @@ static int export_cv_list(
         char token[96];
         uint32_t scan_index = nearest_scan_for_time(reader, times->values[i], options->phase_index);
 
-        format_number_token(times->values[i], "s", token, sizeof(token));
-        if (!output_path_with_token(out_path, sizeof(out_path), options->out_dir, options->prefix, suffix, token)) {
-            fprintf(stderr, "Output path is too long for %.9g s.\n", times->values[i]);
-            return 0;
+        if (options->stdout_export) {
+            if (!copy_string(out_path, sizeof(out_path), "-")) {
+                return 0;
+            }
+        } else {
+            format_number_token(times->values[i], "s", token, sizeof(token));
+            if (!output_path_with_token(out_path, sizeof(out_path), options->out_dir, options->prefix, suffix, token)) {
+                fprintf(stderr, "Output path is too long for %.9g s.\n", times->values[i]);
+                return 0;
+            }
         }
         if (!write_processed_cv_csv(reader, times->values[i], options, out_path, force_raw)) {
             fprintf(stderr, "Could not write %s\n", out_path);
             return 0;
         }
-        printf("wrote %s (%s t=%.9g s, scan=%" PRIu32 ")\n", out_path, kind, times->values[i], scan_index);
+        if (options->stdout_export) {
+            fprintf(stderr, "wrote stdout (%s t=%.9g s, scan=%" PRIu32 ")\n", kind, times->values[i], scan_index);
+        } else {
+            printf("wrote %s (%s t=%.9g s, scan=%" PRIu32 ")\n", out_path, kind, times->values[i], scan_index);
+        }
     }
     return 1;
 }
@@ -902,23 +923,38 @@ static int export_it_list(const hdcv_reader *reader, const hdcv_number_list *vol
         char token[128];
         uint32_t point_index = nearest_point_for_voltage(voltage, points_per_scan, voltages->values[i]);
 
-        format_number_token(voltages->values[i], "V", value_token, sizeof(value_token));
-        snprintf(token, sizeof(token), "%s_p%" PRIu32, value_token, point_index);
-        if (!output_path_with_token(out_path, sizeof(out_path), options->out_dir, options->prefix, "IT", token)) {
-            fprintf(stderr, "Output path is too long for %.9g V.\n", voltages->values[i]);
-            free(voltage);
-            return 0;
+        if (options->stdout_export) {
+            if (!copy_string(out_path, sizeof(out_path), "-")) {
+                free(voltage);
+                return 0;
+            }
+        } else {
+            format_number_token(voltages->values[i], "V", value_token, sizeof(value_token));
+            snprintf(token, sizeof(token), "%s_p%" PRIu32, value_token, point_index);
+            if (!output_path_with_token(out_path, sizeof(out_path), options->out_dir, options->prefix, "IT", token)) {
+                fprintf(stderr, "Output path is too long for %.9g V.\n", voltages->values[i]);
+                free(voltage);
+                return 0;
+            }
         }
         if (!write_it_csv_for_voltage(reader, voltages->values[i], options, out_path)) {
             fprintf(stderr, "Could not write %s\n", out_path);
             free(voltage);
             return 0;
         }
-        printf("wrote %s (requested %.9g V, point=%" PRIu32 ", actual %.9g V)\n",
-            out_path,
-            voltages->values[i],
-            point_index,
-            (double)voltage[point_index]);
+        if (options->stdout_export) {
+            fprintf(stderr,
+                "wrote stdout (requested %.9g V, point=%" PRIu32 ", actual %.9g V)\n",
+                voltages->values[i],
+                point_index,
+                (double)voltage[point_index]);
+        } else {
+            printf("wrote %s (requested %.9g V, point=%" PRIu32 ", actual %.9g V)\n",
+                out_path,
+                voltages->values[i],
+                point_index,
+                (double)voltage[point_index]);
+        }
     }
     free(voltage);
     return 1;
@@ -968,9 +1004,15 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
         return 0;
     }
 
-    if (!output_path_simple(out_path, sizeof(out_path), options->out_dir, options->prefix, "color")) {
-        fputs("Color export path is too long.\n", stderr);
-        return 0;
+    if (options->stdout_export) {
+        if (!copy_string(out_path, sizeof(out_path), "-")) {
+            return 0;
+        }
+    } else {
+        if (!output_path_simple(out_path, sizeof(out_path), options->out_dir, options->prefix, "color")) {
+            fputs("Color export path is too long.\n", stderr);
+            return 0;
+        }
     }
     voltage = (float *)malloc((size_t)points_per_scan * sizeof(*voltage));
     if (voltage == NULL || !hdcv_reader_copy_voltage(reader, voltage, points_per_scan)) {
@@ -1108,8 +1150,9 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
     ok = close_csv_file(stream, out_path);
     stream = NULL;
     if (ok) {
-        printf("wrote %s (%" PRIu32 " phase-%" PRIu32 " scans x %" PRIu32 " points)\n",
-            out_path,
+        FILE *status_stream = options->stdout_export ? stderr : stdout;
+        fprintf(status_stream, "wrote %s (%" PRIu32 " phase-%" PRIu32 " scans x %" PRIu32 " points)\n",
+            options->stdout_export ? "stdout" : out_path,
             export_scan_count,
             active_phase,
             export_point_count);
@@ -1193,6 +1236,8 @@ int main(int argc, char **argv)
             }
         } else if (strcmp(argv[i], "--color") == 0) {
             export_color = 1;
+        } else if (strcmp(argv[i], "--stdout") == 0) {
+            options.stdout_export = 1;
         } else if (strcmp(argv[i], "--bg-subtract") == 0 || strcmp(argv[i], "--background-subtract") == 0) {
             options.background_subtract = 1;
         } else if (strcmp(argv[i], "--bandpass") == 0) {
@@ -1271,7 +1316,13 @@ int main(int argc, char **argv)
         goto done_without_reader;
     }
 
-    if (!ensure_directory(options.out_dir)) {
+    if (options.stdout_export) {
+        size_t stdout_export_count = cv_times.count + background_cv_times.count + it_voltages.count + (export_color ? 1U : 0U);
+        if (stdout_export_count != 1U) {
+            fputs("--stdout requires exactly one export target. Use one --cv time, one --bg-cv time, one --it voltage, or --color.\n", stderr);
+            goto done_with_reader;
+        }
+    } else if (!ensure_directory(options.out_dir)) {
         goto done_with_reader;
     }
     if (!export_cv_list(&reader, &cv_times, &options, "CV", "CV", 0)) {

@@ -10,6 +10,10 @@ if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
   set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Target architectures" FORCE)
 endif()
 
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
+endif()
+
 set(HDCV_COMMON_WARNINGS
   -Wall
   -Wextra
@@ -76,8 +80,13 @@ configure_hdcv_viewer_target(hdcv_viewer)
 set(HDCV_VIEWER_TARGETS hdcv_viewer)
 
 if(APPLE)
+  set(HDCV_VIEWER_ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/HDCVViewer.icns")
+  set_source_files_properties(${HDCV_VIEWER_ICON} PROPERTIES
+    MACOSX_PACKAGE_LOCATION Resources
+  )
   add_executable(hdcv_viewer_app MACOSX_BUNDLE
     src/hdcv_viewer.m
+    ${HDCV_VIEWER_ICON}
   )
   configure_hdcv_viewer_target(hdcv_viewer_app)
   list(APPEND HDCV_VIEWER_TARGETS hdcv_viewer_app)
@@ -85,10 +94,11 @@ if(APPLE)
     OUTPUT_NAME "HDCV Viewer"
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/HDCVViewerInfo.plist.in"
     MACOSX_BUNDLE_BUNDLE_NAME "HDCV Viewer"
-    MACOSX_BUNDLE_GUI_IDENTIFIER "com.hdcv.viewer"
+    MACOSX_BUNDLE_ICON_FILE "HDCVViewer.icns"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.tozturk.hdcvviewer"
     MACOSX_BUNDLE_BUNDLE_VERSION "0.1.0"
     MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1.0"
-    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.hdcv.viewer"
+    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.tozturk.hdcvviewer"
   )
   add_dependencies(hdcv_viewer_app hdcv)
   add_custom_command(TARGET hdcv_viewer_app POST_BUILD

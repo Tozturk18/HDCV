@@ -29,6 +29,11 @@ typedef NS_ENUM(NSInteger, HDCVLinePlotDragTarget) {
     HDCVLinePlotDragTargetBackgroundX = 2,
 };
 
+typedef NS_ENUM(NSInteger, HDCVTimeMarkerKind) {
+    HDCVTimeMarkerKindSelected = 1,
+    HDCVTimeMarkerKindBackground = 2,
+};
+
 typedef NS_ENUM(NSInteger, HDCVAxisEditTarget) {
     HDCVAxisEditTargetNone = 0,
     HDCVAxisEditTargetXMin = 1,
@@ -44,11 +49,14 @@ typedef NS_OPTIONS(NSUInteger, HDCVExportOptions) {
     HDCVExportOptionTimePlot = 1U << 1U,
     HDCVExportOptionCVPlot = 1U << 2U,
     HDCVExportOptionBackgroundCVPlot = 1U << 3U,
+    HDCVExportOptionMarkerTimes = 1U << 4U,
 };
 
 static const NSUInteger HDCVCVSelectedHalfWindow = 1U;
 static const NSUInteger HDCVWaveformProgramVoltageRows = 10U;
 static const NSUInteger HDCVWaveformProgramIntervalRows = 9U;
+static const NSInteger HDCVMarkerFieldTagBase = 900000;
+static const NSInteger HDCVMarkerFieldTagStride = 1000;
 static NSString *const HDCVExportOptionsDefaultsKey = @"HDCVExportOptions";
 
 @class HDCVDropHostView;
@@ -62,9 +70,10 @@ static NSString *const HDCVExportOptionsDefaultsKey = @"HDCVExportOptions";
 @end
 
 @protocol HDCVHeatmapViewDelegate <NSObject>
-- (void)heatmapView:(HDCVHeatmapView *)view didDragSelectionScanIndex:(NSUInteger)scanIndex pointIndex:(NSUInteger)pointIndex updateScan:(BOOL)updateScan updatePoint:(BOOL)updatePoint;
-- (void)heatmapView:(HDCVHeatmapView *)view didDragBackgroundScanIndex:(NSUInteger)scanIndex;
+- (void)heatmapView:(HDCVHeatmapView *)view didDragSelectionScanIndex:(NSUInteger)scanIndex pointIndex:(NSUInteger)pointIndex updateScan:(BOOL)updateScan updatePoint:(BOOL)updatePoint markerIndex:(NSInteger)markerIndex;
+- (void)heatmapView:(HDCVHeatmapView *)view didDragBackgroundScanIndex:(NSUInteger)scanIndex markerIndex:(NSInteger)markerIndex;
 - (void)heatmapView:(HDCVHeatmapView *)view didEditAxisTarget:(HDCVAxisEditTarget)target value:(double)value;
+- (NSMenu *)heatmapView:(HDCVHeatmapView *)view menuForScanIndex:(NSUInteger)scanIndex selectedMarkerIndex:(NSInteger)selectedMarkerIndex backgroundMarkerIndex:(NSInteger)backgroundMarkerIndex;
 @end
 
 @protocol HDCVLinePlotDataSource <NSObject>
@@ -74,10 +83,11 @@ static NSString *const HDCVExportOptionsDefaultsKey = @"HDCVExportOptions";
 @end
 
 @protocol HDCVLinePlotViewDelegate <NSObject>
-- (void)linePlotView:(HDCVLinePlotView *)view didDragXValue:(double)xValue yValue:(double)yValue target:(HDCVLinePlotDragTarget)target;
+- (void)linePlotView:(HDCVLinePlotView *)view didDragXValue:(double)xValue yValue:(double)yValue target:(HDCVLinePlotDragTarget)target markerIndex:(NSInteger)markerIndex;
 - (void)linePlotView:(HDCVLinePlotView *)view didEditAxisTarget:(HDCVAxisEditTarget)target value:(double)value;
 - (void)linePlotView:(HDCVLinePlotView *)view didNavigateToXMin:(double)xMin xMax:(double)xMax yMin:(double)yMin yMax:(double)yMax;
 - (void)linePlotViewDidRequestResetView:(HDCVLinePlotView *)view;
+- (NSMenu *)linePlotView:(HDCVLinePlotView *)view menuForXValue:(double)xValue selectedMarkerIndex:(NSInteger)selectedMarkerIndex backgroundMarkerIndex:(NSInteger)backgroundMarkerIndex;
 @end
 
 @interface HDCVDropHostView : NSView <NSDraggingDestination>
@@ -97,6 +107,10 @@ static NSString *const HDCVExportOptionsDefaultsKey = @"HDCVExportOptions";
 @property(nonatomic, copy) NSArray<NSNumber *> *xTickFractions;
 @property(nonatomic) NSUInteger selectedScanIndex;
 @property(nonatomic) NSUInteger backgroundScanIndex;
+@property(nonatomic, copy) NSArray<NSNumber *> *selectedScanIndexes;
+@property(nonatomic, copy) NSArray<NSNumber *> *backgroundScanIndexes;
+@property(nonatomic) NSInteger activeSelectedMarkerIndex;
+@property(nonatomic) NSInteger activeBackgroundMarkerIndex;
 @property(nonatomic) NSUInteger scanCount;
 @property(nonatomic) NSUInteger selectedPointIndex;
 @property(nonatomic) NSUInteger pointCount;
@@ -130,6 +144,10 @@ static NSString *const HDCVExportOptionsDefaultsKey = @"HDCVExportOptions";
 @property(nonatomic) double selectedYValue;
 @property(nonatomic) double baselineYValue;
 @property(nonatomic) double backgroundXValue;
+@property(nonatomic, copy) NSArray<NSNumber *> *selectedXValues;
+@property(nonatomic, copy) NSArray<NSNumber *> *backgroundXValues;
+@property(nonatomic) NSInteger activeSelectedMarkerIndex;
+@property(nonatomic) NSInteger activeBackgroundMarkerIndex;
 @property(nonatomic) BOOL showsSelection;
 @property(nonatomic) BOOL showsBaseline;
 @property(nonatomic) BOOL showsBackgroundX;
@@ -177,7 +195,7 @@ static NSString *const HDCVExportOptionsDefaultsKey = @"HDCVExportOptions";
 - (void)setInitialPathFromArguments:(NSArray<NSString *> *)arguments;
 @end
 
-static NSString *const HDCVViewerErrorDomain = @"com.openai.hdcvviewer";
+static NSString *const HDCVViewerErrorDomain = @"com.tozturk.hdcvviewer";
 
 static NSColor *HDCVCanvasColor(void)
 {
@@ -351,6 +369,43 @@ static NSTextField *HDCVLabel(NSString *string, NSFont *font, NSColor *color)
     return label;
 }
 
+static void HDCVDrawMarkerBadge(NSString *label, CGFloat centerX, CGFloat edgeY, NSRect plotRect, NSColor *color, BOOL active)
+{
+    NSDictionary<NSAttributedStringKey, id> *attrs = @{
+        NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:8.5 weight:NSFontWeightSemibold],
+        NSForegroundColorAttributeName: active ? NSColor.whiteColor : color
+    };
+    NSSize textSize = [label sizeWithAttributes:attrs];
+    CGFloat width = MAX(21.0, ceil(textSize.width) + 9.0);
+    CGFloat height = 13.0;
+    CGFloat caretHeight = 4.0;
+    CGFloat x = MAX(NSMinX(plotRect) + 3.0, MIN(centerX - (width * 0.5), NSMaxX(plotRect) - width - 3.0));
+    NSRect bodyRect = NSMakeRect(x, edgeY - height - caretHeight, width, height);
+    NSBezierPath *body = [NSBezierPath bezierPathWithRoundedRect:bodyRect xRadius:4.0 yRadius:4.0];
+    NSBezierPath *caret = [NSBezierPath bezierPath];
+    CGFloat tipX = centerX;
+    tipX = MAX(NSMinX(bodyRect) + 6.0, MIN(tipX, NSMaxX(bodyRect) - 6.0));
+    [caret moveToPoint:NSMakePoint(tipX - 5.0, NSMaxY(bodyRect) - 1.0)];
+    [caret lineToPoint:NSMakePoint(tipX, NSMaxY(bodyRect) + caretHeight)];
+    [caret lineToPoint:NSMakePoint(tipX + 5.0, NSMaxY(bodyRect) - 1.0)];
+    [caret closePath];
+
+    NSColor *fill = active ? color : [[NSColor whiteColor] colorWithAlphaComponent:0.86];
+    NSColor *stroke = active ? [color colorWithAlphaComponent:0.98] : [color colorWithAlphaComponent:0.82];
+    [fill setFill];
+    [body fill];
+    [caret fill];
+    [stroke setStroke];
+    body.lineWidth = active ? 0.85 : 0.65;
+    caret.lineWidth = active ? 0.85 : 0.65;
+    [body stroke];
+    [caret stroke];
+
+    [label drawAtPoint:NSMakePoint(NSMidX(bodyRect) - textSize.width * 0.5,
+                                   NSMidY(bodyRect) - textSize.height * 0.5 - 0.5)
+        withAttributes:attrs];
+}
+
 static void HDCVExpandRange(double *minValue, double *maxValue)
 {
     double range = *maxValue - *minValue;
@@ -380,6 +435,34 @@ static BOOL HDCVParseLeadingDouble(NSString *string, double *outValue)
     }
     if (outValue != NULL) {
         *outValue = parsed;
+    }
+    return YES;
+}
+
+static NSInteger HDCVMarkerFieldTag(HDCVTimeMarkerKind kind, NSUInteger index)
+{
+    return HDCVMarkerFieldTagBase + ((NSInteger)kind * HDCVMarkerFieldTagStride) + (NSInteger)index;
+}
+
+static BOOL HDCVDecodeMarkerFieldTag(NSInteger tag, HDCVTimeMarkerKind *outKind, NSUInteger *outIndex)
+{
+    NSInteger encoded = tag - HDCVMarkerFieldTagBase;
+    NSInteger kind;
+    NSInteger index;
+
+    if (encoded < 0) {
+        return NO;
+    }
+    kind = encoded / HDCVMarkerFieldTagStride;
+    index = encoded % HDCVMarkerFieldTagStride;
+    if (kind != HDCVTimeMarkerKindSelected && kind != HDCVTimeMarkerKindBackground) {
+        return NO;
+    }
+    if (outKind != NULL) {
+        *outKind = (HDCVTimeMarkerKind)kind;
+    }
+    if (outIndex != NULL) {
+        *outIndex = (NSUInteger)index;
     }
     return YES;
 }
@@ -591,6 +674,34 @@ static void HDCVApplyPhaseAlignedBackgroundToTrace(
     for (NSUInteger scanIndex = 0U; scanIndex < scanCount; ++scanIndex) {
         NSUInteger alignedIndex = HDCVPhaseAlignedBackgroundIndex(rawBackgroundIndex, scanIndex, scanCount, phasePeriod);
         destination[scanIndex] = source[scanIndex] - source[alignedIndex];
+    }
+}
+
+static NSUInteger HDCVFixedPhaseBaselineIndexForScan(NSUInteger scanIndex, NSUInteger scanCount, NSUInteger phasePeriod)
+{
+    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger baselineIndex;
+
+    if (scanCount == 0U) {
+        return 0U;
+    }
+    if (period <= 1U) {
+        return 0U;
+    }
+    baselineIndex = scanIndex % period;
+    return (baselineIndex < scanCount) ? baselineIndex : 0U;
+}
+
+static void HDCVApplyFixedPhaseBaselineToTrace(
+    const float *source,
+    float *destination,
+    NSUInteger scanCount,
+    NSUInteger phasePeriod
+)
+{
+    for (NSUInteger scanIndex = 0U; scanIndex < scanCount; ++scanIndex) {
+        NSUInteger baselineIndex = HDCVFixedPhaseBaselineIndexForScan(scanIndex, scanCount, phasePeriod);
+        destination[scanIndex] = source[scanIndex] - source[baselineIndex];
     }
 }
 
@@ -942,7 +1053,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *HDCVBuildWaveformProgram
     }
     epsilon = MAX(1.0e-6f, (voltageMax - voltageMin) * 1.0e-5f);
     sampleIntervalMs = 1000.0 / sampleRateHz;
-    minimumHoldMs = MAX(sampleIntervalMs * 1.5, 0.05);
+    minimumHoldMs = sampleIntervalMs * 0.5;
     parseCount = count;
     if (displayDurationMs > ((double)count * sampleIntervalMs) + (sampleIntervalMs * 0.5)) {
         parseCount += 1U;
@@ -990,7 +1101,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *HDCVBuildWaveformProgram
         if (segmentEnd <= currentIntervalStart) {
             continue;
         }
-        if (direction == 0 && durationMs < minimumHoldMs) {
+        if (direction == 0 && (durationMs < minimumHoldMs || segmentEnd >= count)) {
             currentIntervalStart = segmentEnd;
             continue;
         }
@@ -1492,6 +1603,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
 @implementation HDCVHeatmapView {
     HDCVHeatmapDragTarget _activeDragTarget;
+    NSInteger _activeMarkerIndex;
     HDCVAxisEditTarget _activeAxisEditTarget;
     NSTextField *_axisEditor;
     NSTrackingArea *_trackingArea;
@@ -1510,7 +1622,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _visibleScanMaxIndex = NSNotFound;
         _visiblePointMinIndex = 0U;
         _visiblePointMaxIndex = NSNotFound;
+        _activeSelectedMarkerIndex = 0;
+        _activeBackgroundMarkerIndex = 0;
         _activeDragTarget = HDCVHeatmapDragTargetNone;
+        _activeMarkerIndex = -1;
         self.wantsLayer = YES;
         self.layer.backgroundColor = NSColor.whiteColor.CGColor;
     }
@@ -1555,6 +1670,30 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (void)setBackgroundScanIndex:(NSUInteger)backgroundScanIndex
 {
     _backgroundScanIndex = backgroundScanIndex;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setSelectedScanIndexes:(NSArray<NSNumber *> *)selectedScanIndexes
+{
+    _selectedScanIndexes = [selectedScanIndexes copy];
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setBackgroundScanIndexes:(NSArray<NSNumber *> *)backgroundScanIndexes
+{
+    _backgroundScanIndexes = [backgroundScanIndexes copy];
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setActiveSelectedMarkerIndex:(NSInteger)activeSelectedMarkerIndex
+{
+    _activeSelectedMarkerIndex = activeSelectedMarkerIndex;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setActiveBackgroundMarkerIndex:(NSInteger)activeBackgroundMarkerIndex
+{
+    _activeBackgroundMarkerIndex = activeBackgroundMarkerIndex;
     [self setNeedsDisplay:YES];
 }
 
@@ -1800,6 +1939,42 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     return YES;
 }
 
+- (NSInteger)markerIndexNearPoint:(NSPoint)point scanIndexes:(NSArray<NSNumber *> *)scanIndexes tolerance:(CGFloat)tolerance
+{
+    NSRect plotRect = [self plotRect];
+    NSUInteger minScan = [self normalizedVisibleScanMin];
+    NSUInteger maxScan = [self normalizedVisibleScanMax];
+    NSInteger bestIndex = -1;
+    CGFloat bestDistance = CGFLOAT_MAX;
+
+    for (NSUInteger i = 0U; i < scanIndexes.count; ++i) {
+        NSUInteger scanIndex = scanIndexes[i].unsignedIntegerValue;
+        if (scanIndex < minScan || scanIndex > maxScan) {
+            continue;
+        }
+        CGFloat x = [self xPositionForScanIndex:scanIndex inPlotRect:plotRect];
+        CGFloat distance = fabs(point.x - x);
+        if (distance <= tolerance && distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = (NSInteger)i;
+        }
+    }
+    return bestIndex;
+}
+
+- (NSArray<NSNumber *> *)visibleSelectedScanIndexes
+{
+    return (self.selectedScanIndexes.count > 0U) ? self.selectedScanIndexes : @[@(self.selectedScanIndex)];
+}
+
+- (NSArray<NSNumber *> *)visibleBackgroundScanIndexes
+{
+    if (self.backgroundScanIndexes.count > 0U) {
+        return self.backgroundScanIndexes;
+    }
+    return (self.backgroundScanIndex == NSNotFound) ? @[] : @[@(self.backgroundScanIndex)];
+}
+
 - (NSString *)axisEditStringForTarget:(HDCVAxisEditTarget)target
 {
     NSUInteger minPoint = [self normalizedVisiblePointMin];
@@ -1949,58 +2124,82 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [_axisEditor selectText:nil];
 }
 
-- (HDCVHeatmapDragTarget)dragTargetForPoint:(NSPoint)point
+- (CGFloat)xDistanceForScanMarkerIndex:(NSInteger)markerIndex scanIndexes:(NSArray<NSNumber *> *)scanIndexes point:(NSPoint)point plotRect:(NSRect)plotRect
+{
+    if (markerIndex < 0 || (NSUInteger)markerIndex >= scanIndexes.count) {
+        return CGFLOAT_MAX;
+    }
+    NSUInteger scanIndex = scanIndexes[(NSUInteger)markerIndex].unsignedIntegerValue;
+    return fabs(point.x - [self xPositionForScanIndex:scanIndex inPlotRect:plotRect]);
+}
+
+- (HDCVHeatmapDragTarget)dragTargetForPoint:(NSPoint)point markerIndex:(NSInteger *)outMarkerIndex
 {
     NSRect plotRect = [self plotRect];
     CGFloat tolerance = 7.0;
-    CGFloat selectedX;
+    NSArray<NSNumber *> *selectedScanIndexes;
+    NSArray<NSNumber *> *backgroundScanIndexes;
     CGFloat selectedY;
-    CGFloat backgroundX = CGFLOAT_MAX;
     CGFloat selectedXDistance;
     CGFloat backgroundXDistance;
+    NSInteger selectedMarkerIndex;
+    NSInteger backgroundMarkerIndex;
     BOOL nearSelectedX;
     BOOL nearSelectedY;
     BOOL nearBackgroundX;
-    BOOL selectedVisible;
-    BOOL backgroundVisible;
+
+    if (outMarkerIndex != NULL) {
+        *outMarkerIndex = -1;
+    }
 
     if (!NSPointInRect(point, plotRect) || self.scanCount == 0U || self.pointCount == 0U) {
         return HDCVHeatmapDragTargetNone;
     }
 
-    selectedVisible = self.selectedScanIndex >= [self normalizedVisibleScanMin] &&
-        self.selectedScanIndex <= [self normalizedVisibleScanMax] &&
-        self.selectedPointIndex >= [self normalizedVisiblePointMin] &&
-        self.selectedPointIndex <= [self normalizedVisiblePointMax];
-    backgroundVisible = self.backgroundScanIndex != NSNotFound &&
-        self.backgroundScanIndex >= [self normalizedVisibleScanMin] &&
-        self.backgroundScanIndex <= [self normalizedVisibleScanMax];
-
-    selectedX = selectedVisible ? [self xPositionForScanIndex:self.selectedScanIndex inPlotRect:plotRect] : CGFLOAT_MAX;
-    selectedY = selectedVisible ? [self yPositionForPointIndex:self.selectedPointIndex inPlotRect:plotRect] : CGFLOAT_MAX;
-    if (backgroundVisible) {
-        backgroundX = [self xPositionForScanIndex:self.backgroundScanIndex inPlotRect:plotRect];
-    }
-
-    selectedXDistance = fabs(point.x - selectedX);
-    backgroundXDistance = fabs(point.x - backgroundX);
-    nearSelectedX = selectedVisible && selectedXDistance <= tolerance;
-    nearSelectedY = selectedVisible && fabs(point.y - selectedY) <= tolerance;
-    nearBackgroundX = backgroundVisible && backgroundXDistance <= tolerance;
+    selectedScanIndexes = [self visibleSelectedScanIndexes];
+    backgroundScanIndexes = [self visibleBackgroundScanIndexes];
+    selectedMarkerIndex = [self markerIndexNearPoint:point scanIndexes:selectedScanIndexes tolerance:tolerance];
+    backgroundMarkerIndex = [self markerIndexNearPoint:point scanIndexes:backgroundScanIndexes tolerance:tolerance];
+    selectedXDistance = [self xDistanceForScanMarkerIndex:selectedMarkerIndex scanIndexes:selectedScanIndexes point:point plotRect:plotRect];
+    backgroundXDistance = [self xDistanceForScanMarkerIndex:backgroundMarkerIndex scanIndexes:backgroundScanIndexes point:point plotRect:plotRect];
+    nearSelectedX = selectedMarkerIndex >= 0;
+    nearBackgroundX = backgroundMarkerIndex >= 0;
+    selectedY = (self.selectedPointIndex >= [self normalizedVisiblePointMin] &&
+                 self.selectedPointIndex <= [self normalizedVisiblePointMax])
+        ? [self yPositionForPointIndex:self.selectedPointIndex inPlotRect:plotRect]
+        : CGFLOAT_MAX;
+    nearSelectedY = fabs(point.y - selectedY) <= tolerance;
 
     if (nearSelectedX && nearSelectedY) {
+        if (outMarkerIndex != NULL) {
+            *outMarkerIndex = selectedMarkerIndex;
+        }
         return HDCVHeatmapDragTargetSelectionXY;
     }
     if (nearSelectedX && (!nearBackgroundX || selectedXDistance <= backgroundXDistance)) {
+        if (outMarkerIndex != NULL) {
+            *outMarkerIndex = selectedMarkerIndex;
+        }
         return HDCVHeatmapDragTargetSelectionX;
     }
     if (nearSelectedY) {
+        if (outMarkerIndex != NULL) {
+            *outMarkerIndex = self.activeSelectedMarkerIndex;
+        }
         return HDCVHeatmapDragTargetSelectionY;
     }
     if (nearBackgroundX) {
+        if (outMarkerIndex != NULL) {
+            *outMarkerIndex = backgroundMarkerIndex;
+        }
         return HDCVHeatmapDragTargetBackgroundX;
     }
     return HDCVHeatmapDragTargetNone;
+}
+
+- (HDCVHeatmapDragTarget)dragTargetForPoint:(NSPoint)point
+{
+    return [self dragTargetForPoint:point markerIndex:NULL];
 }
 
 - (void)updateCursorForEvent:(NSEvent *)event
@@ -2095,47 +2294,70 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         [bottomLabel drawAtPoint:NSMakePoint(NSMaxX(legendRect) + 5.0, NSMaxY(legendRect) - 13.0) withAttributes:tickAttrs];
     }
 
-    if (self.scanCount > 0U &&
-        self.backgroundScanIndex != NSNotFound &&
-        self.backgroundScanIndex >= [self normalizedVisibleScanMin] &&
-        self.backgroundScanIndex <= [self normalizedVisibleScanMax]) {
-        CGFloat backgroundX = [self xPositionForScanIndex:self.backgroundScanIndex inPlotRect:plotRect];
-        NSBezierPath *backgroundLine = [NSBezierPath bezierPath];
-        [backgroundLine moveToPoint:NSMakePoint(backgroundX, plotRect.origin.y)];
-        [backgroundLine lineToPoint:NSMakePoint(backgroundX, NSMaxY(plotRect))];
-        backgroundLine.lineWidth = 1.2;
-        CGFloat dashes[] = {3.0, 4.0};
-        [backgroundLine setLineDash:dashes count:2 phase:0.0];
-        [[HDCVAccentBlue() colorWithAlphaComponent:0.95] setStroke];
-        [backgroundLine stroke];
+    if (self.scanCount > 0U) {
+        NSArray<NSNumber *> *backgroundScanIndexes = [self visibleBackgroundScanIndexes];
+        for (NSUInteger i = 0U; i < backgroundScanIndexes.count; ++i) {
+            NSUInteger scanIndex = backgroundScanIndexes[i].unsignedIntegerValue;
+            BOOL active = (NSInteger)i == self.activeBackgroundMarkerIndex;
+            if (scanIndex < [self normalizedVisibleScanMin] || scanIndex > [self normalizedVisibleScanMax]) {
+                continue;
+            }
+            CGFloat backgroundX = [self xPositionForScanIndex:scanIndex inPlotRect:plotRect];
+            NSBezierPath *backgroundLine = [NSBezierPath bezierPath];
+            [backgroundLine moveToPoint:NSMakePoint(backgroundX, plotRect.origin.y)];
+            [backgroundLine lineToPoint:NSMakePoint(backgroundX, NSMaxY(plotRect))];
+            backgroundLine.lineWidth = active ? 1.35 : 1.0;
+            CGFloat dashes[] = {3.0, 4.0};
+            [backgroundLine setLineDash:dashes count:2 phase:0.0];
+            [[HDCVAccentBlue() colorWithAlphaComponent:active ? 0.95 : 0.62] setStroke];
+            [backgroundLine stroke];
+            HDCVDrawMarkerBadge([NSString stringWithFormat:@"B%lu", (unsigned long)(i + 1U)],
+                                backgroundX,
+                                plotRect.origin.y,
+                                plotRect,
+                                HDCVAccentBlue(),
+                                active);
+        }
     }
 
-    if (self.scanCount > 0U &&
-        self.pointCount > 0U &&
-        self.selectedScanIndex >= [self normalizedVisibleScanMin] &&
-        self.selectedScanIndex <= [self normalizedVisibleScanMax] &&
-        self.selectedPointIndex >= [self normalizedVisiblePointMin] &&
-        self.selectedPointIndex <= [self normalizedVisiblePointMax]) {
-        CGFloat crossX = [self xPositionForScanIndex:self.selectedScanIndex inPlotRect:plotRect];
-        CGFloat crossY = [self yPositionForPointIndex:self.selectedPointIndex inPlotRect:plotRect];
+    if (self.scanCount > 0U && self.pointCount > 0U) {
+        NSArray<NSNumber *> *selectedScanIndexes = [self visibleSelectedScanIndexes];
 
-        NSBezierPath *vertical = [NSBezierPath bezierPath];
-        [vertical moveToPoint:NSMakePoint(crossX, plotRect.origin.y)];
-        [vertical lineToPoint:NSMakePoint(crossX, NSMaxY(plotRect))];
-        vertical.lineWidth = 1.6;
-        CGFloat verticalDashes[] = {7.0, 5.0};
-        [vertical setLineDash:verticalDashes count:2 phase:0.0];
-        [[HDCVAccentCrimson() colorWithAlphaComponent:0.95] setStroke];
-        [vertical stroke];
+        for (NSUInteger i = 0U; i < selectedScanIndexes.count; ++i) {
+            NSUInteger scanIndex = selectedScanIndexes[i].unsignedIntegerValue;
+            BOOL active = (NSInteger)i == self.activeSelectedMarkerIndex;
+            if (scanIndex < [self normalizedVisibleScanMin] || scanIndex > [self normalizedVisibleScanMax]) {
+                continue;
+            }
+            CGFloat markerX = [self xPositionForScanIndex:scanIndex inPlotRect:plotRect];
+            NSBezierPath *vertical = [NSBezierPath bezierPath];
+            [vertical moveToPoint:NSMakePoint(markerX, plotRect.origin.y)];
+            [vertical lineToPoint:NSMakePoint(markerX, NSMaxY(plotRect))];
+            vertical.lineWidth = active ? 1.7 : 1.15;
+            CGFloat verticalDashes[] = {7.0, 5.0};
+            [vertical setLineDash:verticalDashes count:2 phase:0.0];
+            [[HDCVAccentCrimson() colorWithAlphaComponent:active ? 0.95 : 0.66] setStroke];
+            [vertical stroke];
+            HDCVDrawMarkerBadge([NSString stringWithFormat:@"T%lu", (unsigned long)(i + 1U)],
+                                markerX,
+                                plotRect.origin.y,
+                                plotRect,
+                                HDCVAccentCrimson(),
+                                active);
+        }
 
-        NSBezierPath *horizontal = [NSBezierPath bezierPath];
-        [horizontal moveToPoint:NSMakePoint(plotRect.origin.x, crossY)];
-        [horizontal lineToPoint:NSMakePoint(NSMaxX(plotRect), crossY)];
-        horizontal.lineWidth = 1.4;
-        CGFloat horizontalDashes[] = {6.0, 4.0};
-        [horizontal setLineDash:horizontalDashes count:2 phase:0.0];
-        [[HDCVAccentTeal() colorWithAlphaComponent:0.92] setStroke];
-        [horizontal stroke];
+        if (self.selectedPointIndex >= [self normalizedVisiblePointMin] &&
+            self.selectedPointIndex <= [self normalizedVisiblePointMax]) {
+            CGFloat crossY = [self yPositionForPointIndex:self.selectedPointIndex inPlotRect:plotRect];
+            NSBezierPath *horizontal = [NSBezierPath bezierPath];
+            [horizontal moveToPoint:NSMakePoint(plotRect.origin.x, crossY)];
+            [horizontal lineToPoint:NSMakePoint(NSMaxX(plotRect), crossY)];
+            horizontal.lineWidth = 1.4;
+            CGFloat horizontalDashes[] = {6.0, 4.0};
+            [horizontal setLineDash:horizontalDashes count:2 phase:0.0];
+            [[HDCVAccentTeal() colorWithAlphaComponent:0.92] setStroke];
+            [horizontal stroke];
+        }
     }
 
     [@"Time (s)" drawAtPoint:NSMakePoint(NSMidX(plotRect) - 22.0, NSMaxY(plotRect) + 8.0) withAttributes:axisAttrs];
@@ -2190,13 +2412,13 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
 
     if (_activeDragTarget == HDCVHeatmapDragTargetBackgroundX) {
-        [self.delegate heatmapView:self didDragBackgroundScanIndex:scanIndex];
+        [self.delegate heatmapView:self didDragBackgroundScanIndex:scanIndex markerIndex:_activeMarkerIndex];
     } else if (_activeDragTarget == HDCVHeatmapDragTargetSelectionX) {
-        [self.delegate heatmapView:self didDragSelectionScanIndex:scanIndex pointIndex:pointIndex updateScan:YES updatePoint:NO];
+        [self.delegate heatmapView:self didDragSelectionScanIndex:scanIndex pointIndex:pointIndex updateScan:YES updatePoint:NO markerIndex:_activeMarkerIndex];
     } else if (_activeDragTarget == HDCVHeatmapDragTargetSelectionY) {
-        [self.delegate heatmapView:self didDragSelectionScanIndex:scanIndex pointIndex:pointIndex updateScan:NO updatePoint:YES];
+        [self.delegate heatmapView:self didDragSelectionScanIndex:scanIndex pointIndex:pointIndex updateScan:NO updatePoint:YES markerIndex:_activeMarkerIndex];
     } else if (_activeDragTarget == HDCVHeatmapDragTargetSelectionXY) {
-        [self.delegate heatmapView:self didDragSelectionScanIndex:scanIndex pointIndex:pointIndex updateScan:YES updatePoint:YES];
+        [self.delegate heatmapView:self didDragSelectionScanIndex:scanIndex pointIndex:pointIndex updateScan:YES updatePoint:YES markerIndex:_activeMarkerIndex];
     }
 }
 
@@ -2211,10 +2433,34 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             return;
         }
     }
-    _activeDragTarget = [self dragTargetForPoint:point];
+    _activeDragTarget = [self dragTargetForPoint:point markerIndex:&_activeMarkerIndex];
     if (_activeDragTarget != HDCVHeatmapDragTargetNone) {
         [NSCursor.closedHandCursor set];
+        [self updateSelectionFromEvent:event];
     }
+}
+
+- (void)rightMouseDown:(NSEvent *)event
+{
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    NSUInteger scanIndex = 0U;
+    NSUInteger pointIndex = 0U;
+    if (![self scanIndex:&scanIndex pointIndex:&pointIndex fromPoint:point]) {
+        [super rightMouseDown:event];
+        return;
+    }
+
+    NSInteger selectedMarkerIndex = [self markerIndexNearPoint:point scanIndexes:[self visibleSelectedScanIndexes] tolerance:7.0];
+    NSInteger backgroundMarkerIndex = [self markerIndexNearPoint:point scanIndexes:[self visibleBackgroundScanIndexes] tolerance:7.0];
+    NSMenu *menu = [self.delegate heatmapView:self
+                             menuForScanIndex:scanIndex
+                          selectedMarkerIndex:selectedMarkerIndex
+                        backgroundMarkerIndex:backgroundMarkerIndex];
+    if (menu == nil) {
+        [super rightMouseDown:event];
+        return;
+    }
+    [NSMenu popUpContextMenu:menu withEvent:event forView:self];
 }
 
 - (void)mouseDragged:(NSEvent *)event
@@ -2229,12 +2475,14 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 {
     (void)event;
     _activeDragTarget = HDCVHeatmapDragTargetNone;
+    _activeMarkerIndex = -1;
 }
 
 @end
 
 @implementation HDCVLinePlotView {
     HDCVLinePlotDragTarget _activeDragTarget;
+    NSInteger _activeMarkerIndex;
     HDCVAxisEditTarget _activeAxisEditTarget;
     NSTextField *_axisEditor;
     NSTrackingArea *_trackingArea;
@@ -2257,7 +2505,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _yLabelText = @"Y";
         _xTickFormat = @"%.2f";
         _yTickFormat = @"%.2f";
+        _activeSelectedMarkerIndex = 0;
+        _activeBackgroundMarkerIndex = 0;
         _activeDragTarget = HDCVLinePlotDragTargetNone;
+        _activeMarkerIndex = -1;
         _activePanDrag = NO;
         self.wantsLayer = YES;
         self.layer.backgroundColor = NSColor.whiteColor.CGColor;
@@ -2273,6 +2524,30 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (BOOL)acceptsFirstResponder
 {
     return YES;
+}
+
+- (void)setSelectedXValues:(NSArray<NSNumber *> *)selectedXValues
+{
+    _selectedXValues = [selectedXValues copy];
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setBackgroundXValues:(NSArray<NSNumber *> *)backgroundXValues
+{
+    _backgroundXValues = [backgroundXValues copy];
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setActiveSelectedMarkerIndex:(NSInteger)activeSelectedMarkerIndex
+{
+    _activeSelectedMarkerIndex = activeSelectedMarkerIndex;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setActiveBackgroundMarkerIndex:(NSInteger)activeBackgroundMarkerIndex
+{
+    _activeBackgroundMarkerIndex = activeBackgroundMarkerIndex;
+    [self setNeedsDisplay:YES];
 }
 
 - (NSRect)plotRect
@@ -2325,6 +2600,47 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (BOOL)pointIsInPlotRect:(NSPoint)point
 {
     return NSPointInRect(point, [self plotRect]);
+}
+
+- (NSArray<NSNumber *> *)visibleSelectedXValues
+{
+    return (self.selectedXValues.count > 0U) ? self.selectedXValues : (self.showsSelection ? @[@(self.selectedXValue)] : @[]);
+}
+
+- (NSArray<NSNumber *> *)visibleBackgroundXValues
+{
+    return (self.backgroundXValues.count > 0U) ? self.backgroundXValues : (self.showsBackgroundX ? @[@(self.backgroundXValue)] : @[]);
+}
+
+- (NSInteger)xMarkerIndexNearPoint:(NSPoint)point values:(NSArray<NSNumber *> *)values xMin:(double)xMin xRange:(double)xRange tolerance:(CGFloat)tolerance
+{
+    NSRect plotRect = [self plotRect];
+    NSInteger bestIndex = -1;
+    CGFloat bestDistance = CGFLOAT_MAX;
+
+    for (NSUInteger i = 0U; i < values.count; ++i) {
+        double xValue = values[i].doubleValue;
+        if (xValue < xMin || xValue > xMin + xRange) {
+            continue;
+        }
+        CGFloat x = [self xPositionForValue:xValue inPlotRect:plotRect xMin:xMin xRange:xRange];
+        CGFloat distance = fabs(point.x - x);
+        if (distance <= tolerance && distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = (NSInteger)i;
+        }
+    }
+    return bestIndex;
+}
+
+- (CGFloat)xDistanceForMarkerIndex:(NSInteger)markerIndex values:(NSArray<NSNumber *> *)values point:(NSPoint)point xMin:(double)xMin xRange:(double)xRange
+{
+    if (markerIndex < 0 || (NSUInteger)markerIndex >= values.count) {
+        return CGFLOAT_MAX;
+    }
+    NSRect plotRect = [self plotRect];
+    double xValue = values[(NSUInteger)markerIndex].doubleValue;
+    return fabs(point.x - [self xPositionForValue:xValue inPlotRect:plotRect xMin:xMin xRange:xRange]);
 }
 
 - (void)dispatchNavigationXMin:(double)xMin xMax:(double)xMax yMin:(double)yMin yMax:(double)yMax
@@ -2495,20 +2811,25 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [_axisEditor selectText:nil];
 }
 
-- (HDCVLinePlotDragTarget)dragTargetForPoint:(NSPoint)point
+- (HDCVLinePlotDragTarget)dragTargetForPoint:(NSPoint)point markerIndex:(NSInteger *)outMarkerIndex
 {
     NSRect plotRect = [self plotRect];
     double xMin = self.xMin;
     double xMax = self.xMax;
     double xRange;
     CGFloat tolerance = 7.0;
-    CGFloat selectedX;
-    CGFloat backgroundX = CGFLOAT_MAX;
+    NSArray<NSNumber *> *selectedXValues;
+    NSArray<NSNumber *> *backgroundXValues;
     CGFloat selectedDistance;
     CGFloat backgroundDistance;
+    NSInteger selectedMarkerIndex;
+    NSInteger backgroundMarkerIndex;
     BOOL nearSelected;
     BOOL nearBackground;
 
+    if (outMarkerIndex != NULL) {
+        *outMarkerIndex = -1;
+    }
     if (!NSPointInRect(point, plotRect) || self.interactionMode != HDCVLinePlotInteractionModeSelectX) {
         return HDCVLinePlotDragTargetNone;
     }
@@ -2517,22 +2838,33 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
     xRange = xMax - xMin;
 
-    selectedX = [self xPositionForValue:self.selectedXValue inPlotRect:plotRect xMin:xMin xRange:xRange];
-    if (self.showsBackgroundX) {
-        backgroundX = [self xPositionForValue:self.backgroundXValue inPlotRect:plotRect xMin:xMin xRange:xRange];
-    }
-    selectedDistance = fabs(point.x - selectedX);
-    backgroundDistance = fabs(point.x - backgroundX);
-    nearSelected = self.showsSelection && selectedDistance <= tolerance;
-    nearBackground = self.showsBackgroundX && backgroundDistance <= tolerance;
+    selectedXValues = [self visibleSelectedXValues];
+    backgroundXValues = [self visibleBackgroundXValues];
+    selectedMarkerIndex = [self xMarkerIndexNearPoint:point values:selectedXValues xMin:xMin xRange:xRange tolerance:tolerance];
+    backgroundMarkerIndex = [self xMarkerIndexNearPoint:point values:backgroundXValues xMin:xMin xRange:xRange tolerance:tolerance];
+    selectedDistance = [self xDistanceForMarkerIndex:selectedMarkerIndex values:selectedXValues point:point xMin:xMin xRange:xRange];
+    backgroundDistance = [self xDistanceForMarkerIndex:backgroundMarkerIndex values:backgroundXValues point:point xMin:xMin xRange:xRange];
+    nearSelected = self.showsSelection && selectedMarkerIndex >= 0;
+    nearBackground = self.showsBackgroundX && backgroundMarkerIndex >= 0;
 
     if (nearSelected && (!nearBackground || selectedDistance <= backgroundDistance)) {
+        if (outMarkerIndex != NULL) {
+            *outMarkerIndex = selectedMarkerIndex;
+        }
         return HDCVLinePlotDragTargetSelectedX;
     }
     if (nearBackground) {
+        if (outMarkerIndex != NULL) {
+            *outMarkerIndex = backgroundMarkerIndex;
+        }
         return HDCVLinePlotDragTargetBackgroundX;
     }
     return HDCVLinePlotDragTargetNone;
+}
+
+- (HDCVLinePlotDragTarget)dragTargetForPoint:(NSPoint)point
+{
+    return [self dragTargetForPoint:point markerIndex:NULL];
 }
 
 - (void)updateCursorForEvent:(NSEvent *)event
@@ -2659,16 +2991,24 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         }
     }
 
-    if (self.showsBackgroundX) {
-        CGFloat backgroundX = [self xPositionForValue:self.backgroundXValue inPlotRect:plotRect xMin:xMin xRange:xRange];
-        NSBezierPath *backgroundLine = [NSBezierPath bezierPath];
-        [backgroundLine moveToPoint:NSMakePoint(backgroundX, plotRect.origin.y)];
-        [backgroundLine lineToPoint:NSMakePoint(backgroundX, NSMaxY(plotRect))];
-        backgroundLine.lineWidth = 1.15;
-        CGFloat dashes[] = {3.0, 4.0};
-        [backgroundLine setLineDash:dashes count:2 phase:0.0];
-        [[HDCVAccentBlue() colorWithAlphaComponent:0.92] setStroke];
-        [backgroundLine stroke];
+    if (self.showsBackgroundX && self.backgroundXValues.count > 0U) {
+        NSArray<NSNumber *> *backgroundXValues = [self visibleBackgroundXValues];
+        for (NSUInteger i = 0U; i < backgroundXValues.count; ++i) {
+            double value = backgroundXValues[i].doubleValue;
+            BOOL active = (NSInteger)i == self.activeBackgroundMarkerIndex;
+            if (value < xMin || value > xMax) {
+                continue;
+            }
+            CGFloat backgroundX = [self xPositionForValue:value inPlotRect:plotRect xMin:xMin xRange:xRange];
+            NSBezierPath *backgroundLine = [NSBezierPath bezierPath];
+            [backgroundLine moveToPoint:NSMakePoint(backgroundX, plotRect.origin.y)];
+            [backgroundLine lineToPoint:NSMakePoint(backgroundX, NSMaxY(plotRect))];
+            backgroundLine.lineWidth = active ? 1.25 : 1.0;
+            CGFloat dashes[] = {3.0, 4.0};
+            [backgroundLine setLineDash:dashes count:2 phase:0.0];
+            [[HDCVAccentBlue() colorWithAlphaComponent:active ? 0.92 : 0.60] setStroke];
+            [backgroundLine stroke];
+        }
     }
 
     {
@@ -2804,17 +3144,26 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
 
     if (self.showsSelection) {
+        NSArray<NSNumber *> *selectedXValues = [self visibleSelectedXValues];
         CGFloat selectedX = plotRect.origin.x + (CGFloat)((self.selectedXValue - xMin) / xRange) * plotRect.size.width;
         CGFloat selectedY = plotRect.origin.y + plotRect.size.height - (CGFloat)((self.selectedYValue - yMin) / yRange) * plotRect.size.height;
 
-        NSBezierPath *vertical = [NSBezierPath bezierPath];
-        [vertical moveToPoint:NSMakePoint(selectedX, plotRect.origin.y)];
-        [vertical lineToPoint:NSMakePoint(selectedX, NSMaxY(plotRect))];
-        vertical.lineWidth = 1.35;
-        CGFloat verticalDashes[] = {6.0, 4.0};
-        [vertical setLineDash:verticalDashes count:2 phase:0.0];
-        [[HDCVAccentCrimson() colorWithAlphaComponent:0.96] setStroke];
-        [vertical stroke];
+        for (NSUInteger i = 0U; i < selectedXValues.count; ++i) {
+            double value = selectedXValues[i].doubleValue;
+            BOOL active = (NSInteger)i == self.activeSelectedMarkerIndex;
+            if (value < xMin || value > xMax) {
+                continue;
+            }
+            CGFloat markerX = plotRect.origin.x + (CGFloat)((value - xMin) / xRange) * plotRect.size.width;
+            NSBezierPath *vertical = [NSBezierPath bezierPath];
+            [vertical moveToPoint:NSMakePoint(markerX, plotRect.origin.y)];
+            [vertical lineToPoint:NSMakePoint(markerX, NSMaxY(plotRect))];
+            vertical.lineWidth = active ? 1.45 : 1.05;
+            CGFloat verticalDashes[] = {6.0, 4.0};
+            [vertical setLineDash:verticalDashes count:2 phase:0.0];
+            [[HDCVAccentCrimson() colorWithAlphaComponent:active ? 0.96 : 0.64] setStroke];
+            [vertical stroke];
+        }
 
         NSBezierPath *horizontal = [NSBezierPath bezierPath];
         [horizontal moveToPoint:NSMakePoint(plotRect.origin.x, selectedY)];
@@ -2830,6 +3179,42 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         [marker fill];
     }
     [NSGraphicsContext restoreGraphicsState];
+
+    if (self.showsBackgroundX && self.backgroundXValues.count > 0U) {
+        NSArray<NSNumber *> *backgroundXValues = [self visibleBackgroundXValues];
+        for (NSUInteger i = 0U; i < backgroundXValues.count; ++i) {
+            double value = backgroundXValues[i].doubleValue;
+            BOOL active = (NSInteger)i == self.activeBackgroundMarkerIndex;
+            if (value < xMin || value > xMax) {
+                continue;
+            }
+            CGFloat backgroundX = [self xPositionForValue:value inPlotRect:plotRect xMin:xMin xRange:xRange];
+            HDCVDrawMarkerBadge([NSString stringWithFormat:@"B%lu", (unsigned long)(i + 1U)],
+                                backgroundX,
+                                plotRect.origin.y,
+                                plotRect,
+                                HDCVAccentBlue(),
+                                active);
+        }
+    }
+
+    if (self.showsSelection && self.selectedXValues.count > 0U) {
+        NSArray<NSNumber *> *selectedXValues = [self visibleSelectedXValues];
+        for (NSUInteger i = 0U; i < selectedXValues.count; ++i) {
+            double value = selectedXValues[i].doubleValue;
+            BOOL active = (NSInteger)i == self.activeSelectedMarkerIndex;
+            if (value < xMin || value > xMax) {
+                continue;
+            }
+            CGFloat markerX = [self xPositionForValue:value inPlotRect:plotRect xMin:xMin xRange:xRange];
+            HDCVDrawMarkerBadge([NSString stringWithFormat:@"T%lu", (unsigned long)(i + 1U)],
+                                markerX,
+                                plotRect.origin.y,
+                                plotRect,
+                                HDCVAccentCrimson(),
+                                active);
+        }
+    }
 }
 
 - (void)dispatchSelectionForEvent:(NSEvent *)event
@@ -2842,7 +3227,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [self.delegate linePlotView:self
                   didDragXValue:[self clampedXValueForPoint:point]
                           yValue:[self clampedYValueForPoint:point]
-                          target:_activeDragTarget];
+                          target:_activeDragTarget
+                     markerIndex:_activeMarkerIndex];
 }
 
 - (void)mouseDown:(NSEvent *)event
@@ -2857,9 +3243,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             return;
         }
     }
-    _activeDragTarget = [self dragTargetForPoint:point];
+    _activeDragTarget = [self dragTargetForPoint:point markerIndex:&_activeMarkerIndex];
     if (_activeDragTarget != HDCVLinePlotDragTargetNone) {
         [NSCursor.closedHandCursor set];
+        [self dispatchSelectionForEvent:event];
         return;
     }
     if (self.viewNavigationEnabled && [self pointIsInPlotRect:point]) {
@@ -2871,6 +3258,35 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _panStartYMax = self.yMax;
         [NSCursor.closedHandCursor set];
     }
+}
+
+- (void)rightMouseDown:(NSEvent *)event
+{
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    double xMin = self.xMin;
+    double xMax = self.xMax;
+    double xRange;
+
+    if (![self pointIsInPlotRect:point] || self.interactionMode != HDCVLinePlotInteractionModeSelectX) {
+        [super rightMouseDown:event];
+        return;
+    }
+    if (xMax <= xMin) {
+        xMax = xMin + 1.0;
+    }
+    xRange = xMax - xMin;
+
+    NSInteger selectedMarkerIndex = [self xMarkerIndexNearPoint:point values:[self visibleSelectedXValues] xMin:xMin xRange:xRange tolerance:7.0];
+    NSInteger backgroundMarkerIndex = [self xMarkerIndexNearPoint:point values:[self visibleBackgroundXValues] xMin:xMin xRange:xRange tolerance:7.0];
+    NSMenu *menu = [self.delegate linePlotView:self
+                                 menuForXValue:[self clampedXValueForPoint:point]
+                           selectedMarkerIndex:selectedMarkerIndex
+                         backgroundMarkerIndex:backgroundMarkerIndex];
+    if (menu == nil) {
+        [super rightMouseDown:event];
+        return;
+    }
+    [NSMenu popUpContextMenu:menu withEvent:event forView:self];
 }
 
 - (void)mouseDragged:(NSEvent *)event
@@ -2892,6 +3308,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 {
     (void)event;
     _activeDragTarget = HDCVLinePlotDragTargetNone;
+    _activeMarkerIndex = -1;
     _activePanDrag = NO;
 }
 
@@ -3232,7 +3649,6 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 	    HDCVLinePlotView *_waveformPlotView;
 	    HDCVWaveformProgramView *_waveformProgramView;
 	    NSScrollView *_waveformProgramScrollView;
-	    NSTextField *_heroTitleLabel;
 	    NSTextField *_heroStatusLabel;
 	    NSTextField *_fileLabel;
 	    NSTextField *_heatmapScanField;
@@ -3243,6 +3659,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 	    NSTextField *_cvPointField;
 	    NSTextField *_backgroundModeLabel;
 	    NSTextField *_bandpassFilterLabel;
+	    NSStackView *_markerSelectedControls;
+	    NSStackView *_markerBackgroundControls;
+	    NSMutableArray<NSTextField *> *_markerTimeFields;
+	    NSMutableArray<NSTextField *> *_markerBackgroundFields;
 	    HDCVSwitchControl *_backgroundSubtractSwitch;
 	    HDCVSwitchControl *_bandpassFilterSwitch;
 	    NSButton *_useSelectedAsBackgroundButton;
@@ -3267,6 +3687,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSUInteger _selectedScanIndex;
 	    NSUInteger _selectedPointIndex;
 	    NSUInteger _backgroundScanIndex;
+	    NSMutableArray<NSNumber *> *_selectedMarkerScanIndexes;
+	    NSMutableArray<NSNumber *> *_backgroundMarkerScanIndexes;
+	    NSInteger _activeSelectedMarkerIndex;
+	    NSInteger _activeBackgroundMarkerIndex;
 	    NSUInteger _activePhaseIndex;
 	    BOOL _backgroundSubtractEnabled;
 	    BOOL _bandpassFilterEnabled;
@@ -3308,21 +3732,28 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 {
     self = [super init];
     if (self != nil) {
-        _workerQueue = dispatch_queue_create("com.openai.hdcvviewer.worker", DISPATCH_QUEUE_SERIAL);
+        _workerQueue = dispatch_queue_create("com.tozturk.hdcvviewer.worker", DISPATCH_QUEUE_SERIAL);
         _selectedScanIndex = 0U;
         _selectedPointIndex = 0U;
         _backgroundScanIndex = 0U;
+        _selectedMarkerScanIndexes = [NSMutableArray arrayWithObject:@(0U)];
+        _backgroundMarkerScanIndexes = [NSMutableArray arrayWithObject:@(0U)];
+        _activeSelectedMarkerIndex = 0;
+        _activeBackgroundMarkerIndex = 0;
+        _markerTimeFields = [NSMutableArray array];
+        _markerBackgroundFields = [NSMutableArray array];
         _activePhaseIndex = 0U;
         _backgroundSubtractEnabled = NO;
         _bandpassFilterEnabled = NO;
-        _lastExportOptions = HDCVExportOptionColorPlot | HDCVExportOptionTimePlot | HDCVExportOptionCVPlot;
+        _lastExportOptions = HDCVExportOptionColorPlot | HDCVExportOptionTimePlot | HDCVExportOptionCVPlot | HDCVExportOptionMarkerTimes;
         id storedExportOptions = [NSUserDefaults.standardUserDefaults objectForKey:HDCVExportOptionsDefaultsKey];
         if ([storedExportOptions isKindOfClass:NSNumber.class]) {
             HDCVExportOptions storedOptions = (HDCVExportOptions)[storedExportOptions unsignedIntegerValue];
             HDCVExportOptions supportedOptions = HDCVExportOptionColorPlot |
                 HDCVExportOptionTimePlot |
                 HDCVExportOptionCVPlot |
-                HDCVExportOptionBackgroundCVPlot;
+                HDCVExportOptionBackgroundCVPlot |
+                HDCVExportOptionMarkerTimes;
             if ((storedOptions & supportedOptions) != 0U) {
                 _lastExportOptions = storedOptions & supportedOptions;
             }
@@ -3361,7 +3792,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (_pendingOpenPath != nil) {
         [self loadFileAtPath:_pendingOpenPath];
     } else {
-        _heroStatusLabel.stringValue = @"Open or drag an HDCV FSCV file into the window to begin.";
+        _heroStatusLabel.stringValue = @"Ready";
     }
 }
 
@@ -3524,6 +3955,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"HDCV Viewer"];
     NSMenuItem *fileItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
     NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
+    NSMenuItem *editItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
 
     [mainMenu addItem:appItem];
     appItem.submenu = appMenu;
@@ -3543,6 +3976,19 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSMenuItem *exportItem = [fileMenu addItemWithTitle:@"Export Data…" action:@selector(exportData:) keyEquivalent:@"e"];
     exportItem.target = self;
     exportItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+
+    [mainMenu addItem:editItem];
+    editItem.submenu = editMenu;
+    [editMenu addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
+    NSMenuItem *redoItem = [editMenu addItemWithTitle:@"Redo" action:@selector(redo:) keyEquivalent:@"Z"];
+    redoItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    [editMenu addItem:NSMenuItem.separatorItem];
+    [editMenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
+    [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+    [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
+    [editMenu addItemWithTitle:@"Delete" action:@selector(delete:) keyEquivalent:@""];
+    [editMenu addItem:NSMenuItem.separatorItem];
+    [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
 
     NSApp.mainMenu = mainMenu;
 }
@@ -3577,6 +4023,23 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     return pair;
 }
 
+- (NSTextField *)markerInputFieldWithKind:(HDCVTimeMarkerKind)kind index:(NSUInteger)index width:(CGFloat)width
+{
+    NSTextField *field = [self compactInputFieldWithAction:@selector(selectionFieldChanged:) width:width];
+    field.tag = HDCVMarkerFieldTag(kind, index);
+    field.enabled = (_loadedFile != nil);
+    return field;
+}
+
+- (void)clearArrangedSubviewsInStack:(NSStackView *)stack
+{
+    NSArray<NSView *> *subviews = [stack.arrangedSubviews copy];
+    for (NSView *view in subviews) {
+        [stack removeArrangedSubview:view];
+        [view removeFromSuperview];
+    }
+}
+
 - (NSStackView *)compactControlsStack
 {
     NSStackView *stack = [[NSStackView alloc] init];
@@ -3585,6 +4048,32 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     stack.alignment = NSLayoutAttributeCenterY;
     stack.spacing = 8.0;
     return stack;
+}
+
+- (void)addMarkerFieldsToStack:(NSStackView *)stack
+                           kind:(HDCVTimeMarkerKind)kind
+                   markerIndexes:(NSArray<NSNumber *> *)markerIndexes
+                     labelPrefix:(NSString *)labelPrefix
+                      fieldWidth:(CGFloat)fieldWidth
+{
+    for (NSNumber *indexNumber in markerIndexes) {
+        NSUInteger i = indexNumber.unsignedIntegerValue;
+        NSTextField *field = [self markerInputFieldWithKind:kind index:i width:fieldWidth];
+        if (kind == HDCVTimeMarkerKindSelected) {
+            [_markerTimeFields addObject:field];
+        } else {
+            [_markerBackgroundFields addObject:field];
+        }
+        [stack addArrangedSubview:[self controlPairWithLabel:[NSString stringWithFormat:@"%@%lu s", labelPrefix, (unsigned long)(i + 1U)] field:field]];
+    }
+}
+
+- (void)rebuildExtraMarkerControls
+{
+    [_markerTimeFields removeAllObjects];
+    [_markerBackgroundFields removeAllObjects];
+    [self refreshControlFields];
+    [self setInputControlsEnabled:(_loadedFile != nil)];
 }
 
 - (NSButton *)smallActionButtonWithTitle:(NSString *)title action:(SEL)action
@@ -3637,6 +4126,12 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     ]) {
         field.enabled = enabled;
     }
+    for (NSTextField *field in _markerTimeFields) {
+        field.enabled = enabled;
+    }
+    for (NSTextField *field in _markerBackgroundFields) {
+        field.enabled = enabled;
+    }
     _backgroundSubtractSwitch.enabled = enabled;
     _bandpassFilterSwitch.enabled = enabled;
     _useSelectedAsBackgroundButton.enabled = enabled;
@@ -3679,7 +4174,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     heroPanel.layer.backgroundColor = HDCVHeroColor().CGColor;
     heroPanel.layer.borderColor = HDCVHeroBorderColor().CGColor;
     [rootStack addArrangedSubview:heroPanel];
-    [heroPanel.heightAnchor constraintEqualToConstant:96.0].active = YES;
+    [heroPanel.heightAnchor constraintEqualToConstant:56.0].active = YES;
 
     NSButton *openButton = [NSButton buttonWithTitle:@"Import FSCV File" target:self action:@selector(openDocument:)];
     openButton.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3709,13 +4204,6 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [heroActions addArrangedSubview:_exportButton];
     [heroPanel addSubview:heroActions];
 
-    _heroTitleLabel = HDCVLabel(@"WaveNeuro FSCV Review Workspace", [NSFont systemFontOfSize:18.0 weight:NSFontWeightSemibold], NSColor.whiteColor);
-    [heroPanel addSubview:_heroTitleLabel];
-
-    _heroStatusLabel = HDCVLabel(@"Open or drag an HDCV FSCV file into the window to begin.", [NSFont systemFontOfSize:11.5 weight:NSFontWeightRegular], [[NSColor whiteColor] colorWithAlphaComponent:0.82]);
-    _heroStatusLabel.lineBreakMode = NSLineBreakByWordWrapping;
-    [heroPanel addSubview:_heroStatusLabel];
-
     _fileLabel = HDCVLabel(@"No file loaded", [NSFont systemFontOfSize:12.5 weight:NSFontWeightSemibold], [[NSColor whiteColor] colorWithAlphaComponent:0.96]);
     [heroPanel addSubview:_fileLabel];
 
@@ -3727,15 +4215,11 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [heroPanel addSubview:_progressIndicator];
 
     [NSLayoutConstraint activateConstraints:@[
-        [_heroTitleLabel.leadingAnchor constraintEqualToAnchor:heroPanel.leadingAnchor constant:18.0],
-        [_heroTitleLabel.topAnchor constraintEqualToAnchor:heroPanel.topAnchor constant:14.0],
-        [_heroStatusLabel.leadingAnchor constraintEqualToAnchor:_heroTitleLabel.leadingAnchor],
-        [_heroStatusLabel.topAnchor constraintEqualToAnchor:_heroTitleLabel.bottomAnchor constant:6.0],
-        [_heroStatusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:heroActions.leadingAnchor constant:-16.0],
-        [_fileLabel.leadingAnchor constraintEqualToAnchor:_heroTitleLabel.leadingAnchor],
-        [_fileLabel.topAnchor constraintEqualToAnchor:_heroStatusLabel.bottomAnchor constant:8.0],
+        [_fileLabel.leadingAnchor constraintEqualToAnchor:heroPanel.leadingAnchor constant:18.0],
+        [_fileLabel.centerYAnchor constraintEqualToAnchor:heroPanel.centerYAnchor],
+        [_fileLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_progressIndicator.leadingAnchor constant:-16.0],
         [heroActions.trailingAnchor constraintEqualToAnchor:heroPanel.trailingAnchor constant:-18.0],
-        [heroActions.topAnchor constraintEqualToAnchor:heroPanel.topAnchor constant:18.0],
+        [heroActions.centerYAnchor constraintEqualToAnchor:heroPanel.centerYAnchor],
         [_progressIndicator.trailingAnchor constraintEqualToAnchor:heroActions.leadingAnchor constant:-14.0],
         [_progressIndicator.centerYAnchor constraintEqualToAnchor:heroActions.centerYAnchor],
     ]];
@@ -3758,6 +4242,21 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     sidebarColumn.spacing = 16.0;
     [contentRow addArrangedSubview:sidebarColumn];
     [sidebarColumn.widthAnchor constraintEqualToConstant:392.0].active = YES;
+
+    NSView *statusPanel = HDCVPanelContainer();
+    [rootStack addArrangedSubview:statusPanel];
+    [statusPanel.heightAnchor constraintEqualToConstant:36.0].active = YES;
+    _heroStatusLabel = HDCVLabel(@"Ready", [NSFont systemFontOfSize:10.5 weight:NSFontWeightMedium], HDCVMutedText());
+    _heroStatusLabel.alignment = NSTextAlignmentRight;
+    _heroStatusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [statusPanel addSubview:_heroStatusLabel];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_heroStatusLabel.trailingAnchor constraintEqualToAnchor:statusPanel.trailingAnchor constant:-16.0],
+        [_heroStatusLabel.centerYAnchor constraintEqualToAnchor:statusPanel.centerYAnchor],
+        [_heroStatusLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:statusPanel.leadingAnchor constant:16.0],
+        [_heroStatusLabel.widthAnchor constraintGreaterThanOrEqualToConstant:280.0],
+    ]];
 
     NSView *heatmapPanel = HDCVPanelContainer();
     [mainColumn addArrangedSubview:heatmapPanel];
@@ -3979,7 +4478,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSAlert *alert = [[NSAlert alloc] init];
     alert.alertStyle = NSAlertStyleInformational;
     alert.messageText = @"Export FSCV plot data";
-    alert.informativeText = @"Exports use the current plot state and active phase. I-t uses the selected voltage; CV uses the selected time; background CV uses the background line.";
+    alert.informativeText = @"Exports use the current plot state and active phase. I-t uses the selected voltage; CV uses the selected time; marker times export the visible CV/BG crosshair lists for MATLAB.";
     [alert addButtonWithTitle:@"Export"];
     [alert addButtonWithTitle:@"Cancel"];
 
@@ -3987,12 +4486,14 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSButton *timeCheck = [NSButton checkboxWithTitle:@"I-t plot (t, I)" target:nil action:nil];
     NSButton *cvCheck = [NSButton checkboxWithTitle:@"CV plot (V, I)" target:nil action:nil];
     NSButton *backgroundCVCheck = [NSButton checkboxWithTitle:@"Background CV plot (V, I)" target:nil action:nil];
+    NSButton *markerTimesCheck = [NSButton checkboxWithTitle:@"Crosshair times for MATLAB (CV_times, BG_times)" target:nil action:nil];
     colorCheck.state = ((_lastExportOptions & HDCVExportOptionColorPlot) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
     timeCheck.state = ((_lastExportOptions & HDCVExportOptionTimePlot) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
     cvCheck.state = ((_lastExportOptions & HDCVExportOptionCVPlot) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
     backgroundCVCheck.state = ((_lastExportOptions & HDCVExportOptionBackgroundCVPlot) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
+    markerTimesCheck.state = ((_lastExportOptions & HDCVExportOptionMarkerTimes) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
 
-    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 330.0, 112.0)];
+    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 360.0, 140.0)];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
     stack.spacing = 8.0;
@@ -4000,6 +4501,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [stack addArrangedSubview:timeCheck];
     [stack addArrangedSubview:cvCheck];
     [stack addArrangedSubview:backgroundCVCheck];
+    [stack addArrangedSubview:markerTimesCheck];
     alert.accessoryView = stack;
 
     [alert beginSheetModalForWindow:_window completionHandler:^(NSModalResponse response) {
@@ -4023,6 +4525,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         }
         if (backgroundCVCheck.state == NSControlStateValueOn) {
             options |= HDCVExportOptionBackgroundCVPlot;
+            selectedCount += 1U;
+        }
+        if (markerTimesCheck.state == NSControlStateValueOn) {
+            options |= HDCVExportOptionMarkerTimes;
             selectedCount += 1U;
         }
 
@@ -4089,11 +4595,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (backgroundSubtractEnabled) {
         NSMutableData *sourceTraceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
         memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
-        HDCVApplyPhaseAlignedBackgroundToTrace(
+        HDCVApplyFixedPhaseBaselineToTrace(
             sourceTraceData.bytes,
             trace,
             scanCount,
-            backgroundScanIndex,
             phasePeriod
         );
     }
@@ -4152,11 +4657,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             float *trace = traceData.mutableBytes;
             if (backgroundSubtractEnabled) {
                 memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
-                HDCVApplyPhaseAlignedBackgroundToTrace(
+                HDCVApplyFixedPhaseBaselineToTrace(
                     sourceTraceData.bytes,
                     trace,
                     scanCount,
-                    backgroundScanIndex,
                     phasePeriod
                 );
             }
@@ -4271,6 +4775,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
                     phasePeriod:(NSUInteger)phasePeriod
                           error:(NSError **)error
 {
+    (void)backgroundScanIndex;
     NSUInteger scanCount = loadedFile.scanCount;
     NSUInteger pointsPerScan = loadedFile.pointsPerScan;
     NSUInteger exportScanCount = HDCVPhaseSampleCountInRange(scanMinIndex, scanMaxIndex, activePhaseIndex, phasePeriod);
@@ -4297,11 +4802,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             float *trace = traceData.mutableBytes;
             if (backgroundSubtractEnabled) {
                 memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
-                HDCVApplyPhaseAlignedBackgroundToTrace(
+                HDCVApplyFixedPhaseBaselineToTrace(
                     sourceTraceData.bytes,
                     trace,
                     scanCount,
-                    backgroundScanIndex,
                     phasePeriod
                 );
             }
@@ -4346,7 +4850,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
             const float *background = NULL;
             if (backgroundSubtractEnabled) {
-                NSUInteger alignedIndex = HDCVPhaseAlignedBackgroundIndex(backgroundScanIndex, scanIndex, scanCount, phasePeriod);
+                NSUInteger alignedIndex = HDCVFixedPhaseBaselineIndexForScan(scanIndex, scanCount, phasePeriod);
                 NSNumber *key = @(alignedIndex);
                 NSData *cachedBackground = backgroundCache[key];
                 if (cachedBackground == nil) {
@@ -4374,6 +4878,48 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     return HDCVCloseCSVFile(file, url, error);
 }
 
+- (BOOL)writeMarkerTimesCSVToURL:(NSURL *)url
+                       loadedFile:(HDCVLoadedFile *)loadedFile
+             selectedScanIndexes:(NSArray<NSNumber *> *)selectedScanIndexes
+           backgroundScanIndexes:(NSArray<NSNumber *> *)backgroundScanIndexes
+                            error:(NSError **)error
+{
+    FILE *file = HDCVOpenCSVFile(url, error);
+    if (file == NULL) {
+        return NO;
+    }
+
+    fprintf(file, "CV_times_s,BG_times_s,CV_scan_index,BG_scan_index\n");
+    BOOL usesSharedBackground = (backgroundScanIndexes.count == 1U && selectedScanIndexes.count > 1U);
+    NSUInteger rowCount = usesSharedBackground ? selectedScanIndexes.count : MAX(selectedScanIndexes.count, backgroundScanIndexes.count);
+    for (NSUInteger row = 0U; row < rowCount; ++row) {
+        BOOL hasSelected = row < selectedScanIndexes.count;
+        BOOL hasBackground = usesSharedBackground ? YES : (row < backgroundScanIndexes.count);
+        NSUInteger selectedScan = hasSelected ? MIN(selectedScanIndexes[row].unsignedIntegerValue, (NSUInteger)loadedFile.scanCount - 1U) : 0U;
+        NSUInteger backgroundScan = hasBackground
+            ? MIN(backgroundScanIndexes[usesSharedBackground ? 0U : row].unsignedIntegerValue, (NSUInteger)loadedFile.scanCount - 1U)
+            : 0U;
+
+        if (hasSelected) {
+            fprintf(file, "%.9g", [loadedFile sequenceTimeSecondsAtScan:selectedScan]);
+        }
+        fprintf(file, ",");
+        if (hasBackground) {
+            fprintf(file, "%.9g", [loadedFile sequenceTimeSecondsAtScan:backgroundScan]);
+        }
+        fprintf(file, ",");
+        if (hasSelected) {
+            fprintf(file, "%lu", (unsigned long)selectedScan);
+        }
+        fprintf(file, ",");
+        if (hasBackground) {
+            fprintf(file, "%lu", (unsigned long)backgroundScan);
+        }
+        fprintf(file, "\n");
+    }
+    return HDCVCloseCSVFile(file, url, error);
+}
+
 - (void)performExportWithOptions:(HDCVExportOptions)options baseURL:(NSURL *)baseURL singleFile:(BOOL)singleFile
 {
     HDCVLoadedFile *loadedFile = _loadedFile;
@@ -4381,9 +4927,12 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         return;
     }
 
+    [self syncPrimaryMarkerArrays];
     NSUInteger selectedScanIndex = MIN(_selectedScanIndex, (NSUInteger)loadedFile.scanCount - 1U);
     NSUInteger selectedPointIndex = MIN(_selectedPointIndex, (NSUInteger)loadedFile.pointsPerScan - 1U);
     NSUInteger backgroundScanIndex = MIN(_backgroundScanIndex, (NSUInteger)loadedFile.scanCount - 1U);
+    NSArray<NSNumber *> *selectedMarkerScanIndexes = [_selectedMarkerScanIndexes copy];
+    NSArray<NSNumber *> *backgroundMarkerScanIndexes = [_backgroundMarkerScanIndexes copy];
     NSUInteger phasePeriod = MAX((NSUInteger)loadedFile.phasePeriod, 1U);
     NSUInteger activePhaseIndex = _activePhaseIndex % phasePeriod;
     BOOL backgroundSubtractEnabled = _backgroundSubtractEnabled;
@@ -4406,7 +4955,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     _exportInProgress = YES;
     _exportButton.enabled = NO;
-    _heroStatusLabel.stringValue = @"Exporting CSV data from the current FSCV plot state…";
+    _heroStatusLabel.stringValue = @"Exporting...";
     [_progressIndicator startAnimation:nil];
 
     dispatch_async(_workerQueue, ^{
@@ -4492,6 +5041,21 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             [writtenURLs addObject:url];
         }
 
+        if ((options & HDCVExportOptionMarkerTimes) != 0U) {
+            NSURL *url = HDCVExportURLForSuffix(baseURL, @"marker_times", singleFile);
+            if (![self writeMarkerTimesCSVToURL:url
+                                     loadedFile:loadedFile
+                           selectedScanIndexes:selectedMarkerScanIndexes
+                         backgroundScanIndexes:backgroundMarkerScanIndexes
+                                          error:&error]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self finishExportWithError:error writtenURLs:writtenURLs];
+                });
+                return;
+            }
+            [writtenURLs addObject:url];
+        }
+
         dispatch_async(dispatch_get_main_queue(), ^{
             [self finishExportWithError:nil writtenURLs:writtenURLs];
         });
@@ -4517,7 +5081,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
 
     NSString *fileList = [[writtenURLs valueForKey:@"lastPathComponent"] componentsJoinedByString:@", "];
-    _heroStatusLabel.stringValue = [NSString stringWithFormat:@"Export complete: %@", fileList];
+    _heroStatusLabel.stringValue = [NSString stringWithFormat:@"Exported %@", fileList];
 }
 
 - (void)loadFileAtPath:(NSString *)path
@@ -4526,7 +5090,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [self setInputControlsEnabled:NO];
     _useSelectedAsBackgroundButton.enabled = NO;
     _fileLabel.stringValue = path.lastPathComponent;
-    _heroStatusLabel.stringValue = @"Loading file, validating offsets, and preparing interactive FSCV views…";
+    _heroStatusLabel.stringValue = @"Loading...";
     [_progressIndicator startAnimation:nil];
 
     dispatch_async(_workerQueue, ^{
@@ -4565,6 +5129,12 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _selectedScanIndex = [self scanIndexNearestActivePhaseToScanIndex:loaded.scanCount / 2U];
     _selectedPointIndex = loaded.pointsPerScan / 2U;
     _backgroundScanIndex = [self scanIndexNearestActivePhaseToScanIndex:0U];
+    [_selectedMarkerScanIndexes removeAllObjects];
+    [_selectedMarkerScanIndexes addObject:@(_selectedScanIndex)];
+    [_backgroundMarkerScanIndexes removeAllObjects];
+    [_backgroundMarkerScanIndexes addObject:@(_backgroundScanIndex)];
+    _activeSelectedMarkerIndex = 0;
+    _activeBackgroundMarkerIndex = 0;
     _backgroundSubtractEnabled = NO;
     _bandpassFilterEnabled = NO;
     _heatmapXManual = NO;
@@ -4578,6 +5148,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _waveformYManual = NO;
     _backgroundSubtractSwitch.on = NO;
     _bandpassFilterSwitch.on = NO;
+    [self rebuildExtraMarkerControls];
     [self setInputControlsEnabled:YES];
 
     _heatmapView.scanCount = loaded.scanCount;
@@ -4606,10 +5177,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     _fileLabel.stringValue = [self fileSubtitleForLoadedFile:loaded filename:_pendingOpenPath.lastPathComponent];
     _heroStatusLabel.stringValue = ([self activePhasePeriod] > 1U)
-        ? [NSString stringWithFormat:@"Layout verified. Showing phase %lu of %lu; crosshairs snap to that FSCV scan family.",
+        ? [NSString stringWithFormat:@"Phase %lu/%lu",
             (unsigned long)_activePhaseIndex + 1UL,
             (unsigned long)[self activePhasePeriod]]
-        : @"Layout verified. Grab a crosshair line to move it; sequence time is used for all time axes.";
+        : @"Ready";
 }
 
 - (BOOL)copyBackgroundScan
@@ -4649,12 +5220,24 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     );
 }
 
+- (NSUInteger)fixedPlotBaselineIndexForScan:(NSUInteger)scanIndex
+{
+    if (_loadedFile == nil) {
+        return 0U;
+    }
+    return HDCVFixedPhaseBaselineIndexForScan(
+        scanIndex,
+        (NSUInteger)_loadedFile.scanCount,
+        [self activePhasePeriod]
+    );
+}
+
 - (BOOL)copyPhaseAlignedBackgroundScanForSelectedScan
 {
     if (_loadedFile == nil) {
         return NO;
     }
-    NSUInteger alignedIndex = [self phaseAlignedBackgroundScanIndexForScan:_selectedScanIndex];
+    NSUInteger alignedIndex = [self fixedPlotBaselineIndexForScan:_selectedScanIndex];
     return [_loadedFile copyScanAtIndex:(uint32_t)alignedIndex intoMutableData:_selectedPhaseBackgroundScanData min:NULL max:NULL];
 }
 
@@ -4765,12 +5348,11 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         float *trace = traceData.mutableBytes;
         if (_backgroundSubtractEnabled) {
             memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
-            HDCVApplyPhaseAlignedBackgroundToTrace(
+            HDCVApplyFixedPhaseBaselineToTrace(
                 sourceTraceData.bytes,
                 trace,
                 scanCount,
-                _backgroundScanIndex,
-                (NSUInteger)_loadedFile.phasePeriod
+                [self activePhasePeriod]
             );
         }
 
@@ -4889,7 +5471,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         const float *rawTrace = _rawPointTraceData.bytes;
         float *displayTrace = _displayPointTraceData.mutableBytes;
         for (NSUInteger i = 0U; i < scanCount; ++i) {
-            NSUInteger alignedIndex = [self phaseAlignedBackgroundScanIndexForScan:i];
+            NSUInteger alignedIndex = [self fixedPlotBaselineIndexForScan:i];
             displayTrace[i] = _backgroundSubtractEnabled ? (rawTrace[i] - rawTrace[alignedIndex]) : rawTrace[i];
         }
         if (_bandpassFilterEnabled) {
@@ -5045,7 +5627,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
                     continue;
                 }
 
-                NSUInteger backgroundIndex = [self phaseAlignedBackgroundScanIndexForScan:scanIndex];
+                NSUInteger backgroundIndex = [self fixedPlotBaselineIndexForScan:scanIndex];
                 NSData *backgroundData = _backgroundSubtractEnabled
                     ? [self cachedBackgroundScanForIndex:backgroundIndex cache:backgroundCache]
                     : nil;
@@ -5062,7 +5644,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
                 NSUInteger midpointScan = startScan + ((endScan - startScan) / 2U);
                 NSUInteger scanIndex = [self scanIndexNearestActivePhaseToScanIndex:midpointScan];
                 if ([_loadedFile copyScanAtIndex:(uint32_t)scanIndex intoMutableData:scanData min:NULL max:NULL]) {
-                    NSUInteger backgroundIndex = [self phaseAlignedBackgroundScanIndexForScan:scanIndex];
+                    NSUInteger backgroundIndex = [self fixedPlotBaselineIndexForScan:scanIndex];
                     NSData *backgroundData = _backgroundSubtractEnabled
                         ? [self cachedBackgroundScanForIndex:backgroundIndex cache:backgroundCache]
                         : nil;
@@ -5165,6 +5747,189 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     return [self timeValueForScanIndex:_selectedScanIndex];
 }
 
+- (void)syncPrimaryMarkerArrays
+{
+    if (_selectedMarkerScanIndexes.count == 0U) {
+        [_selectedMarkerScanIndexes addObject:@(_selectedScanIndex)];
+    }
+    if (_backgroundMarkerScanIndexes.count == 0U) {
+        [_backgroundMarkerScanIndexes addObject:@(_backgroundScanIndex)];
+    }
+    if (_activeSelectedMarkerIndex < 0 || (NSUInteger)_activeSelectedMarkerIndex >= _selectedMarkerScanIndexes.count) {
+        _activeSelectedMarkerIndex = 0;
+    }
+    if (_activeBackgroundMarkerIndex < 0 || (NSUInteger)_activeBackgroundMarkerIndex >= _backgroundMarkerScanIndexes.count) {
+        _activeBackgroundMarkerIndex = 0;
+    }
+    _selectedScanIndex = _selectedMarkerScanIndexes[(NSUInteger)_activeSelectedMarkerIndex].unsignedIntegerValue;
+    _backgroundScanIndex = _backgroundMarkerScanIndexes[(NSUInteger)_activeBackgroundMarkerIndex].unsignedIntegerValue;
+}
+
+- (NSArray<NSNumber *> *)timeValuesForScanIndexes:(NSArray<NSNumber *> *)scanIndexes
+{
+    NSMutableArray<NSNumber *> *times = [NSMutableArray arrayWithCapacity:scanIndexes.count];
+    for (NSNumber *scanNumber in scanIndexes) {
+        [times addObject:@([self timeValueForScanIndex:scanNumber.unsignedIntegerValue])];
+    }
+    return times;
+}
+
+- (NSUInteger)pairedBackgroundIndexForSelectedIndex:(NSUInteger)selectedIndex
+{
+    if (_backgroundMarkerScanIndexes.count == 0U) {
+        return 0U;
+    }
+    if (_backgroundMarkerScanIndexes.count == 1U) {
+        return 0U;
+    }
+    if (selectedIndex < _backgroundMarkerScanIndexes.count) {
+        return selectedIndex;
+    }
+    if (_activeBackgroundMarkerIndex >= 0 && (NSUInteger)_activeBackgroundMarkerIndex < _backgroundMarkerScanIndexes.count) {
+        return (NSUInteger)_activeBackgroundMarkerIndex;
+    }
+    return 0U;
+}
+
+- (NSUInteger)clampedActiveSelectedMarkerIndex
+{
+    if (_selectedMarkerScanIndexes.count == 0U) {
+        return 0U;
+    }
+    if (_activeSelectedMarkerIndex < 0 || (NSUInteger)_activeSelectedMarkerIndex >= _selectedMarkerScanIndexes.count) {
+        _activeSelectedMarkerIndex = 0;
+    }
+    return (NSUInteger)_activeSelectedMarkerIndex;
+}
+
+- (NSUInteger)clampedActiveBackgroundMarkerIndex
+{
+    if (_backgroundMarkerScanIndexes.count == 0U) {
+        return 0U;
+    }
+    if (_activeBackgroundMarkerIndex < 0 || (NSUInteger)_activeBackgroundMarkerIndex >= _backgroundMarkerScanIndexes.count) {
+        _activeBackgroundMarkerIndex = 0;
+    }
+    return (NSUInteger)_activeBackgroundMarkerIndex;
+}
+
+- (void)activateSelectedMarkerIndex:(NSUInteger)selectedIndex pairBackground:(BOOL)pairBackground
+{
+    if (selectedIndex >= _selectedMarkerScanIndexes.count) {
+        return;
+    }
+    _activeSelectedMarkerIndex = (NSInteger)selectedIndex;
+    _selectedScanIndex = _selectedMarkerScanIndexes[selectedIndex].unsignedIntegerValue;
+    if (pairBackground && _backgroundMarkerScanIndexes.count > 0U) {
+        NSUInteger backgroundIndex = [self pairedBackgroundIndexForSelectedIndex:selectedIndex];
+        _activeBackgroundMarkerIndex = (NSInteger)backgroundIndex;
+        _backgroundScanIndex = _backgroundMarkerScanIndexes[backgroundIndex].unsignedIntegerValue;
+    }
+}
+
+- (void)activateBackgroundMarkerIndex:(NSUInteger)backgroundIndex pairSelected:(BOOL)pairSelected
+{
+    if (backgroundIndex >= _backgroundMarkerScanIndexes.count) {
+        return;
+    }
+    _activeBackgroundMarkerIndex = (NSInteger)backgroundIndex;
+    _backgroundScanIndex = _backgroundMarkerScanIndexes[backgroundIndex].unsignedIntegerValue;
+    if (pairSelected && _backgroundMarkerScanIndexes.count > 1U && backgroundIndex < _selectedMarkerScanIndexes.count) {
+        _activeSelectedMarkerIndex = (NSInteger)backgroundIndex;
+        _selectedScanIndex = _selectedMarkerScanIndexes[backgroundIndex].unsignedIntegerValue;
+    }
+}
+
+- (void)setMarkerOfKind:(HDCVTimeMarkerKind)kind index:(NSUInteger)index scanIndex:(NSUInteger)scanIndex
+{
+    NSMutableArray<NSNumber *> *markers = (kind == HDCVTimeMarkerKindSelected)
+        ? _selectedMarkerScanIndexes
+        : _backgroundMarkerScanIndexes;
+    NSUInteger clampedScan = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
+
+    if (index >= markers.count) {
+        return;
+    }
+    markers[index] = @(clampedScan);
+    if (kind == HDCVTimeMarkerKindSelected) {
+        [self activateSelectedMarkerIndex:index pairBackground:YES];
+        _selectedScanIndex = clampedScan;
+        [self openOrRefreshAfterSelectionChangeNeedsTrace:NO];
+    } else if (kind == HDCVTimeMarkerKindBackground) {
+        [self activateBackgroundMarkerIndex:index pairSelected:YES];
+        _backgroundScanIndex = clampedScan;
+        [self copyBackgroundScan];
+        [self copyPhaseAlignedBackgroundScanForSelectedScan];
+        [self applyDisplayModes];
+        [self refreshSelectionReadout];
+    } else {
+        [self refreshPlots];
+        [self refreshControlFields];
+    }
+}
+
+- (void)addMarkerOfKind:(HDCVTimeMarkerKind)kind scanIndex:(NSUInteger)scanIndex
+{
+    NSMutableArray<NSNumber *> *markers = (kind == HDCVTimeMarkerKindSelected)
+        ? _selectedMarkerScanIndexes
+        : _backgroundMarkerScanIndexes;
+    NSUInteger clampedScan = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
+    [markers addObject:@(clampedScan)];
+    if (kind == HDCVTimeMarkerKindSelected) {
+        [self activateSelectedMarkerIndex:markers.count - 1U pairBackground:YES];
+        [self openOrRefreshAfterSelectionChangeNeedsTrace:NO];
+    } else {
+        [self activateBackgroundMarkerIndex:markers.count - 1U pairSelected:YES];
+        [self copyBackgroundScan];
+        [self copyPhaseAlignedBackgroundScanForSelectedScan];
+        [self applyDisplayModes];
+        [self refreshSelectionReadout];
+    }
+    [self rebuildExtraMarkerControls];
+    [self refreshPlots];
+    _heroStatusLabel.stringValue = (kind == HDCVTimeMarkerKindSelected)
+        ? [NSString stringWithFormat:@"CV marker %.3f s", [self timeValueForScanIndex:clampedScan]]
+        : [NSString stringWithFormat:@"BG marker %.3f s", [self timeValueForScanIndex:clampedScan]];
+}
+
+- (void)removeMarkerOfKind:(HDCVTimeMarkerKind)kind index:(NSUInteger)index
+{
+    NSMutableArray<NSNumber *> *markers = (kind == HDCVTimeMarkerKindSelected)
+        ? _selectedMarkerScanIndexes
+        : _backgroundMarkerScanIndexes;
+    if (markers.count <= 1U || index >= markers.count) {
+        NSBeep();
+        return;
+    }
+    [markers removeObjectAtIndex:index];
+
+    if (kind == HDCVTimeMarkerKindSelected) {
+        if (_activeSelectedMarkerIndex > (NSInteger)index) {
+            _activeSelectedMarkerIndex -= 1;
+        } else if (_activeSelectedMarkerIndex == (NSInteger)index) {
+            _activeSelectedMarkerIndex = 0;
+        }
+        [self activateSelectedMarkerIndex:(NSUInteger)MAX((NSInteger)0, _activeSelectedMarkerIndex) pairBackground:YES];
+        [self openOrRefreshAfterSelectionChangeNeedsTrace:NO];
+    } else {
+        if (_activeBackgroundMarkerIndex > (NSInteger)index) {
+            _activeBackgroundMarkerIndex -= 1;
+        } else if (_activeBackgroundMarkerIndex == (NSInteger)index) {
+            _activeBackgroundMarkerIndex = 0;
+        }
+        [self activateBackgroundMarkerIndex:(NSUInteger)MAX((NSInteger)0, _activeBackgroundMarkerIndex) pairSelected:YES];
+        [self copyBackgroundScan];
+        [self copyPhaseAlignedBackgroundScanForSelectedScan];
+        [self applyDisplayModes];
+        [self refreshSelectionReadout];
+    }
+    [self rebuildExtraMarkerControls];
+    [self refreshPlots];
+    _heroStatusLabel.stringValue = (kind == HDCVTimeMarkerKindSelected)
+        ? @"CV marker removed"
+        : @"BG marker removed";
+}
+
 - (NSString *)fileSubtitleForLoadedFile:(HDCVLoadedFile *)loaded filename:(NSString *)filename
 {
     double sampleRate = loaded.sampleRateHz;
@@ -5188,6 +5953,12 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         ]) {
             field.stringValue = @"";
         }
+        for (NSTextField *field in _markerTimeFields) {
+            field.stringValue = @"";
+        }
+        for (NSTextField *field in _markerBackgroundFields) {
+            field.stringValue = @"";
+        }
         return;
     }
 
@@ -5201,6 +5972,25 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _cvPointField.stringValue = pointText;
     _heatmapBackgroundField.stringValue = backgroundText;
     _timeBackgroundField.stringValue = backgroundText;
+
+    for (NSTextField *field in _markerTimeFields) {
+        HDCVTimeMarkerKind kind;
+        NSUInteger index;
+        if (HDCVDecodeMarkerFieldTag(field.tag, &kind, &index) &&
+            kind == HDCVTimeMarkerKindSelected &&
+            index < _selectedMarkerScanIndexes.count) {
+            field.stringValue = [NSString stringWithFormat:@"%.3f", [self timeValueForScanIndex:_selectedMarkerScanIndexes[index].unsignedIntegerValue]];
+        }
+    }
+    for (NSTextField *field in _markerBackgroundFields) {
+        HDCVTimeMarkerKind kind;
+        NSUInteger index;
+        if (HDCVDecodeMarkerFieldTag(field.tag, &kind, &index) &&
+            kind == HDCVTimeMarkerKindBackground &&
+            index < _backgroundMarkerScanIndexes.count) {
+            field.stringValue = [NSString stringWithFormat:@"%.3f", [self timeValueForScanIndex:_backgroundMarkerScanIndexes[index].unsignedIntegerValue]];
+        }
+    }
 }
 
 - (void)refreshPlots
@@ -5209,9 +5999,14 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         return;
     }
 
+    [self syncPrimaryMarkerArrays];
     _heatmapView.selectedScanIndex = _selectedScanIndex;
     _heatmapView.selectedPointIndex = _selectedPointIndex;
     _heatmapView.backgroundScanIndex = _backgroundScanIndex;
+    _heatmapView.selectedScanIndexes = [_selectedMarkerScanIndexes copy];
+    _heatmapView.backgroundScanIndexes = [_backgroundMarkerScanIndexes copy];
+    _heatmapView.activeSelectedMarkerIndex = _activeSelectedMarkerIndex;
+    _heatmapView.activeBackgroundMarkerIndex = _activeBackgroundMarkerIndex;
     _heatmapView.visibleScanMinIndex = _heatmapXManual
         ? (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.scanCount - 1U), _heatmapXMinManual)))
         : 0U;
@@ -5276,10 +6071,14 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _timePlotView.yMax = _timeYManual ? _timeYMaxManual : traceMax;
         _timePlotView.selectedXValue = [self selectedScanTime];
         _timePlotView.selectedYValue = ((const float *)_displayPointTraceData.bytes)[_selectedScanIndex];
+        _timePlotView.selectedXValues = [self timeValuesForScanIndexes:_selectedMarkerScanIndexes];
+        _timePlotView.activeSelectedMarkerIndex = _activeSelectedMarkerIndex;
         _timePlotView.showsSelection = YES;
         _timePlotView.showsBaseline = _backgroundSubtractEnabled;
         _timePlotView.showsBackgroundX = YES;
         _timePlotView.backgroundXValue = [self timeValueForScanIndex:_backgroundScanIndex];
+        _timePlotView.backgroundXValues = [self timeValuesForScanIndexes:_backgroundMarkerScanIndexes];
+        _timePlotView.activeBackgroundMarkerIndex = _activeBackgroundMarkerIndex;
         _timePlotView.baselineYValue = 0.0;
         [_timePlotView setNeedsDisplay:YES];
     }
@@ -5333,7 +6132,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSUInteger requestToken = ++_traceRequestToken;
     NSUInteger pointIndex = _selectedPointIndex;
     HDCVLoadedFile *loadedFile = _loadedFile;
-    _heroStatusLabel.stringValue = [NSString stringWithFormat:@"Extracting I-t trace for waveform point %lu…", (unsigned long)pointIndex];
+    _heroStatusLabel.stringValue = @"Updating trace...";
 
     dispatch_async(_workerQueue, ^{
         NSMutableData *traceData = [NSMutableData dataWithLength:(NSUInteger)loadedFile.scanCount * sizeof(float)];
@@ -5347,13 +6146,13 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
                 return;
             }
             if (!ok) {
-                self->_heroStatusLabel.stringValue = @"Failed to compute the I-t trace for the selected point.";
+                self->_heroStatusLabel.stringValue = @"Trace failed";
                 return;
             }
             self->_rawPointTraceData = traceData;
             [self applyDisplayModes];
             [self refreshSelectionReadout];
-            self->_heroStatusLabel.stringValue = @"Interactive FSCV plots are live. Grab crosshair lines to move scan, point, or background positions.";
+            self->_heroStatusLabel.stringValue = @"Ready";
         });
     });
 }
@@ -5401,7 +6200,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
     if (field == _heatmapScanField || field == _timeScanField ||
         field == _heatmapPointField || field == _cvPointField ||
-        field == _heatmapBackgroundField || field == _timeBackgroundField) {
+        field == _heatmapBackgroundField || field == _timeBackgroundField ||
+        HDCVDecodeMarkerFieldTag(field.tag, NULL, NULL)) {
         [self selectionFieldChanged:field];
     }
 }
@@ -5414,6 +6214,22 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     NSTextField *field = sender;
     double value = 0.0;
+    HDCVTimeMarkerKind markerKind;
+    NSUInteger markerIndex;
+
+    if (HDCVDecodeMarkerFieldTag(field.tag, &markerKind, &markerIndex)) {
+        if (!HDCVParseLeadingDouble(field.stringValue, &value)) {
+            [self refreshControlFields];
+            return;
+        }
+        [self setMarkerOfKind:markerKind index:markerIndex scanIndex:[self scanIndexNearestTimeValue:value]];
+        if (markerIndex > 0U) {
+            _heroStatusLabel.stringValue = (markerKind == HDCVTimeMarkerKindSelected)
+                ? [NSString stringWithFormat:@"T%lu %.3f s", (unsigned long)(markerIndex + 1U), [self timeValueForScanIndex:_selectedMarkerScanIndexes[markerIndex].unsignedIntegerValue]]
+                : [NSString stringWithFormat:@"B%lu %.3f s", (unsigned long)(markerIndex + 1U), [self timeValueForScanIndex:_backgroundMarkerScanIndexes[markerIndex].unsignedIntegerValue]];
+        }
+        return;
+    }
 
     if (field == _heatmapScanField || field == _timeScanField) {
         if (!HDCVParseLeadingDouble(field.stringValue, &value)) {
@@ -5421,6 +6237,12 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             return;
         }
         _selectedScanIndex = [self scanIndexNearestTimeValue:value];
+        _selectedMarkerScanIndexes[[self clampedActiveSelectedMarkerIndex]] = @(_selectedScanIndex);
+        if (_backgroundMarkerScanIndexes.count > 0U) {
+            NSUInteger backgroundIndex = [self pairedBackgroundIndexForSelectedIndex:[self clampedActiveSelectedMarkerIndex]];
+            _activeBackgroundMarkerIndex = (NSInteger)backgroundIndex;
+            _backgroundScanIndex = _backgroundMarkerScanIndexes[backgroundIndex].unsignedIntegerValue;
+        }
         [self openOrRefreshAfterSelectionChangeNeedsTrace:NO];
     } else if (field == _heatmapPointField || field == _cvPointField) {
         if (!HDCVParseLeadingDouble(field.stringValue, &value)) {
@@ -5435,12 +6257,15 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             return;
         }
         _backgroundScanIndex = [self scanIndexNearestTimeValue:value];
+        _backgroundMarkerScanIndexes[[self clampedActiveBackgroundMarkerIndex]] = @(_backgroundScanIndex);
+        [self activateBackgroundMarkerIndex:[self clampedActiveBackgroundMarkerIndex] pairSelected:YES];
+        _backgroundScanIndex = [self scanIndexNearestTimeValue:value];
+        _backgroundMarkerScanIndexes[[self clampedActiveBackgroundMarkerIndex]] = @(_backgroundScanIndex);
         [self copyBackgroundScan];
         [self copyPhaseAlignedBackgroundScanForSelectedScan];
         [self applyDisplayModes];
-        [self rebuildHeatmapImage];
         [self refreshSelectionReadout];
-        _heroStatusLabel.stringValue = [NSString stringWithFormat:@"Background time set to %.3f s.", [self timeValueForScanIndex:_backgroundScanIndex]];
+        _heroStatusLabel.stringValue = [NSString stringWithFormat:@"BG %.3f s", [self timeValueForScanIndex:_backgroundScanIndex]];
     }
 }
 
@@ -5518,7 +6343,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
 
     if (!isfinite(newMin) || !isfinite(newMax) || newMax <= newMin) {
-        _heroStatusLabel.stringValue = @"Axis range needs a numeric min smaller than max.";
+        _heroStatusLabel.stringValue = @"Invalid axis range";
         return NO;
     }
 
@@ -5558,6 +6383,114 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _timeXMaxManual = [self timeValueForScanIndex:maxScan];
 }
 
+- (NSMenu *)timeMarkerContextMenuForScanIndex:(NSUInteger)scanIndex
+                          selectedMarkerIndex:(NSInteger)selectedMarkerIndex
+                        backgroundMarkerIndex:(NSInteger)backgroundMarkerIndex
+{
+    if (_loadedFile == nil) {
+        return nil;
+    }
+
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    NSDictionary<NSString *, NSNumber *> *addInfo = @{@"scanIndex": @([self scanIndexNearestActivePhaseToScanIndex:scanIndex])};
+    NSMenuItem *addVertical = [menu addItemWithTitle:@"Add a vertical crosshair"
+                                              action:@selector(addVerticalMarkerFromMenu:)
+                                       keyEquivalent:@""];
+    addVertical.target = self;
+    addVertical.representedObject = addInfo;
+
+    NSMenuItem *addBackground = [menu addItemWithTitle:@"Add a background crosshair"
+                                                action:@selector(addBackgroundMarkerFromMenu:)
+                                         keyEquivalent:@""];
+    addBackground.target = self;
+    addBackground.representedObject = addInfo;
+
+    BOOL canRemoveSelected = selectedMarkerIndex >= 0 && _selectedMarkerScanIndexes.count > 1U;
+    BOOL canRemoveBackground = backgroundMarkerIndex >= 0 && _backgroundMarkerScanIndexes.count > 1U;
+    if (canRemoveSelected || canRemoveBackground) {
+        [menu addItem:NSMenuItem.separatorItem];
+    }
+    if (canRemoveSelected) {
+        NSMenuItem *removeSelected = [menu addItemWithTitle:@"Remove vertical line"
+                                                     action:@selector(removeVerticalMarkerFromMenu:)
+                                              keyEquivalent:@""];
+        removeSelected.target = self;
+        removeSelected.representedObject = @{@"index": @((NSUInteger)selectedMarkerIndex)};
+    }
+    if (canRemoveBackground) {
+        NSMenuItem *removeBackground = [menu addItemWithTitle:@"Remove background line"
+                                                       action:@selector(removeBackgroundMarkerFromMenu:)
+                                                keyEquivalent:@""];
+        removeBackground.target = self;
+        removeBackground.representedObject = @{@"index": @((NSUInteger)backgroundMarkerIndex)};
+    }
+    return menu;
+}
+
+- (void)addVerticalMarkerFromMenu:(NSMenuItem *)sender
+{
+    NSNumber *scanIndex = [sender.representedObject isKindOfClass:NSDictionary.class]
+        ? ((NSDictionary *)sender.representedObject)[@"scanIndex"]
+        : nil;
+    if (scanIndex != nil) {
+        [self addMarkerOfKind:HDCVTimeMarkerKindSelected scanIndex:scanIndex.unsignedIntegerValue];
+    }
+}
+
+- (void)addBackgroundMarkerFromMenu:(NSMenuItem *)sender
+{
+    NSNumber *scanIndex = [sender.representedObject isKindOfClass:NSDictionary.class]
+        ? ((NSDictionary *)sender.representedObject)[@"scanIndex"]
+        : nil;
+    if (scanIndex != nil) {
+        [self addMarkerOfKind:HDCVTimeMarkerKindBackground scanIndex:scanIndex.unsignedIntegerValue];
+    }
+}
+
+- (void)removeVerticalMarkerFromMenu:(NSMenuItem *)sender
+{
+    NSNumber *index = [sender.representedObject isKindOfClass:NSDictionary.class]
+        ? ((NSDictionary *)sender.representedObject)[@"index"]
+        : nil;
+    if (index != nil) {
+        [self removeMarkerOfKind:HDCVTimeMarkerKindSelected index:index.unsignedIntegerValue];
+    }
+}
+
+- (void)removeBackgroundMarkerFromMenu:(NSMenuItem *)sender
+{
+    NSNumber *index = [sender.representedObject isKindOfClass:NSDictionary.class]
+        ? ((NSDictionary *)sender.representedObject)[@"index"]
+        : nil;
+    if (index != nil) {
+        [self removeMarkerOfKind:HDCVTimeMarkerKindBackground index:index.unsignedIntegerValue];
+    }
+}
+
+- (NSMenu *)heatmapView:(HDCVHeatmapView *)view
+       menuForScanIndex:(NSUInteger)scanIndex
+    selectedMarkerIndex:(NSInteger)selectedMarkerIndex
+  backgroundMarkerIndex:(NSInteger)backgroundMarkerIndex
+{
+    (void)view;
+    return [self timeMarkerContextMenuForScanIndex:scanIndex
+                               selectedMarkerIndex:selectedMarkerIndex
+                             backgroundMarkerIndex:backgroundMarkerIndex];
+}
+
+- (NSMenu *)linePlotView:(HDCVLinePlotView *)view
+           menuForXValue:(double)xValue
+     selectedMarkerIndex:(NSInteger)selectedMarkerIndex
+   backgroundMarkerIndex:(NSInteger)backgroundMarkerIndex
+{
+    if (view != _timePlotView || _loadedFile == nil) {
+        return nil;
+    }
+    return [self timeMarkerContextMenuForScanIndex:[self scanIndexNearestTimeValue:xValue]
+                               selectedMarkerIndex:selectedMarkerIndex
+                             backgroundMarkerIndex:backgroundMarkerIndex];
+}
+
 - (void)heatmapView:(HDCVHeatmapView *)view didEditAxisTarget:(HDCVAxisEditTarget)target value:(double)value
 {
     (void)view;
@@ -5593,12 +6526,12 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _heatmapColorMaxManual = colorMax;
         _heatmapColorManual = YES;
         [self rebuildHeatmapImage];
-        _heroStatusLabel.stringValue = @"Color scale updated from the legend.";
+        _heroStatusLabel.stringValue = @"Color scale updated";
         return;
     }
 
     [self refreshPlots];
-    _heroStatusLabel.stringValue = @"Axis range updated from the plot.";
+    _heroStatusLabel.stringValue = @"Axis updated";
 }
 
 - (void)linePlotView:(HDCVLinePlotView *)view didEditAxisTarget:(HDCVAxisEditTarget)target value:(double)value
@@ -5641,7 +6574,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
 
     [self refreshPlots];
-    _heroStatusLabel.stringValue = @"Axis range updated from the plot.";
+    _heroStatusLabel.stringValue = @"Axis updated";
 }
 
 - (void)linePlotView:(HDCVLinePlotView *)view didNavigateToXMin:(double)xMin xMax:(double)xMax yMin:(double)yMin yMax:(double)yMax
@@ -5658,7 +6591,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _timeYMinManual = yMin;
         _timeYMaxManual = yMax;
         [self syncTimeRangeToHeatmap];
-        _heroStatusLabel.stringValue = @"I-t view adjusted. Use Reset View to return to automatic scaling.";
+        _heroStatusLabel.stringValue = @"I-t view adjusted";
     } else if (view == _cvPlotView) {
         _cvXManual = YES;
         _cvYManual = YES;
@@ -5666,7 +6599,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _cvXMaxManual = xMax;
         _cvYMinManual = yMin;
         _cvYMaxManual = yMax;
-        _heroStatusLabel.stringValue = @"CV view adjusted. Use Reset View to return to automatic scaling.";
+        _heroStatusLabel.stringValue = @"CV view adjusted";
     } else {
         return;
     }
@@ -5693,7 +6626,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _timeYManual = NO;
     _heatmapXManual = NO;
     [self refreshPlots];
-    _heroStatusLabel.stringValue = @"I-t view reset to automatic scaling.";
+    _heroStatusLabel.stringValue = @"I-t reset";
 }
 
 - (void)resetCVPlotView:(id)sender
@@ -5705,7 +6638,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _cvXManual = NO;
     _cvYManual = NO;
     [self refreshPlots];
-    _heroStatusLabel.stringValue = @"CV view reset to automatic scaling.";
+    _heroStatusLabel.stringValue = @"CV reset";
 }
 
 - (void)backgroundSubtractToggled:(id)sender
@@ -5718,9 +6651,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [self applyDisplayModes];
     [self rebuildHeatmapImage];
     [self refreshSelectionReadout];
-    _heroStatusLabel.stringValue = _backgroundSubtractEnabled
-        ? @"Background subtraction is enabled across the color plot, I-t plot, and CV plot."
-        : @"Background subtraction is disabled. The plots are showing raw current.";
+    _heroStatusLabel.stringValue = _backgroundSubtractEnabled ? @"BG subtraction on" : @"BG subtraction off";
 }
 
 - (void)bandpassFilterToggled:(id)sender
@@ -5733,9 +6664,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [self applyDisplayModes];
     [self rebuildHeatmapImage];
     [self refreshSelectionReadout];
-    _heroStatusLabel.stringValue = _bandpassFilterEnabled
-        ? @"Butterworth bandpass is enabled across the color plot, I-t plot, and CV plot."
-        : @"Butterworth bandpass is disabled.";
+    _heroStatusLabel.stringValue = _bandpassFilterEnabled ? @"Bandpass on" : @"Bandpass off";
 }
 
 - (void)useSelectedScanAsBackground:(id)sender
@@ -5744,45 +6673,67 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (_loadedFile == nil) {
         return;
     }
+    if (_backgroundMarkerScanIndexes.count > 0U) {
+        NSUInteger backgroundIndex = [self pairedBackgroundIndexForSelectedIndex:[self clampedActiveSelectedMarkerIndex]];
+        _activeBackgroundMarkerIndex = (NSInteger)backgroundIndex;
+        _backgroundMarkerScanIndexes[backgroundIndex] = @(_selectedScanIndex);
+    }
     _backgroundScanIndex = _selectedScanIndex;
     [self copyBackgroundScan];
     [self copyPhaseAlignedBackgroundScanForSelectedScan];
     [self applyDisplayModes];
-    [self rebuildHeatmapImage];
     [self refreshSelectionReadout];
-    _heroStatusLabel.stringValue = [NSString stringWithFormat:@"Background scan updated to the selected scan %lu.", (unsigned long)_backgroundScanIndex];
+    _heroStatusLabel.stringValue = @"BG = selected scan";
 }
 
-- (void)heatmapView:(HDCVHeatmapView *)view didDragSelectionScanIndex:(NSUInteger)scanIndex pointIndex:(NSUInteger)pointIndex updateScan:(BOOL)updateScan updatePoint:(BOOL)updatePoint
+- (void)heatmapView:(HDCVHeatmapView *)view didDragSelectionScanIndex:(NSUInteger)scanIndex pointIndex:(NSUInteger)pointIndex updateScan:(BOOL)updateScan updatePoint:(BOOL)updatePoint markerIndex:(NSInteger)markerIndex
 {
     (void)view;
     if (_loadedFile == nil) {
         return;
     }
+    if (updateScan && markerIndex >= 0 && (NSUInteger)markerIndex < _selectedMarkerScanIndexes.count) {
+        _activeSelectedMarkerIndex = markerIndex;
+    }
     if (updateScan) {
-        _selectedScanIndex = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, _loadedFile.scanCount - 1U)];
+        _selectedScanIndex = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
+        _selectedMarkerScanIndexes[[self clampedActiveSelectedMarkerIndex]] = @(_selectedScanIndex);
+    } else {
+        [self activateSelectedMarkerIndex:[self clampedActiveSelectedMarkerIndex] pairBackground:YES];
+    }
+    if (_backgroundMarkerScanIndexes.count > 0U) {
+        NSUInteger backgroundIndex = [self pairedBackgroundIndexForSelectedIndex:[self clampedActiveSelectedMarkerIndex]];
+        _activeBackgroundMarkerIndex = (NSInteger)backgroundIndex;
+        _backgroundScanIndex = _backgroundMarkerScanIndexes[backgroundIndex].unsignedIntegerValue;
     }
     if (updatePoint) {
-        _selectedPointIndex = MIN(pointIndex, _loadedFile.pointsPerScan - 1U);
+        _selectedPointIndex = MIN(pointIndex, (NSUInteger)_loadedFile.pointsPerScan - 1U);
     }
     [self openOrRefreshAfterSelectionChangeNeedsTrace:updatePoint];
 }
 
-- (void)heatmapView:(HDCVHeatmapView *)view didDragBackgroundScanIndex:(NSUInteger)scanIndex
+- (void)heatmapView:(HDCVHeatmapView *)view didDragBackgroundScanIndex:(NSUInteger)scanIndex markerIndex:(NSInteger)markerIndex
 {
     (void)view;
     if (_loadedFile == nil) {
         return;
     }
-    _backgroundScanIndex = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, _loadedFile.scanCount - 1U)];
+    if (markerIndex >= 0 && (NSUInteger)markerIndex < _backgroundMarkerScanIndexes.count) {
+        _activeBackgroundMarkerIndex = markerIndex;
+        if (_backgroundMarkerScanIndexes.count > 1U && (NSUInteger)markerIndex < _selectedMarkerScanIndexes.count) {
+            _activeSelectedMarkerIndex = markerIndex;
+            _selectedScanIndex = _selectedMarkerScanIndexes[(NSUInteger)markerIndex].unsignedIntegerValue;
+        }
+    }
+    _backgroundScanIndex = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
+    _backgroundMarkerScanIndexes[[self clampedActiveBackgroundMarkerIndex]] = @(_backgroundScanIndex);
     [self copyBackgroundScan];
     [self copyPhaseAlignedBackgroundScanForSelectedScan];
     [self applyDisplayModes];
-    [self rebuildHeatmapImage];
     [self refreshSelectionReadout];
 }
 
-- (void)linePlotView:(HDCVLinePlotView *)view didDragXValue:(double)xValue yValue:(double)yValue target:(HDCVLinePlotDragTarget)target
+- (void)linePlotView:(HDCVLinePlotView *)view didDragXValue:(double)xValue yValue:(double)yValue target:(HDCVLinePlotDragTarget)target markerIndex:(NSInteger)markerIndex
 {
     if (_loadedFile == nil) {
         return;
@@ -5791,14 +6742,30 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (view == _timePlotView) {
         NSUInteger bestScanIndex = [self scanIndexNearestTimeValue:xValue];
         if (target == HDCVLinePlotDragTargetBackgroundX) {
+            if (markerIndex >= 0 && (NSUInteger)markerIndex < _backgroundMarkerScanIndexes.count) {
+                _activeBackgroundMarkerIndex = markerIndex;
+                if (_backgroundMarkerScanIndexes.count > 1U && (NSUInteger)markerIndex < _selectedMarkerScanIndexes.count) {
+                    _activeSelectedMarkerIndex = markerIndex;
+                    _selectedScanIndex = _selectedMarkerScanIndexes[(NSUInteger)markerIndex].unsignedIntegerValue;
+                }
+            }
             _backgroundScanIndex = bestScanIndex;
+            _backgroundMarkerScanIndexes[[self clampedActiveBackgroundMarkerIndex]] = @(_backgroundScanIndex);
             [self copyBackgroundScan];
             [self copyPhaseAlignedBackgroundScanForSelectedScan];
             [self applyDisplayModes];
-            [self rebuildHeatmapImage];
             [self refreshSelectionReadout];
         } else {
+            if (markerIndex >= 0 && (NSUInteger)markerIndex < _selectedMarkerScanIndexes.count) {
+                _activeSelectedMarkerIndex = markerIndex;
+            }
             _selectedScanIndex = bestScanIndex;
+            _selectedMarkerScanIndexes[[self clampedActiveSelectedMarkerIndex]] = @(_selectedScanIndex);
+            if (_backgroundMarkerScanIndexes.count > 0U) {
+                NSUInteger backgroundIndex = [self pairedBackgroundIndexForSelectedIndex:[self clampedActiveSelectedMarkerIndex]];
+                _activeBackgroundMarkerIndex = (NSInteger)backgroundIndex;
+                _backgroundScanIndex = _backgroundMarkerScanIndexes[backgroundIndex].unsignedIntegerValue;
+            }
             [self openOrRefreshAfterSelectionChangeNeedsTrace:NO];
         }
     } else if (view == _cvPlotView) {

@@ -11,6 +11,8 @@
   <string>@MACOSX_BUNDLE_EXECUTABLE_NAME@</string>
   <key>CFBundleIdentifier</key>
   <string>@MACOSX_BUNDLE_GUI_IDENTIFIER@</string>
+  <key>CFBundleIconFile</key>
+  <string>@MACOSX_BUNDLE_ICON_FILE@</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -28,19 +30,47 @@
       <array>
         <string>hdcv</string>
       </array>
+      <key>CFBundleTypeIconFile</key>
+      <string>@MACOSX_BUNDLE_ICON_FILE@</string>
       <key>CFBundleTypeName</key>
       <string>HDCV FSCV File</string>
       <key>CFBundleTypeRole</key>
       <string>Viewer</string>
       <key>LSHandlerRank</key>
       <string>Owner</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>com.tozturk.hdcvviewer.hdcv</string>
+      </array>
     </dict>
   </array>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.medical</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>@CMAKE_OSX_DEPLOYMENT_TARGET@</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.data</string>
+      </array>
+      <key>UTTypeDescription</key>
+      <string>HDCV FSCV File</string>
+      <key>UTTypeIdentifier</key>
+      <string>com.tozturk.hdcvviewer.hdcv</string>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>hdcv</string>
+        </array>
+      </dict>
+    </dict>
+  </array>
 </dict>
 </plist>

@@ -1,10 +1,13 @@
 # Build artifacts
 build/
+build-package*/
+dist/
 *.o
 *.a
 *.so
 *.dylib
 *.dll
+*.mex*
 
 # CMake
 CMakeFiles/
@@ -51,4 +54,7 @@ ehthumbs.db
 # Logs
 *.log
 
+# Images
 *.png
+./icons/
+*.svg
