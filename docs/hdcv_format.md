@@ -88,6 +88,8 @@ A representative header suffix contains:
 
 The first waveform block header appears to begin before the metadata NUL boundary, so only its tail is plainly visible after `metadata_end`.
 
+Some valid WaveNeuro files have misleading `Wavespecs.<size(s)>` metadata. For example, a file may declare `3` but also include numbered entries through `Wavespecs 3...` and physically store four contiguous full-cycle waveform templates. The reader therefore uses the larger of the declared size and the numbered WaveSpec entries, then keeps detecting contiguous waveform-template blocks before locating the current matrix.
+
 ## Current Matrix Block
 
 ### Verified properties

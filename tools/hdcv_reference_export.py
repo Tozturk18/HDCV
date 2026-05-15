@@ -58,11 +58,21 @@ def get_int(metadata: Dict[str, Dict[str, str]], section: str, key: str) -> int:
     return int(round(float(metadata[section][key])))
 
 
+def infer_wavespec_count(metadata: Dict[str, Dict[str, str]]) -> int:
+    declared = get_int(metadata, "Setup Cluster", "Wavespecs.<size(s)>")
+    numbered = [
+        int(key.split(".", 1)[0].split()[1]) + 1
+        for key in metadata["Setup Cluster"]
+        if key.startswith("Wavespecs ") and "." in key and key.split(".", 1)[0].split()[1].isdigit()
+    ]
+    return max([declared, *numbered])
+
+
 def find_layout(raw: bytes, metadata: Dict[str, Dict[str, str]], metadata_end: int) -> Dict[str, object]:
     sample_rate = get_float(metadata, "Core Cluster", "SampRate")
     cvf = get_float(metadata, "Core Cluster", "CVF")
     points_per_scan = get_int(metadata, "Setup Cluster", "Wavespecs 0.Data points per scan")
-    waveform_count = get_int(metadata, "Setup Cluster", "Wavespecs.<size(s)>")
+    waveform_count = infer_wavespec_count(metadata)
     run_count = get_int(metadata, "Experiment control cluster", "Runs")
     run_duration_s = get_float(metadata, "Experiment control cluster", "Run duration")
     delay_between_runs_s = get_float(metadata, "Experiment control cluster", "Delay between runs")

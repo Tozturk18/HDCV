@@ -117,10 +117,40 @@ static double compute_stddev(const float *values, size_t count)
     return sqrt(var);
 }
 
+static uint32_t infer_numbered_wavespec_count(const hdcv_metadata *metadata)
+{
+    size_t i;
+    uint32_t count = 0U;
+
+    for (i = 0U; i < metadata->count; ++i) {
+        const hdcv_metadata_entry *entry = &metadata->entries[i];
+        const char *prefix = "Wavespecs ";
+        size_t prefix_len = strlen(prefix);
+        char *endptr = NULL;
+        unsigned long index;
+
+        if (strcmp(entry->section, "Setup Cluster") != 0 ||
+            strncmp(entry->key, prefix, prefix_len) != 0) {
+            continue;
+        }
+
+        index = strtoul(entry->key + prefix_len, &endptr, 10);
+        if (endptr == entry->key + prefix_len || *endptr != '.') {
+            continue;
+        }
+        if (index + 1UL > (unsigned long)count && index < HDCV_MAX_WAVEFORMS) {
+            count = (uint32_t)(index + 1UL);
+        }
+    }
+
+    return count;
+}
+
 static int metadata_to_layout(hdcv_reader *reader)
 {
     double temp = 0.0;
     uint32_t u32 = 0U;
+    uint32_t numbered_wavespec_count;
     hdcv_layout *layout = &reader->layout;
     uint64_t metadata_start_offset = layout->metadata_start_offset;
     uint64_t metadata_end_offset = layout->metadata_end_offset;
@@ -139,6 +169,17 @@ static int metadata_to_layout(hdcv_reader *reader)
     }
     if (!hdcv_metadata_get_uint32(&reader->metadata, "Setup Cluster", "Wavespecs.<size(s)>", &layout->waveform_count)) {
         layout->waveform_count = 1U;
+    }
+    numbered_wavespec_count = infer_numbered_wavespec_count(&reader->metadata);
+    if (numbered_wavespec_count > layout->waveform_count) {
+        layout->waveform_count = numbered_wavespec_count;
+    }
+    if (layout->waveform_count == 0U) {
+        layout->waveform_count = 1U;
+    }
+    if (layout->waveform_count > HDCV_MAX_WAVEFORMS) {
+        hdcv_set_error(reader->error, sizeof(reader->error), "Metadata declares too many waveform blocks.");
+        return 0;
     }
     if (!hdcv_metadata_get_uint32(&reader->metadata, "Setup Cluster", "Wavespecs 0.Data points per scan", &layout->points_per_scan)) {
         hdcv_set_error(reader->error, sizeof(reader->error), "Metadata is missing Setup Cluster/Wavespecs 0.Data points per scan.");
@@ -181,6 +222,7 @@ static int locate_waveform_blocks(hdcv_reader *reader)
     uint64_t off;
     uint64_t count_offset = 0U;
     uint32_t i;
+    uint32_t found_count;
     int found = 0;
 
     search_start = layout->metadata_end_offset;
@@ -245,6 +287,34 @@ static int locate_waveform_blocks(hdcv_reader *reader)
             return 0;
         }
     }
+
+    found_count = layout->waveform_count;
+    while (found_count < HDCV_MAX_WAVEFORMS) {
+        uint64_t prev_end = layout->wave_data_offsets[found_count - 1U] + layout->waveform_block_bytes;
+        uint64_t window_end = prev_end + 256U;
+        int found_next = 0;
+        if (window_end > size) {
+            window_end = size;
+        }
+        for (off = prev_end + 8U; off + 4U <= window_end; ++off) {
+            if (hdcv_read_be_u32(data + off) == layout->waveform_full_points) {
+                double dt = hdcv_read_be_f64(data + off - 8U);
+                if (safe_fabs_diff(dt, layout->sample_period_s) <= 1.0e-12) {
+                    uint64_t data_offset = off + 4U;
+                    if (data_offset + layout->waveform_block_bytes <= size) {
+                        layout->wave_data_offsets[found_count] = data_offset;
+                        found_count += 1U;
+                        found_next = 1;
+                    }
+                    break;
+                }
+            }
+        }
+        if (!found_next) {
+            break;
+        }
+    }
+    layout->waveform_count = found_count;
 
     return 1;
 }
