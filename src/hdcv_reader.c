@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,11 @@
 typedef struct {
     uint64_t count_offset;
     uint64_t data_offset;
-    uint32_t scan_count;
+    uint32_t row_count;
+    uint32_t header_samples_per_channel;
+    uint32_t header_channel_count;
+    uint32_t header_points_per_scan;
+    int header_matches_channels;
     double score;
 } current_candidate;
 
@@ -151,6 +156,8 @@ static int metadata_to_layout(hdcv_reader *reader)
     double temp = 0.0;
     uint32_t u32 = 0U;
     uint32_t numbered_wavespec_count;
+    uint32_t declared_channel_count;
+    uint32_t expected_waveform_count;
     hdcv_layout *layout = &reader->layout;
     uint64_t metadata_start_offset = layout->metadata_start_offset;
     uint64_t metadata_end_offset = layout->metadata_end_offset;
@@ -167,20 +174,32 @@ static int metadata_to_layout(hdcv_reader *reader)
         hdcv_set_error(reader->error, sizeof(reader->error), "Metadata is missing Core Cluster/CVF.");
         return 0;
     }
-    if (!hdcv_metadata_get_uint32(&reader->metadata, "Setup Cluster", "Wavespecs.<size(s)>", &layout->waveform_count)) {
-        layout->waveform_count = 1U;
+    if (!hdcv_metadata_get_uint32(&reader->metadata, "Setup Cluster", "Wavespecs.<size(s)>", &declared_channel_count)) {
+        declared_channel_count = 1U;
     }
     numbered_wavespec_count = infer_numbered_wavespec_count(&reader->metadata);
-    if (numbered_wavespec_count > layout->waveform_count) {
-        layout->waveform_count = numbered_wavespec_count;
+    if (declared_channel_count == 0U) {
+        declared_channel_count = 1U;
     }
-    if (layout->waveform_count == 0U) {
-        layout->waveform_count = 1U;
+    if (declared_channel_count > HDCV_MAX_WAVEFORMS) {
+        hdcv_set_error(reader->error, sizeof(reader->error), "Metadata declares too many channels.");
+        return 0;
     }
-    if (layout->waveform_count > HDCV_MAX_WAVEFORMS) {
+    layout->declared_channel_count = declared_channel_count;
+    layout->numbered_wavespec_count = numbered_wavespec_count;
+    layout->channel_count = declared_channel_count;
+
+    expected_waveform_count = numbered_wavespec_count > declared_channel_count
+        ? numbered_wavespec_count
+        : declared_channel_count;
+    if (expected_waveform_count == 0U) {
+        expected_waveform_count = 1U;
+    }
+    if (expected_waveform_count > HDCV_MAX_WAVEFORMS) {
         hdcv_set_error(reader->error, sizeof(reader->error), "Metadata declares too many waveform blocks.");
         return 0;
     }
+    layout->waveform_count = expected_waveform_count;
     if (!hdcv_metadata_get_uint32(&reader->metadata, "Setup Cluster", "Wavespecs 0.Data points per scan", &layout->points_per_scan)) {
         hdcv_set_error(reader->error, sizeof(reader->error), "Metadata is missing Setup Cluster/Wavespecs 0.Data points per scan.");
         return 0;
@@ -207,6 +226,17 @@ static int metadata_to_layout(hdcv_reader *reader)
         u32 = (uint32_t)llround(layout->run_duration_s * layout->cvf_hz);
         if (u32 > 0U) {
             layout->scans_per_run = u32;
+        }
+    }
+    for (u32 = 0U; u32 < layout->channel_count; ++u32) {
+        char key[64];
+        const char *name;
+        (void)snprintf(key, sizeof(key), "Wavespecs %" PRIu32 ".Name", u32);
+        name = hdcv_metadata_get(&reader->metadata, "Setup Cluster", key);
+        if (name != NULL && name[0] != '\0') {
+            (void)snprintf(layout->channel_names[u32], sizeof(layout->channel_names[u32]), "%s", name);
+        } else {
+            (void)snprintf(layout->channel_names[u32], sizeof(layout->channel_names[u32]), "Channel %" PRIu32, u32 + 1U);
         }
     }
     return 1;
@@ -323,7 +353,8 @@ static double score_current_candidate(
     const hdcv_reader *reader,
     uint64_t data_offset,
     uint32_t rows,
-    uint32_t expected_total_scans
+    uint32_t expected_total_rows,
+    int header_matches_channels
 )
 {
     const uint8_t *src;
@@ -357,12 +388,17 @@ static double score_current_candidate(
 
     score += corr * 1000.0;
     score += fmin(std0, 1000.0) + fmin(std1, 1000.0);
-    if (expected_total_scans > 0U) {
-        if (rows == expected_total_scans) {
+    if (expected_total_rows > 0U) {
+        if (rows == expected_total_rows) {
             score += 10000.0;
         } else {
-            score -= fabs((double)rows - (double)expected_total_scans) * 10.0;
+            score -= fabs((double)rows - (double)expected_total_rows) * 10.0;
         }
+    }
+    if (header_matches_channels) {
+        score += 20000.0;
+    } else if (reader->layout.channel_count > 0U && rows % reader->layout.channel_count == 0U) {
+        score += 5000.0;
     }
     if (std0 < 1.0e-6 || std1 < 1.0e-6) {
         score -= 5000.0;
@@ -382,15 +418,11 @@ static int locate_current_matrix(hdcv_reader *reader)
     uint64_t search_end = last_wave_end + 512U;
     uint64_t off;
     uint64_t row_bytes = (uint64_t)layout->points_per_scan * 4U;
-    uint32_t expected_total_scans = 0U;
+    uint32_t expected_total_rows = 0U;
     current_candidate best;
     int have_best = 0;
 
     memset(&best, 0, sizeof(best));
-
-    if (layout->has_experiment_timing && layout->scans_per_run > 0U && layout->run_count > 0U) {
-        expected_total_scans = layout->scans_per_run * layout->run_count;
-    }
 
     if (search_end > size) {
         search_end = size;
@@ -403,6 +435,7 @@ static int locate_current_matrix(hdcv_reader *reader)
         if (hdcv_read_be_u32(data + off) != layout->points_per_scan) {
             continue;
         }
+        memset(&candidate, 0, sizeof(candidate));
         data_offset = off + 4U;
         if (data_offset >= size) {
             continue;
@@ -413,8 +446,25 @@ static int locate_current_matrix(hdcv_reader *reader)
         }
         candidate.count_offset = off;
         candidate.data_offset = data_offset;
-        candidate.scan_count = (uint32_t)(remaining / row_bytes);
-        candidate.score = score_current_candidate(reader, data_offset, candidate.scan_count, expected_total_scans);
+        candidate.row_count = (uint32_t)(remaining / row_bytes);
+        if (data_offset >= 12U) {
+            candidate.header_samples_per_channel = hdcv_read_be_u32(data + data_offset - 12U);
+            candidate.header_channel_count = hdcv_read_be_u32(data + data_offset - 8U);
+            candidate.header_points_per_scan = hdcv_read_be_u32(data + data_offset - 4U);
+            candidate.header_matches_channels =
+                candidate.header_points_per_scan == layout->points_per_scan &&
+                candidate.header_samples_per_channel > 0U &&
+                candidate.header_channel_count > 0U &&
+                candidate.header_samples_per_channel * candidate.header_channel_count == candidate.row_count &&
+                candidate.header_channel_count == layout->channel_count;
+        }
+        candidate.score = score_current_candidate(
+            reader,
+            data_offset,
+            candidate.row_count,
+            expected_total_rows,
+            candidate.header_matches_channels
+        );
         candidate.score -= (double)(data_offset - last_wave_end) * 0.05;
 
         if (!have_best || candidate.score > best.score) {
@@ -432,7 +482,8 @@ static int locate_current_matrix(hdcv_reader *reader)
     layout->current_header_size_bytes = best.data_offset - last_wave_end;
     layout->current_matrix_offset = best.data_offset;
     layout->current_matrix_bytes = size - best.data_offset;
-    layout->scan_count = best.scan_count;
+    layout->current_matrix_row_count = best.row_count;
+    layout->scan_count = best.row_count;
 
     if (layout->current_header_size_bytes > HDCV_MAX_HEADER_TAIL) {
         layout->current_header_tail_len = HDCV_MAX_HEADER_TAIL;
@@ -446,26 +497,31 @@ static int locate_current_matrix(hdcv_reader *reader)
         memcpy(layout->current_header_tail, data + layout->current_header_offset, layout->current_header_tail_len);
     }
 
-    if (layout->current_header_size_bytes >= 12U) {
-        uint64_t header_end = layout->current_matrix_offset;
-        uint32_t header_scans_per_run = hdcv_read_be_u32(data + header_end - 12U);
-        uint32_t header_run_count = hdcv_read_be_u32(data + header_end - 8U);
-        uint32_t header_points = hdcv_read_be_u32(data + header_end - 4U);
-        if (header_points == layout->points_per_scan &&
-            header_scans_per_run > 0U &&
-            header_run_count > 0U &&
-            header_scans_per_run * header_run_count == layout->scan_count) {
-            layout->scans_per_run = header_scans_per_run;
-            layout->run_count = header_run_count;
-            layout->has_run_structure = 1;
+    if (best.header_points_per_scan == layout->points_per_scan &&
+        best.header_samples_per_channel > 0U &&
+        best.header_channel_count > 0U &&
+        best.header_samples_per_channel * best.header_channel_count == best.row_count) {
+        if (layout->declared_channel_count == 0U || layout->declared_channel_count == 1U) {
+            layout->channel_count = best.header_channel_count;
+        }
+        if (best.header_channel_count == layout->channel_count) {
+            layout->samples_per_channel = best.header_samples_per_channel;
         }
     }
 
+    if (layout->samples_per_channel == 0U) {
+        if (layout->channel_count > 0U && layout->scan_count % layout->channel_count == 0U) {
+            layout->samples_per_channel = layout->scan_count / layout->channel_count;
+        } else {
+            layout->samples_per_channel = layout->scan_count;
+            layout->channel_count = 1U;
+        }
+    }
     if (!layout->has_run_structure &&
         layout->has_experiment_timing &&
         layout->scans_per_run > 0U &&
         layout->run_count > 0U &&
-        layout->scans_per_run * layout->run_count == layout->scan_count) {
+        layout->scans_per_run * layout->run_count == layout->samples_per_channel) {
         layout->has_run_structure = 1;
     }
 
@@ -603,11 +659,30 @@ void hdcv_reader_close(hdcv_reader *reader)
 
 int hdcv_reader_copy_voltage(const hdcv_reader *reader, float *dst, size_t count)
 {
+    return hdcv_reader_copy_voltage_for_channel(reader, 0U, dst, count);
+}
+
+int hdcv_reader_copy_voltage_for_channel(
+    const hdcv_reader *reader,
+    uint32_t channel_index,
+    float *dst,
+    size_t count
+)
+{
     if (count < reader->layout.points_per_scan) {
         return 0;
     }
+    if (reader->layout.waveform_count == 0U) {
+        return 0;
+    }
+    if (channel_index >= reader->layout.channel_count) {
+        channel_index = 0U;
+    }
+    if (channel_index >= reader->layout.waveform_count) {
+        channel_index = 0U;
+    }
     hdcv_copy_be_f32_array(
-        reader->mapped.data + reader->layout.first_wave_data_offset,
+        reader->mapped.data + reader->layout.wave_data_offsets[channel_index],
         dst,
         reader->layout.points_per_scan
     );
@@ -627,6 +702,26 @@ int hdcv_reader_copy_scan(const hdcv_reader *reader, uint32_t scan_index, float 
     offset = reader->layout.current_matrix_offset + ((uint64_t)scan_index * row_bytes);
     hdcv_copy_be_f32_array(reader->mapped.data + offset, dst, reader->layout.points_per_scan);
     return 1;
+}
+
+int hdcv_reader_copy_channel_sample(
+    const hdcv_reader *reader,
+    uint32_t channel_index,
+    uint32_t sample_index,
+    float *dst,
+    size_t count
+)
+{
+    if (sample_index >= reader->layout.samples_per_channel ||
+        channel_index >= reader->layout.channel_count) {
+        return 0;
+    }
+    return hdcv_reader_copy_scan(
+        reader,
+        hdcv_reader_row_index_for_channel_sample(reader, channel_index, sample_index),
+        dst,
+        count
+    );
 }
 
 int hdcv_reader_copy_scan_points(
@@ -690,20 +785,104 @@ double hdcv_reader_within_scan_time_s(const hdcv_reader *reader, uint32_t point_
     return (double)point_index * reader->layout.sample_period_s;
 }
 
+uint32_t hdcv_reader_row_index_for_channel_sample(
+    const hdcv_reader *reader,
+    uint32_t channel_index,
+    uint32_t sample_index
+)
+{
+    uint32_t channel_count = reader->layout.channel_count == 0U ? 1U : reader->layout.channel_count;
+    uint64_t row_index;
+
+    if (channel_index >= channel_count) {
+        channel_index = 0U;
+    }
+    if (reader->layout.samples_per_channel > 0U && sample_index >= reader->layout.samples_per_channel) {
+        sample_index = reader->layout.samples_per_channel - 1U;
+    }
+    row_index = ((uint64_t)sample_index * channel_count) + channel_index;
+    if (reader->layout.scan_count > 0U && row_index >= reader->layout.scan_count) {
+        return reader->layout.scan_count - 1U;
+    }
+    return (uint32_t)row_index;
+}
+
+uint32_t hdcv_reader_sample_index_for_row(const hdcv_reader *reader, uint32_t row_index)
+{
+    uint32_t channel_count = reader->layout.channel_count == 0U ? 1U : reader->layout.channel_count;
+    if (reader->layout.scan_count > 0U && row_index >= reader->layout.scan_count) {
+        row_index = reader->layout.scan_count - 1U;
+    }
+    return row_index / channel_count;
+}
+
+uint32_t hdcv_reader_channel_index_for_row(const hdcv_reader *reader, uint32_t row_index)
+{
+    uint32_t channel_count = reader->layout.channel_count == 0U ? 1U : reader->layout.channel_count;
+    if (reader->layout.scan_count > 0U && row_index >= reader->layout.scan_count) {
+        row_index = reader->layout.scan_count - 1U;
+    }
+    return row_index % channel_count;
+}
+
+uint32_t hdcv_reader_nearest_row_for_channel_time(
+    const hdcv_reader *reader,
+    uint32_t channel_index,
+    double time_s
+)
+{
+    double raw_sample;
+    uint32_t sample_index;
+
+    if (reader->layout.samples_per_channel == 0U || !isfinite(time_s) || time_s < 0.0) {
+        sample_index = 0U;
+    } else {
+        raw_sample = round(time_s * reader->layout.cvf_hz);
+        if (raw_sample < 0.0) {
+            raw_sample = 0.0;
+        }
+        if (raw_sample > (double)(reader->layout.samples_per_channel - 1U)) {
+            raw_sample = (double)(reader->layout.samples_per_channel - 1U);
+        }
+        sample_index = (uint32_t)raw_sample;
+    }
+    return hdcv_reader_row_index_for_channel_sample(reader, channel_index, sample_index);
+}
+
+double hdcv_reader_sample_time_sequence_s(const hdcv_reader *reader, uint32_t sample_index)
+{
+    if (reader->layout.samples_per_channel > 0U && sample_index >= reader->layout.samples_per_channel) {
+        sample_index = reader->layout.samples_per_channel - 1U;
+    }
+    return (double)sample_index * reader->layout.scan_interval_s;
+}
+
 double hdcv_reader_scan_time_sequence_s(const hdcv_reader *reader, uint32_t scan_index)
 {
-    return (double)scan_index * reader->layout.scan_interval_s;
+    return hdcv_reader_sample_time_sequence_s(reader, hdcv_reader_sample_index_for_row(reader, scan_index));
 }
 
 double hdcv_reader_scan_time_experiment_s(const hdcv_reader *reader, uint32_t scan_index)
 {
+    uint32_t sample_index = hdcv_reader_sample_index_for_row(reader, scan_index);
     if (reader->layout.has_run_structure &&
         reader->layout.has_experiment_timing &&
         reader->layout.scans_per_run > 0U) {
-        uint32_t run_index = scan_index / reader->layout.scans_per_run;
-        uint32_t scan_in_run = scan_index % reader->layout.scans_per_run;
+        uint32_t run_index = sample_index / reader->layout.scans_per_run;
+        uint32_t scan_in_run = sample_index % reader->layout.scans_per_run;
         double run_block = reader->layout.run_duration_s + reader->layout.delay_between_runs_s;
         return ((double)run_index * run_block) + ((double)scan_in_run * reader->layout.scan_interval_s);
     }
     return hdcv_reader_scan_time_sequence_s(reader, scan_index);
+}
+
+const char *hdcv_reader_channel_name(const hdcv_reader *reader, uint32_t channel_index)
+{
+    if (reader->layout.channel_count == 0U || channel_index >= reader->layout.channel_count) {
+        channel_index = 0U;
+    }
+    if (reader->layout.channel_names[channel_index][0] == '\0') {
+        return "Channel";
+    }
+    return reader->layout.channel_names[channel_index];
 }

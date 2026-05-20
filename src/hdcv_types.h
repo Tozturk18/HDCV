@@ -6,6 +6,7 @@
 
 #define HDCV_ERROR_MAX 256
 #define HDCV_MAX_WAVEFORMS 64
+#define HDCV_MAX_CHANNEL_NAME 64
 #define HDCV_MAX_HEADER_TAIL 128
 
 typedef struct {
@@ -39,8 +40,15 @@ typedef struct {
     uint64_t current_matrix_offset;
     uint64_t current_matrix_bytes;
     uint32_t waveform_full_points;
+    /* Physical full-cycle waveform-template blocks used to locate the matrix. */
     uint32_t waveform_count;
+    uint32_t declared_channel_count;
+    uint32_t numbered_wavespec_count;
+    uint32_t channel_count;
+    uint32_t samples_per_channel;
+    uint32_t current_matrix_row_count;
     uint32_t points_per_scan;
+    /* Compatibility alias for current_matrix_row_count. Matrix rows are interleaved by channel. */
     uint32_t scan_count;
     uint32_t scans_per_run;
     uint32_t run_count;
@@ -56,6 +64,7 @@ typedef struct {
     int has_voltage_bounds;
     int has_run_structure;
     int has_experiment_timing;
+    char channel_names[HDCV_MAX_WAVEFORMS][HDCV_MAX_CHANNEL_NAME];
     unsigned char current_header_tail[HDCV_MAX_HEADER_TAIL];
     size_t current_header_tail_len;
 } hdcv_layout;

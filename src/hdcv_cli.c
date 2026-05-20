@@ -31,7 +31,9 @@ typedef struct {
 typedef struct {
     const char *out_dir;
     const char *prefix;
-    uint32_t phase_index;
+    uint32_t channel_index;
+    const char *channel_spec;
+    int channel_spec_zero_based;
     int background_subtract;
     int bandpass;
     double background_time_s;
@@ -51,8 +53,8 @@ static void usage(FILE *stream)
     fputs("  hdcv <file.hdcv> --info [--json]\n", stream);
     fputs("  hdcv <file.hdcv> --cv 100,200,300 [--bg-time 50 --bg-subtract] [--bandpass] [--out exports]\n", stream);
     fputs("  hdcv <file.hdcv> --it 0.65 [--bg-time 50 --bg-subtract] [--bandpass] [--out exports]\n", stream);
-    fputs("  hdcv <file.hdcv> --color [--time-range 100:300] [--point-range 0:1500] [--out exports]\n", stream);
-    fputs("  hdcv <file.hdcv> -cv [100, 200, 300] --bg-cv 50 [--phase 0]\n", stream);
+    fputs("  hdcv <file.hdcv> --color [--channel 1|Ramp0] [--time-range 100:300] [--point-range 0:1500] [--out exports]\n", stream);
+    fputs("  hdcv <file.hdcv> -cv [100, 200, 300] --bg-cv 50 [--channel 1]\n", stream);
     fputs("  hdcv <file.hdcv> --cv 100 --stdout\n", stream);
     fputs("  hdcv <file.hdcv> --it 0.65 --stdout\n", stream);
     fputs("  hdcv --install-command [--install-destination /path/to/hdcv]\n", stream);
@@ -525,39 +527,55 @@ static int output_path_simple(
     return written >= 0 && (size_t)written < out_size;
 }
 
-static double scan_interval_s(const hdcv_reader *reader)
+static uint32_t nearest_scan_for_time(const hdcv_reader *reader, double time_s, uint32_t channel_index)
 {
-    double interval = reader->layout.scan_interval_s;
-    if (!(interval > 0.0) && reader->layout.cvf_hz > 0.0) {
-        interval = 1.0 / reader->layout.cvf_hz;
-    }
-    if (!(interval > 0.0)) {
-        interval = 0.1;
-    }
-    return interval;
+    return hdcv_reader_nearest_row_for_channel_time(reader, channel_index, time_s);
 }
 
-static uint32_t scan_for_time_raw(const hdcv_reader *reader, double time_s)
+static int parse_channel_spec(
+    const hdcv_reader *reader,
+    const char *text,
+    int zero_based_numeric,
+    uint32_t *out_channel_index
+)
 {
-    double raw_scan = round(time_s / scan_interval_s(reader));
+    char *end = NULL;
+    unsigned long parsed;
 
-    if (reader->layout.scan_count == 0U || !isfinite(raw_scan) || raw_scan < 0.0) {
-        return 0U;
+    if (text == NULL || text[0] == '\0') {
+        *out_channel_index = 0U;
+        return 1;
     }
-    if (raw_scan > (double)(reader->layout.scan_count - 1U)) {
-        return reader->layout.scan_count - 1U;
-    }
-    return (uint32_t)raw_scan;
-}
 
-static uint32_t nearest_scan_for_time(const hdcv_reader *reader, double time_s, uint32_t phase_index)
-{
-    return hdcv_analysis_nearest_scan_index_for_phase(
-        scan_for_time_raw(reader, time_s),
-        reader->layout.scan_count,
-        phase_index,
-        reader->layout.waveform_count
-    );
+    errno = 0;
+    parsed = strtoul(text, &end, 10);
+    if (errno == 0 && end != text && *end == '\0') {
+        if (zero_based_numeric) {
+            if (parsed >= reader->layout.channel_count) {
+                return 0;
+            }
+            *out_channel_index = (uint32_t)parsed;
+            return 1;
+        }
+        if (parsed == 0UL) {
+            *out_channel_index = 0U;
+            return 1;
+        }
+        if (parsed <= reader->layout.channel_count) {
+            *out_channel_index = (uint32_t)(parsed - 1UL);
+            return 1;
+        }
+        return 0;
+    }
+
+    for (uint32_t i = 0U; i < reader->layout.channel_count; ++i) {
+        const char *name = hdcv_reader_channel_name(reader, i);
+        if (strcmp(text, name) == 0) {
+            *out_channel_index = i;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static uint32_t nearest_point_for_voltage(const float *voltage, uint32_t point_count, double requested_voltage)
@@ -621,8 +639,8 @@ static int write_cv_values_csv(const char *out_path, const float *voltage, const
 static int copy_average_scan(
     const hdcv_reader *reader,
     uint32_t center_scan,
-    uint32_t phase_index,
-    uint32_t phase_period,
+    uint32_t channel_index,
+    uint32_t channel_count,
     uint32_t half_window,
     float *destination,
     float *scratch,
@@ -630,19 +648,19 @@ static int copy_average_scan(
 )
 {
     uint32_t points_per_scan = reader->layout.points_per_scan;
-    uint32_t center = hdcv_analysis_nearest_scan_index_for_phase(center_scan, reader->layout.scan_count, phase_index, phase_period);
-    int64_t start = (int64_t)center - ((int64_t)half_window * (int64_t)phase_period);
-    int64_t end = (int64_t)center + ((int64_t)half_window * (int64_t)phase_period);
+    uint32_t center = hdcv_analysis_nearest_row_index_for_channel(center_scan, reader->layout.scan_count, channel_index, channel_count);
+    int64_t start = (int64_t)center - ((int64_t)half_window * (int64_t)channel_count);
+    int64_t end = (int64_t)center + ((int64_t)half_window * (int64_t)channel_count);
     uint32_t used_count = 0U;
 
     memset(sums, 0, (size_t)points_per_scan * sizeof(*sums));
     while (start < 0) {
-        start += (int64_t)phase_period;
+        start += (int64_t)channel_count;
     }
     while (end >= (int64_t)reader->layout.scan_count) {
-        end -= (int64_t)phase_period;
+        end -= (int64_t)channel_count;
     }
-    for (int64_t local_scan = start; local_scan <= end; local_scan += (int64_t)phase_period) {
+    for (int64_t local_scan = start; local_scan <= end; local_scan += (int64_t)channel_count) {
         if (local_scan < 0 || local_scan >= (int64_t)reader->layout.scan_count) {
             continue;
         }
@@ -673,10 +691,10 @@ static int write_processed_cv_csv(
 {
     uint32_t scan_count = reader->layout.scan_count;
     uint32_t points_per_scan = reader->layout.points_per_scan;
-    uint32_t phase_period = reader->layout.waveform_count == 0U ? 1U : reader->layout.waveform_count;
-    uint32_t active_phase = options->phase_index % phase_period;
-    uint32_t selected_center = nearest_scan_for_time(reader, time_s, active_phase);
-    uint32_t background_center = nearest_scan_for_time(reader, options->background_time_s, active_phase);
+    uint32_t channel_count = reader->layout.channel_count == 0U ? 1U : reader->layout.channel_count;
+    uint32_t active_channel = options->channel_index % channel_count;
+    uint32_t selected_center = nearest_scan_for_time(reader, time_s, active_channel);
+    uint32_t background_center = nearest_scan_for_time(reader, options->background_time_s, active_channel);
     int background_subtract = options->background_subtract && !force_raw;
     float *voltage = NULL;
     float *cv_values = NULL;
@@ -687,7 +705,7 @@ static int write_processed_cv_csv(
     if (voltage == NULL || cv_values == NULL) {
         goto done;
     }
-    if (!hdcv_reader_copy_voltage(reader, voltage, points_per_scan)) {
+    if (!hdcv_reader_copy_voltage_for_channel(reader, active_channel, voltage, points_per_scan)) {
         goto done;
     }
 
@@ -713,21 +731,21 @@ static int write_processed_cv_csv(
             }
             if (background_subtract) {
                 memcpy(source_trace, trace, (size_t)scan_count * sizeof(*source_trace));
-                hdcv_analysis_apply_phase_aligned_background_to_trace(
+                hdcv_analysis_apply_channel_aligned_background_to_trace(
                     source_trace,
                     trace,
                     scan_count,
                     background_center,
-                    phase_period
+                    channel_count
                 );
             }
-            (void)hdcv_analysis_apply_butterworth_bandpass_by_phase(trace, scan_count, phase_period, reader->layout.cvf_hz);
-            cv_values[point_index] = hdcv_analysis_average_trace_in_phase_window(
+            (void)hdcv_analysis_apply_butterworth_bandpass_by_channel(trace, scan_count, channel_count, reader->layout.cvf_hz);
+            cv_values[point_index] = hdcv_analysis_average_trace_in_channel_window(
                 trace,
                 scan_count,
                 selected_center,
-                active_phase,
-                phase_period,
+                active_channel,
+                channel_count,
                 HDCV_CV_HALF_WINDOW
             );
         }
@@ -745,7 +763,7 @@ static int write_processed_cv_csv(
             free(sums);
             goto done;
         }
-        if (!copy_average_scan(reader, selected_center, active_phase, phase_period, HDCV_CV_HALF_WINDOW, selected_average, scratch, sums)) {
+        if (!copy_average_scan(reader, selected_center, active_channel, channel_count, HDCV_CV_HALF_WINDOW, selected_average, scratch, sums)) {
             free(selected_average);
             free(background_average);
             free(scratch);
@@ -753,7 +771,7 @@ static int write_processed_cv_csv(
             goto done;
         }
         if (background_subtract) {
-            if (!copy_average_scan(reader, background_center, active_phase, phase_period, HDCV_CV_HALF_WINDOW, background_average, scratch, sums)) {
+            if (!copy_average_scan(reader, background_center, active_channel, channel_count, HDCV_CV_HALF_WINDOW, background_average, scratch, sums)) {
                 free(selected_average);
                 free(background_average);
                 free(scratch);
@@ -795,7 +813,7 @@ static int export_cv_list(
     for (size_t i = 0U; i < times->count; ++i) {
         char out_path[4096];
         char token[96];
-        uint32_t scan_index = nearest_scan_for_time(reader, times->values[i], options->phase_index);
+        uint32_t scan_index = nearest_scan_for_time(reader, times->values[i], options->channel_index);
 
         if (options->stdout_export) {
             if (!copy_string(out_path, sizeof(out_path), "-")) {
@@ -830,9 +848,9 @@ static int write_it_csv_for_voltage(
 {
     uint32_t scan_count = reader->layout.scan_count;
     uint32_t points_per_scan = reader->layout.points_per_scan;
-    uint32_t phase_period = reader->layout.waveform_count == 0U ? 1U : reader->layout.waveform_count;
-    uint32_t active_phase = options->phase_index % phase_period;
-    uint32_t background_scan = nearest_scan_for_time(reader, options->background_time_s, active_phase);
+    uint32_t channel_count = reader->layout.channel_count == 0U ? 1U : reader->layout.channel_count;
+    uint32_t active_channel = options->channel_index % channel_count;
+    uint32_t background_scan = nearest_scan_for_time(reader, options->background_time_s, active_channel);
     uint32_t scan_min = 0U;
     uint32_t scan_max = scan_count == 0U ? 0U : scan_count - 1U;
     uint32_t first_scan;
@@ -843,8 +861,8 @@ static int write_it_csv_for_voltage(
     FILE *stream;
 
     if (options->has_time_range) {
-        scan_min = scan_for_time_raw(reader, options->time_min_s);
-        scan_max = scan_for_time_raw(reader, options->time_max_s);
+        scan_min = nearest_scan_for_time(reader, options->time_min_s, active_channel);
+        scan_max = nearest_scan_for_time(reader, options->time_max_s, active_channel);
         if (scan_max < scan_min) {
             uint32_t tmp = scan_min;
             scan_min = scan_max;
@@ -857,7 +875,7 @@ static int write_it_csv_for_voltage(
     if (voltage == NULL || trace == NULL) {
         goto done;
     }
-    if (!hdcv_reader_copy_voltage(reader, voltage, points_per_scan)) {
+    if (!hdcv_reader_copy_voltage_for_channel(reader, active_channel, voltage, points_per_scan)) {
         goto done;
     }
     point_index = nearest_point_for_voltage(voltage, points_per_scan, requested_voltage);
@@ -870,17 +888,17 @@ static int write_it_csv_for_voltage(
             goto done;
         }
         memcpy(source_trace, trace, (size_t)scan_count * sizeof(*source_trace));
-        hdcv_analysis_apply_phase_aligned_background_to_trace(
+        hdcv_analysis_apply_channel_aligned_background_to_trace(
             source_trace,
             trace,
             scan_count,
             background_scan,
-            phase_period
+            channel_count
         );
         free(source_trace);
     }
     if (options->bandpass) {
-        (void)hdcv_analysis_apply_butterworth_bandpass_by_phase(trace, scan_count, phase_period, reader->layout.cvf_hz);
+        (void)hdcv_analysis_apply_butterworth_bandpass_by_channel(trace, scan_count, channel_count, reader->layout.cvf_hz);
     }
 
     stream = open_csv_file(out_path);
@@ -888,10 +906,10 @@ static int write_it_csv_for_voltage(
         goto done;
     }
     fprintf(stream, "time_s,current_nA\n");
-    first_scan = hdcv_analysis_first_phase_scan_in_range(scan_min, scan_max, active_phase, phase_period);
-    for (uint32_t scan_index = first_scan; first_scan != HDCV_SCAN_INDEX_NOT_FOUND && scan_index <= scan_max; scan_index += phase_period) {
+    first_scan = hdcv_analysis_first_channel_row_in_range(scan_min, scan_max, active_channel, channel_count);
+    for (uint32_t scan_index = first_scan; first_scan != HDCV_SCAN_INDEX_NOT_FOUND && scan_index <= scan_max; scan_index += channel_count) {
         fprintf(stream, "%.9g,%.9g\n", hdcv_reader_scan_time_sequence_s(reader, scan_index), (double)trace[scan_index]);
-        if (phase_period == 0U) {
+        if (channel_count == 0U) {
             break;
         }
     }
@@ -912,7 +930,7 @@ static int export_it_list(const hdcv_reader *reader, const hdcv_number_list *vol
         return 1;
     }
     voltage = (float *)malloc((size_t)points_per_scan * sizeof(*voltage));
-    if (voltage == NULL || !hdcv_reader_copy_voltage(reader, voltage, points_per_scan)) {
+    if (voltage == NULL || !hdcv_reader_copy_voltage_for_channel(reader, options->channel_index, voltage, points_per_scan)) {
         free(voltage);
         return 0;
     }
@@ -964,23 +982,23 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
 {
     uint32_t scan_count = reader->layout.scan_count;
     uint32_t points_per_scan = reader->layout.points_per_scan;
-    uint32_t phase_period = reader->layout.waveform_count == 0U ? 1U : reader->layout.waveform_count;
-    uint32_t active_phase = options->phase_index % phase_period;
+    uint32_t channel_count = reader->layout.channel_count == 0U ? 1U : reader->layout.channel_count;
+    uint32_t active_channel = options->channel_index % channel_count;
     uint32_t scan_min = 0U;
     uint32_t scan_max = scan_count == 0U ? 0U : scan_count - 1U;
     uint32_t point_min = 0U;
     uint32_t point_max = points_per_scan == 0U ? 0U : points_per_scan - 1U;
     uint32_t export_scan_count;
     uint32_t export_point_count;
-    uint32_t background_scan = nearest_scan_for_time(reader, options->background_time_s, active_phase);
+    uint32_t background_scan = nearest_scan_for_time(reader, options->background_time_s, active_channel);
     char out_path[4096];
     float *voltage = NULL;
     int ok = 0;
     FILE *stream = NULL;
 
     if (options->has_time_range) {
-        scan_min = scan_for_time_raw(reader, options->time_min_s);
-        scan_max = scan_for_time_raw(reader, options->time_max_s);
+        scan_min = nearest_scan_for_time(reader, options->time_min_s, active_channel);
+        scan_max = nearest_scan_for_time(reader, options->time_max_s, active_channel);
         if (scan_max < scan_min) {
             uint32_t tmp = scan_min;
             scan_min = scan_max;
@@ -997,7 +1015,7 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
         }
     }
 
-    export_scan_count = hdcv_analysis_phase_sample_count_in_range(scan_min, scan_max, active_phase, phase_period);
+    export_scan_count = hdcv_analysis_channel_sample_count_in_range(scan_min, scan_max, active_channel, channel_count);
     export_point_count = point_max - point_min + 1U;
     if (export_scan_count == 0U || export_point_count == 0U) {
         fputs("No color plot samples match the requested range.\n", stderr);
@@ -1015,7 +1033,7 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
         }
     }
     voltage = (float *)malloc((size_t)points_per_scan * sizeof(*voltage));
-    if (voltage == NULL || !hdcv_reader_copy_voltage(reader, voltage, points_per_scan)) {
+    if (voltage == NULL || !hdcv_reader_copy_voltage_for_channel(reader, active_channel, voltage, points_per_scan)) {
         goto done;
     }
     stream = open_csv_file(out_path);
@@ -1048,12 +1066,12 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
             }
             if (options->background_subtract) {
                 memcpy(source_trace, trace, (size_t)scan_count * sizeof(*source_trace));
-                hdcv_analysis_apply_phase_aligned_background_to_trace(source_trace, trace, scan_count, background_scan, phase_period);
+                hdcv_analysis_apply_channel_aligned_background_to_trace(source_trace, trace, scan_count, background_scan, channel_count);
             }
-            (void)hdcv_analysis_apply_butterworth_bandpass_by_phase(trace, scan_count, phase_period, reader->layout.cvf_hz);
+            (void)hdcv_analysis_apply_butterworth_bandpass_by_channel(trace, scan_count, channel_count, reader->layout.cvf_hz);
 
-            first_scan = hdcv_analysis_first_phase_scan_in_range(scan_min, scan_max, active_phase, phase_period);
-            for (uint32_t scan_index = first_scan; first_scan != HDCV_SCAN_INDEX_NOT_FOUND && scan_index <= scan_max; scan_index += phase_period) {
+            first_scan = hdcv_analysis_first_channel_row_in_range(scan_min, scan_max, active_channel, channel_count);
+            for (uint32_t scan_index = first_scan; first_scan != HDCV_SCAN_INDEX_NOT_FOUND && scan_index <= scan_max; scan_index += channel_count) {
                 matrix[((size_t)local_scan * export_point_count) + local_point] = trace[scan_index];
                 local_scan += 1U;
             }
@@ -1061,8 +1079,8 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
 
         {
             uint32_t local_scan = 0U;
-            uint32_t first_scan = hdcv_analysis_first_phase_scan_in_range(scan_min, scan_max, active_phase, phase_period);
-            for (uint32_t scan_index = first_scan; first_scan != HDCV_SCAN_INDEX_NOT_FOUND && scan_index <= scan_max; scan_index += phase_period) {
+            uint32_t first_scan = hdcv_analysis_first_channel_row_in_range(scan_min, scan_max, active_channel, channel_count);
+            for (uint32_t scan_index = first_scan; first_scan != HDCV_SCAN_INDEX_NOT_FOUND && scan_index <= scan_max; scan_index += channel_count) {
                 double time = hdcv_reader_scan_time_sequence_s(reader, scan_index);
                 for (uint32_t point_index = point_min; point_index <= point_max; ++point_index) {
                     uint32_t local_point = point_index - point_min;
@@ -1085,7 +1103,7 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
             goto done;
         }
         if (options->background_subtract) {
-            background_cache = (float **)calloc(phase_period, sizeof(*background_cache));
+            background_cache = (float **)calloc(channel_count, sizeof(*background_cache));
             if (background_cache == NULL) {
                 free(scan);
                 goto done;
@@ -1093,14 +1111,14 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
         }
 
         {
-            uint32_t first_scan = hdcv_analysis_first_phase_scan_in_range(scan_min, scan_max, active_phase, phase_period);
-            for (uint32_t scan_index = first_scan; first_scan != HDCV_SCAN_INDEX_NOT_FOUND && scan_index <= scan_max; scan_index += phase_period) {
+            uint32_t first_scan = hdcv_analysis_first_channel_row_in_range(scan_min, scan_max, active_channel, channel_count);
+            for (uint32_t scan_index = first_scan; first_scan != HDCV_SCAN_INDEX_NOT_FOUND && scan_index <= scan_max; scan_index += channel_count) {
                 const float *background = NULL;
                 double time = hdcv_reader_scan_time_sequence_s(reader, scan_index);
 
                 if (!hdcv_reader_copy_scan(reader, scan_index, scan, points_per_scan)) {
                     if (background_cache != NULL) {
-                        for (uint32_t i = 0U; i < phase_period; ++i) {
+                        for (uint32_t i = 0U; i < channel_count; ++i) {
                             free(background_cache[i]);
                         }
                     }
@@ -1109,18 +1127,18 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
                     goto done;
                 }
                 if (options->background_subtract) {
-                    uint32_t aligned_index = hdcv_analysis_phase_aligned_background_index(
+                    uint32_t aligned_index = hdcv_analysis_channel_aligned_background_index(
                         background_scan,
                         scan_index,
                         scan_count,
-                        phase_period
+                        channel_count
                     );
-                    uint32_t cache_index = aligned_index % phase_period;
+                    uint32_t cache_index = aligned_index % channel_count;
                     if (background_cache[cache_index] == NULL) {
                         background_cache[cache_index] = (float *)malloc((size_t)points_per_scan * sizeof(*background_cache[cache_index]));
                         if (background_cache[cache_index] == NULL ||
                             !hdcv_reader_copy_scan(reader, aligned_index, background_cache[cache_index], points_per_scan)) {
-                            for (uint32_t i = 0U; i < phase_period; ++i) {
+                            for (uint32_t i = 0U; i < channel_count; ++i) {
                                 free(background_cache[i]);
                             }
                             free(background_cache);
@@ -1139,7 +1157,7 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
             }
         }
         if (background_cache != NULL) {
-            for (uint32_t i = 0U; i < phase_period; ++i) {
+            for (uint32_t i = 0U; i < channel_count; ++i) {
                 free(background_cache[i]);
             }
         }
@@ -1151,10 +1169,10 @@ static int write_color_csv(const hdcv_reader *reader, const hdcv_cli_options *op
     stream = NULL;
     if (ok) {
         FILE *status_stream = options->stdout_export ? stderr : stdout;
-        fprintf(status_stream, "wrote %s (%" PRIu32 " phase-%" PRIu32 " scans x %" PRIu32 " points)\n",
+        fprintf(status_stream, "wrote %s (%" PRIu32 " channel-%" PRIu32 " samples x %" PRIu32 " points)\n",
             options->stdout_export ? "stdout" : out_path,
             export_scan_count,
-            active_phase,
+            active_channel + 1U,
             export_point_count);
     }
 
@@ -1210,7 +1228,7 @@ int main(int argc, char **argv)
     memset(&options, 0, sizeof(options));
     options.out_dir = ".";
     options.prefix = default_prefix;
-    options.phase_index = 0U;
+    options.channel_index = 0U;
     options.background_time_s = 0.0;
 
     if (argc == 2) {
@@ -1276,20 +1294,20 @@ int main(int argc, char **argv)
             if (options.prefix == NULL) {
                 goto done_without_reader;
             }
-        } else if (strcmp(argv[i], "--phase") == 0) {
-            const char *value = arg_value(argc, argv, &i, "--phase");
-            char *end = NULL;
-            unsigned long parsed;
+        } else if (strcmp(argv[i], "--channel") == 0) {
+            const char *value = arg_value(argc, argv, &i, "--channel");
             if (value == NULL) {
                 goto done_without_reader;
             }
-            errno = 0;
-            parsed = strtoul(value, &end, 10);
-            if (errno != 0 || end == value || *end != '\0' || parsed > UINT32_MAX) {
-                fprintf(stderr, "Invalid --phase value: %s\n", value);
+            options.channel_spec = value;
+            options.channel_spec_zero_based = 0;
+        } else if (strcmp(argv[i], "--phase") == 0) {
+            const char *value = arg_value(argc, argv, &i, "--phase");
+            if (value == NULL) {
                 goto done_without_reader;
             }
-            options.phase_index = (uint32_t)parsed;
+            options.channel_spec = value;
+            options.channel_spec_zero_based = 1;
         } else if (strcmp(argv[i], "--launch") == 0) {
             status = launch_viewer(file_path, argv[0]) ? 0 : 1;
             goto done_without_reader;
@@ -1303,6 +1321,23 @@ int main(int argc, char **argv)
     if (!hdcv_reader_open(&reader, file_path)) {
         fprintf(stderr, "error: %s\n", reader.error);
         goto done_without_reader;
+    }
+    if (!parse_channel_spec(&reader, options.channel_spec, options.channel_spec_zero_based, &options.channel_index)) {
+        fprintf(stderr,
+            "Invalid channel %s. This file has %" PRIu32 " channels",
+            options.channel_spec != NULL ? options.channel_spec : "",
+            reader.layout.channel_count);
+        if (reader.layout.channel_count > 0U) {
+            fputs(": ", stderr);
+            for (uint32_t i = 0U; i < reader.layout.channel_count; ++i) {
+                fprintf(stderr, "%s%s", i > 0U ? ", " : "", hdcv_reader_channel_name(&reader, i));
+            }
+        }
+        fputc('\n', stderr);
+        goto done_with_reader;
+    }
+    if (options.channel_spec_zero_based) {
+        fputs("--phase is deprecated; use --channel with a channel number or name.\n", stderr);
     }
 
     if (show_info) {

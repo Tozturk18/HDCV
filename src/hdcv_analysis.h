@@ -21,6 +21,16 @@ int hdcv_analysis_copy_point_trace(
     float *out_max
 );
 
+int hdcv_analysis_copy_channel_point_trace(
+    const hdcv_reader *reader,
+    uint32_t channel_index,
+    uint32_t point_index,
+    float *dst,
+    size_t count,
+    float *out_min,
+    float *out_max
+);
+
 int hdcv_analysis_build_overview(
     const hdcv_reader *reader,
     uint32_t max_columns,
@@ -36,11 +46,19 @@ void hdcv_analysis_compute_min_max(
     float *out_max
 );
 
+/* Compatibility names from the older phase terminology. New code should use the channel wrappers below. */
 uint32_t hdcv_analysis_phase_aligned_background_index(
     uint32_t raw_background_index,
     uint32_t scan_index,
     uint32_t scan_count,
     uint32_t phase_period
+);
+
+uint32_t hdcv_analysis_channel_aligned_background_index(
+    uint32_t raw_background_index,
+    uint32_t row_index,
+    uint32_t row_count,
+    uint32_t channel_count
 );
 
 uint32_t hdcv_analysis_nearest_scan_index_for_phase(
@@ -50,6 +68,13 @@ uint32_t hdcv_analysis_nearest_scan_index_for_phase(
     uint32_t phase_period
 );
 
+uint32_t hdcv_analysis_nearest_row_index_for_channel(
+    uint32_t row_index,
+    uint32_t row_count,
+    uint32_t channel_index,
+    uint32_t channel_count
+);
+
 uint32_t hdcv_analysis_first_phase_scan_in_range(
     uint32_t min_scan,
     uint32_t max_scan,
@@ -57,11 +82,25 @@ uint32_t hdcv_analysis_first_phase_scan_in_range(
     uint32_t phase_period
 );
 
+uint32_t hdcv_analysis_first_channel_row_in_range(
+    uint32_t min_row,
+    uint32_t max_row,
+    uint32_t channel_index,
+    uint32_t channel_count
+);
+
 uint32_t hdcv_analysis_phase_sample_count_in_range(
     uint32_t min_scan,
     uint32_t max_scan,
     uint32_t phase_index,
     uint32_t phase_period
+);
+
+uint32_t hdcv_analysis_channel_sample_count_in_range(
+    uint32_t min_row,
+    uint32_t max_row,
+    uint32_t channel_index,
+    uint32_t channel_count
 );
 
 float hdcv_analysis_average_trace_in_phase_window(
@@ -73,12 +112,29 @@ float hdcv_analysis_average_trace_in_phase_window(
     uint32_t half_window
 );
 
+float hdcv_analysis_average_trace_in_channel_window(
+    const float *trace,
+    uint32_t row_count,
+    uint32_t center_row,
+    uint32_t channel_index,
+    uint32_t channel_count,
+    uint32_t half_window
+);
+
 void hdcv_analysis_apply_phase_aligned_background_to_trace(
     const float *source,
     float *destination,
     uint32_t scan_count,
     uint32_t raw_background_index,
     uint32_t phase_period
+);
+
+void hdcv_analysis_apply_channel_aligned_background_to_trace(
+    const float *source,
+    float *destination,
+    uint32_t row_count,
+    uint32_t raw_background_index,
+    uint32_t channel_count
 );
 
 int hdcv_analysis_apply_butterworth_bandpass(
@@ -92,6 +148,13 @@ int hdcv_analysis_apply_butterworth_bandpass_by_phase(
     size_t count,
     uint32_t phase_period,
     double scan_rate_hz
+);
+
+int hdcv_analysis_apply_butterworth_bandpass_by_channel(
+    float *values,
+    size_t count,
+    uint32_t channel_count,
+    double cvf_hz
 );
 
 void hdcv_analysis_background_subtracted_cv_denoise(

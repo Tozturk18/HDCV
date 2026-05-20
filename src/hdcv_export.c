@@ -49,6 +49,15 @@ int hdcv_print_info(const hdcv_reader *reader, FILE *out, int as_json)
         fprintf(out, "  \"current_header_offset\": %" PRIu64 ",\n", layout->current_header_offset);
         fprintf(out, "  \"current_matrix_offset\": %" PRIu64 ",\n", layout->current_matrix_offset);
         fprintf(out, "  \"waveform_count\": %" PRIu32 ",\n", layout->waveform_count);
+        fprintf(out, "  \"physical_waveform_template_count\": %" PRIu32 ",\n", layout->waveform_count);
+        fprintf(out, "  \"declared_channel_count\": %" PRIu32 ",\n", layout->declared_channel_count);
+        fprintf(out, "  \"numbered_wavespec_count\": %" PRIu32 ",\n", layout->numbered_wavespec_count);
+        fprintf(out, "  \"channel_count\": %" PRIu32 ",\n", layout->channel_count);
+        fprintf(out, "  \"samples_per_channel\": %" PRIu32 ",\n", layout->samples_per_channel);
+        fprintf(out, "  \"current_matrix_row_count\": %" PRIu32 ",\n", layout->current_matrix_row_count);
+        fprintf(out, "  \"current_header_samples_per_channel\": %" PRIu32 ",\n", layout->samples_per_channel);
+        fprintf(out, "  \"current_header_channel_count\": %" PRIu32 ",\n", layout->channel_count);
+        fprintf(out, "  \"current_header_points_per_scan\": %" PRIu32 ",\n", layout->points_per_scan);
         fprintf(out, "  \"waveform_full_points\": %" PRIu32 ",\n", layout->waveform_full_points);
         fprintf(out, "  \"points_per_scan\": %" PRIu32 ",\n", layout->points_per_scan);
         fprintf(out, "  \"scan_count\": %" PRIu32 ",\n", layout->scan_count);
@@ -65,6 +74,14 @@ int hdcv_print_info(const hdcv_reader *reader, FILE *out, int as_json)
             fprintf(out, "  \"v1_v\": %.9f,\n", layout->v1_v);
             fprintf(out, "  \"v2_v\": %.9f,\n", layout->v2_v);
         }
+        fputs("  \"channel_names\": [", out);
+        for (uint32_t i = 0U; i < layout->channel_count; ++i) {
+            if (i > 0U) {
+                fputs(", ", out);
+            }
+            print_json_string(out, hdcv_reader_channel_name(reader, i));
+        }
+        fputs("],\n", out);
         fputs("  \"wave_data_offsets\": [", out);
         for (uint32_t i = 0U; i < layout->waveform_count; ++i) {
             if (i > 0U) {
@@ -80,16 +97,35 @@ int hdcv_print_info(const hdcv_reader *reader, FILE *out, int as_json)
     fprintf(out, "file: %s\n", reader->path);
     fprintf(out, "size: %zu bytes\n", reader->mapped.size);
     fprintf(out, "metadata: [%" PRIu64 ", %" PRIu64 ")\n", layout->metadata_start_offset, layout->metadata_end_offset);
-    fprintf(out, "waveform templates: %" PRIu32 " blocks, %" PRIu32 " full-cycle points each\n", layout->waveform_count, layout->waveform_full_points);
+    fprintf(out, "waveform templates: %" PRIu32 " physical blocks, %" PRIu32 " full-cycle points each\n", layout->waveform_count, layout->waveform_full_points);
+    fprintf(out, "channels: %" PRIu32 " recorded", layout->channel_count);
+    if (layout->declared_channel_count > 0U) {
+        fprintf(out, " (Wavespecs.<size(s)> = %" PRIu32 ")", layout->declared_channel_count);
+    }
+    fputc('\n', out);
+    if (layout->channel_count > 0U) {
+        fprintf(out, "channel names:");
+        for (uint32_t i = 0U; i < layout->channel_count; ++i) {
+            fprintf(out, " [%" PRIu32 "] %s", i, hdcv_reader_channel_name(reader, i));
+        }
+        fputc('\n', out);
+    }
     fprintf(out, "active scan points: %" PRIu32 "\n", layout->points_per_scan);
     fprintf(out, "current matrix offset: %" PRIu64 "\n", layout->current_matrix_offset);
-    fprintf(out, "scan count: %" PRIu32 "\n", layout->scan_count);
+    fprintf(out, "current header tail: %" PRIu32 ", %" PRIu32 ", %" PRIu32 "\n",
+        layout->samples_per_channel,
+        layout->channel_count,
+        layout->points_per_scan);
+    fprintf(out, "current matrix rows: %" PRIu32 "\n", layout->current_matrix_row_count);
+    fprintf(out, "samples per channel: %" PRIu32 "\n", layout->samples_per_channel);
     fprintf(out, "sample rate: %.3f Hz\n", layout->sample_rate_hz);
     fprintf(out, "CVF: %.3f Hz\n", layout->cvf_hz);
-    fprintf(out, "sequence time span: 0.0 .. %.3f s\n", hdcv_reader_scan_time_sequence_s(reader, layout->scan_count - 1U));
-    fprintf(out, "experiment time span: 0.0 .. %.3f s\n", hdcv_reader_scan_time_experiment_s(reader, layout->scan_count - 1U));
+    if (layout->scan_count > 0U) {
+        fprintf(out, "sequence time span: 0.0 .. %.3f s\n", hdcv_reader_scan_time_sequence_s(reader, layout->scan_count - 1U));
+        fprintf(out, "experiment time span: 0.0 .. %.3f s\n", hdcv_reader_scan_time_experiment_s(reader, layout->scan_count - 1U));
+    }
     if (layout->has_run_structure) {
-        fprintf(out, "run structure: %" PRIu32 " runs x %" PRIu32 " scans per run\n", layout->run_count, layout->scans_per_run);
+        fprintf(out, "run structure: %" PRIu32 " runs x %" PRIu32 " samples per channel per run\n", layout->run_count, layout->scans_per_run);
     }
     if (layout->has_voltage_bounds) {
         fprintf(out, "voltage bounds: %.3f V .. %.3f V\n", layout->v1_v, layout->v2_v);
@@ -250,7 +286,7 @@ static int export_range_hdcvbin(
     hdcv_write_le_f64(stream, reader->layout.cvf_hz);
     hdcv_write_le_f64(stream, reader->layout.scan_interval_s);
     hdcv_write_le_f64(stream, reader->layout.scan_duration_s);
-    hdcv_write_le_u32(stream, reader->layout.waveform_count);
+    hdcv_write_le_u32(stream, reader->layout.channel_count);
     hdcv_write_le_u32(stream, reader->layout.run_count);
     hdcv_write_le_u32(stream, reader->layout.scans_per_run);
     hdcv_write_le_u32(stream, reader->layout.has_experiment_timing ? 1U : 0U);

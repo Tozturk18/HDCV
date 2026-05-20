@@ -171,6 +171,56 @@ int hdcv_analysis_copy_point_trace(
     return 1;
 }
 
+int hdcv_analysis_copy_channel_point_trace(
+    const hdcv_reader *reader,
+    uint32_t channel_index,
+    uint32_t point_index,
+    float *dst,
+    size_t count,
+    float *out_min,
+    float *out_max
+)
+{
+    uint64_t row_bytes;
+    const uint8_t *src;
+    uint32_t sample_index;
+    uint32_t sample_count = reader->layout.samples_per_channel;
+    uint32_t channel_count = reader->layout.channel_count == 0U ? 1U : reader->layout.channel_count;
+    float min_value;
+    float max_value;
+
+    if (point_index >= reader->layout.points_per_scan ||
+        channel_index >= channel_count ||
+        count < sample_count) {
+        return 0;
+    }
+
+    row_bytes = (uint64_t)reader->layout.points_per_scan * 4U;
+    src = reader->mapped.data + reader->layout.current_matrix_offset + ((uint64_t)point_index * 4U);
+
+    min_value = 0.0f;
+    max_value = 0.0f;
+    for (sample_index = 0U; sample_index < sample_count; ++sample_index) {
+        uint32_t row_index = hdcv_reader_row_index_for_channel_sample(reader, channel_index, sample_index);
+        float value = hdcv_read_be_f32(src + ((uint64_t)row_index * row_bytes));
+        dst[sample_index] = value;
+        if (sample_index == 0U || value < min_value) {
+            min_value = value;
+        }
+        if (sample_index == 0U || value > max_value) {
+            max_value = value;
+        }
+    }
+
+    if (out_min != NULL) {
+        *out_min = min_value;
+    }
+    if (out_max != NULL) {
+        *out_max = max_value;
+    }
+    return 1;
+}
+
 int hdcv_analysis_build_overview(
     const hdcv_reader *reader,
     uint32_t max_columns,
@@ -193,11 +243,11 @@ int hdcv_analysis_build_overview(
     }
 
     column_count = reader->layout.scan_count < max_columns ? reader->layout.scan_count : max_columns;
-    if (reader->layout.waveform_count > 1U && reader->layout.scan_count > max_columns) {
-        uint32_t phase_period = reader->layout.waveform_count;
+    if (reader->layout.channel_count > 1U && reader->layout.scan_count > max_columns) {
+        uint32_t channel_count = reader->layout.channel_count;
         uint32_t scans_per_column = (reader->layout.scan_count + max_columns - 1U) / max_columns;
         uint32_t balanced_scans_per_column =
-            ((scans_per_column + phase_period - 1U) / phase_period) * phase_period;
+            ((scans_per_column + channel_count - 1U) / channel_count) * channel_count;
         if (balanced_scans_per_column > scans_per_column) {
             column_count = (reader->layout.scan_count + balanced_scans_per_column - 1U) / balanced_scans_per_column;
             if (column_count == 0U) {
@@ -337,6 +387,16 @@ uint32_t hdcv_analysis_phase_aligned_background_index(
     return (uint32_t)nearest;
 }
 
+uint32_t hdcv_analysis_channel_aligned_background_index(
+    uint32_t raw_background_index,
+    uint32_t row_index,
+    uint32_t row_count,
+    uint32_t channel_count
+)
+{
+    return hdcv_analysis_phase_aligned_background_index(raw_background_index, row_index, row_count, channel_count);
+}
+
 uint32_t hdcv_analysis_nearest_scan_index_for_phase(
     uint32_t scan_index,
     uint32_t scan_count,
@@ -377,6 +437,16 @@ uint32_t hdcv_analysis_nearest_scan_index_for_phase(
     return (uint32_t)candidate;
 }
 
+uint32_t hdcv_analysis_nearest_row_index_for_channel(
+    uint32_t row_index,
+    uint32_t row_count,
+    uint32_t channel_index,
+    uint32_t channel_count
+)
+{
+    return hdcv_analysis_nearest_scan_index_for_phase(row_index, row_count, channel_index, channel_count);
+}
+
 uint32_t hdcv_analysis_first_phase_scan_in_range(
     uint32_t min_scan,
     uint32_t max_scan,
@@ -403,6 +473,16 @@ uint32_t hdcv_analysis_first_phase_scan_in_range(
     return min_scan + delta;
 }
 
+uint32_t hdcv_analysis_first_channel_row_in_range(
+    uint32_t min_row,
+    uint32_t max_row,
+    uint32_t channel_index,
+    uint32_t channel_count
+)
+{
+    return hdcv_analysis_first_phase_scan_in_range(min_row, max_row, channel_index, channel_count);
+}
+
 uint32_t hdcv_analysis_phase_sample_count_in_range(
     uint32_t min_scan,
     uint32_t max_scan,
@@ -420,6 +500,16 @@ uint32_t hdcv_analysis_phase_sample_count_in_range(
         return max_scan - first_scan + 1U;
     }
     return ((max_scan - first_scan) / period) + 1U;
+}
+
+uint32_t hdcv_analysis_channel_sample_count_in_range(
+    uint32_t min_row,
+    uint32_t max_row,
+    uint32_t channel_index,
+    uint32_t channel_count
+)
+{
+    return hdcv_analysis_phase_sample_count_in_range(min_row, max_row, channel_index, channel_count);
 }
 
 float hdcv_analysis_average_trace_in_phase_window(
@@ -462,6 +552,25 @@ float hdcv_analysis_average_trace_in_phase_window(
     return (float)(sum / (double)count);
 }
 
+float hdcv_analysis_average_trace_in_channel_window(
+    const float *trace,
+    uint32_t row_count,
+    uint32_t center_row,
+    uint32_t channel_index,
+    uint32_t channel_count,
+    uint32_t half_window
+)
+{
+    return hdcv_analysis_average_trace_in_phase_window(
+        trace,
+        row_count,
+        center_row,
+        channel_index,
+        channel_count,
+        half_window
+    );
+}
+
 void hdcv_analysis_apply_phase_aligned_background_to_trace(
     const float *source,
     float *destination,
@@ -482,6 +591,23 @@ void hdcv_analysis_apply_phase_aligned_background_to_trace(
         );
         destination[scan_index] = source[scan_index] - source[aligned_index];
     }
+}
+
+void hdcv_analysis_apply_channel_aligned_background_to_trace(
+    const float *source,
+    float *destination,
+    uint32_t row_count,
+    uint32_t raw_background_index,
+    uint32_t channel_count
+)
+{
+    hdcv_analysis_apply_phase_aligned_background_to_trace(
+        source,
+        destination,
+        row_count,
+        raw_background_index,
+        channel_count
+    );
 }
 
 int hdcv_analysis_apply_butterworth_bandpass(float *values, size_t count, double sample_rate_hz)
@@ -523,14 +649,24 @@ int hdcv_analysis_apply_butterworth_bandpass_by_phase(
     double scan_rate_hz
 )
 {
-    uint32_t period = phase_period == 0U ? 1U : phase_period;
+    return hdcv_analysis_apply_butterworth_bandpass_by_channel(values, count, phase_period, scan_rate_hz);
+}
+
+int hdcv_analysis_apply_butterworth_bandpass_by_channel(
+    float *values,
+    size_t count,
+    uint32_t channel_count,
+    double cvf_hz
+)
+{
+    uint32_t period = channel_count == 0U ? 1U : channel_count;
     int filtered = 0;
 
     if (values == NULL) {
         return 0;
     }
     if (period <= 1U) {
-        return hdcv_analysis_apply_butterworth_bandpass(values, count, scan_rate_hz);
+        return hdcv_analysis_apply_butterworth_bandpass(values, count, cvf_hz);
     }
 
     for (uint32_t phase = 0U; phase < period; ++phase) {
@@ -550,7 +686,7 @@ int hdcv_analysis_apply_butterworth_bandpass_by_phase(
             phase_values[j++] = values[scan_index];
         }
 
-        if (hdcv_analysis_apply_butterworth_bandpass(phase_values, phase_count, scan_rate_hz / (double)period)) {
+        if (hdcv_analysis_apply_butterworth_bandpass(phase_values, phase_count, cvf_hz)) {
             j = 0U;
             for (size_t scan_index = phase; scan_index < count; scan_index += period) {
                 values[scan_index] = phase_values[j++];

@@ -1,15 +1,15 @@
 # HDCV Reader
 
-Fast C parser and CLI for large Pine Research WaveNeuro `.hdcv` FSCV files, built from the local Python decoder and then re-verified directly against the sample binary in this repository.
+Fast C parser, CLI, and native macOS AppKit viewer for large Pine Research WaveNeuro `.hdcv` FSCV files, built from the local Python decoder and then re-verified directly against local WaveNeuro binaries.
 
-The current implementation is validated on `DA_5uM_1.hdcv` and targets the HDCV v1001-style layout seen in that file:
+The current implementation targets the HDCV v1001-style layout seen in `/Users/tozturk/PhD/FSCV_Data`:
 
 - text metadata block
-- four full-cycle waveform template blocks
+- physical full-cycle waveform template blocks
 - one current-matrix header
 - big-endian float32 current matrix
 
-It is designed for streaming, mmap-backed scan access, and macOS/Apple Silicon builds.
+It is designed for streaming, mmap-backed matrix access, native channel/electrode selection, and macOS/Apple Silicon builds.
 
 ## Repository Findings
 
@@ -27,7 +27,7 @@ For the sample file, the Python metadata extraction is useful, but the current-m
 - current matrix offset: `166317`
 - current matrix shape: `7200 x 1060`
 
-That `7200`-scan count matches `4 runs x 180 s x 10 Hz`. The reader also reconstructs an experiment-time axis with the 1-second inter-run gaps restored, so sequence time and wall-clock experiment time stay distinct.
+For newer local datasets, the current-matrix header tail is interpreted as `samples_per_channel, channel_count, points_per_scan`. Matrix rows are interleaved by channel as `row_index = sample_index * channel_count + channel_index`; sequence time is therefore `sample_index / CVF`.
 
 ## Build
 
@@ -123,11 +123,11 @@ Launch the native viewer or export MATLAB-ready CV files through the higher-leve
 ./build/hdcv DA_5uM_1.hdcv --cv 100,200,300 --out exports
 ./build/hdcv DA_5uM_1.hdcv -cv "[100, 200, 300]" --bg-cv 50 --out exports
 ./build/hdcv DA_5uM_1.hdcv --it 0.65 --bg-time 50 --bg-subtract --bandpass --out exports
-./build/hdcv DA_5uM_1.hdcv --color --time-range 100:300 --point-range 0:1500 --out exports
+./build/hdcv DA_5uM_1.hdcv --color --channel 1 --time-range 100:300 --point-range 0:1500 --out exports
 ./build/hdcv DA_5uM_1.hdcv --cv 100 --stdout
 ```
 
-`hdcv --cv` exports one `voltage_V,current_nA` CSV per requested sequence-time value, using the nearest scan in the selected phase family. `--bg-cv` exports raw background CV files, `--it` exports selected-voltage `time_s,current_nA` traces, and `--color` exports long-form `time_s,current_nA,voltage_V` color plot data. `--bg-time`, `--bg-subtract`, and `--bandpass` apply the same phase-aware background subtraction and Butterworth processing model used by the viewer. The default phase is `0`, matching the viewer's single-phase default for interleaved WaveNeuro files; use `--phase <index>` when a different phase family is scientifically intended.
+`hdcv --cv` exports one `voltage_V,current_nA` CSV per requested sequence-time value, using the nearest row for the selected channel. `--bg-cv` exports raw background CV files, `--it` exports selected-voltage `time_s,current_nA` traces, and `--color` exports long-form `time_s,current_nA,voltage_V` color plot data. `--bg-time`, `--bg-subtract`, and `--bandpass` apply the same channel-local background subtraction and Butterworth processing model used by the viewer. The default channel is the first recorded channel. Use `--channel <number-or-name>` to select a channel; numbers are one-based for `--channel` (`1` is the first channel), while `--phase <zero-based-index>` is kept only as a deprecated compatibility alias.
 
 For MATLAB, shell pipelines, or other software that should not receive temporary CSV files, add `--stdout` to stream exactly one export to standard output. Status messages are written to standard error so the CSV stream stays clean:
 
@@ -173,6 +173,7 @@ The viewer is optimized for the current system and uses the C reader directly ra
 Current GUI features:
 
 - native macOS window with open dialog and drag-and-drop file loading
+- compact channel selector for interleaved electrode/channel recordings, using WaveSpec names such as `Ramp0` when available
 - overview color plot built from a downsampled scan matrix
 - selected `I-t` plot at the chosen waveform point
 - selected `CV` plot at the chosen scan, preserving the full active waveform including custom repeated triangle cycles
@@ -184,7 +185,7 @@ Current GUI features:
 - optional zero-phase Butterworth-style bandpass filter for the color plot, `I-t`, and `CV`
 - MATLAB-friendly CSV export for the color plot, selected-voltage `I-t`, selected-time `CV`, raw background `CV`, and crosshair time lists
 - bundled `hdcv` shell command for launching files and batch-exporting processed CV, background CV, `I-t`, and color plot CSVs from Terminal or MATLAB
-- single-phase plotting for files that contain repeated interleaved WaveNeuro waveform phases
+- single-channel plotting for files that contain interleaved WaveNeuro channels/electrodes
 - synchronized vertical and horizontal crosshair lines across the plots
 - drag-to-move crosshair lines on the color plot, `I-t`, and `CV` plots, including labeled `T#` CV-time and `B#` background-time markers
 - sequence-time plotting
@@ -193,9 +194,9 @@ Current GUI features:
 Performance notes:
 
 - file open and overview generation run off the main thread
-- the heatmap is decimated for display rather than rendered at full scan-count width; display bins are balanced against repeated WaveNeuro template phases to avoid artificial column striping
+- the heatmap is decimated for display rather than rendered at full matrix-row width; display bins are balanced against interleaved channels to avoid artificial column striping
 - the current-vs-time trace for the selected waveform point is extracted asynchronously
-- line plots render all visible samples when zoomed and use per-pixel min/max envelopes only for very dense ranges, so repeated scan phases are not hidden by stride aliasing
+- line plots render all visible samples when zoomed and use per-pixel min/max envelopes only for very dense ranges, so interleaved channels are not hidden by stride aliasing
 - scan selection updates the CV immediately from the mmap-backed reader
 
 FSCV-specific interaction model:
@@ -210,26 +211,29 @@ FSCV-specific interaction model:
 - the background scan can be chosen explicitly, dragged in the color plot and `I-t` plot, or set from the current selected scan
 - right-click the color plot or `I-t` plot to add linked CV-time or background-time crosshairs; compact bookmark badges label scan markers as `T1`, `T2`, ... and background markers as `B1`, `B2`, ...
 - clicking or dragging `Tn` activates that selected time for the `CV` plot and uses `Bn` as its background when that background marker exists; when there is only one background marker, `B1` is shared by all `T` markers
-- sequence time remains contiguous by scan index
+- sequence time is based on the per-channel sample index, not the raw interleaved matrix row index
 - plot subtitles use compact coordinates with three decimal places: color plot `[time ; voltage ; current]`, `I-t` `[time ; current]`, and `CV` `[voltage ; current]`
 - plot axis ranges are edited by double-clicking visible min/max tick labels; the color plot's current scale is edited the same way from the color legend labels
 - color-plot voltage ticks prioritize waveform extrema and breakpoint/hold voltages while still adding proportional intermediate ticks; raw `I-t` current ranges are not forced to include zero, while background-subtracted `I-t` and the waveform plot keep zero visible when appropriate
 - the color plot uses independent positive and negative current limits so asymmetric data ranges such as `+20 nA / -10 nA` are represented honestly instead of being forced into a symmetric legend
-- the viewer preserves the full active voltage waveform reported by the parser, including custom repeated triangle cycles, and plots a single scan phase by default so `I-t` traces do not interleave multiple baseline families
-- when background subtraction is enabled, the color plot and `I-t` plot subtract a fixed first-scan baseline within each displayed phase family, so moving the background marker does not reshape those overview traces; the visible background marker remains user-selected for the active `CV`, background `CV`, marker-time export, and MATLAB workflows
-- the `CV` plot keeps the full active waveform intact, including custom repeated triangle cycles; to reduce point jitter without cropping, it averages matching 3-scan same-phase windows for the selected and background times, so selecting the same scan as background produces an exactly zero CV
+- the viewer preserves the full active voltage waveform reported by the parser for the selected channel, including custom repeated triangle cycles
+- when background subtraction is enabled, the color plot and `I-t` plot subtract a fixed first-sample baseline within the displayed channel, so moving the background marker does not reshape those overview traces; the visible background marker remains user-selected for the active `CV`, background `CV`, marker-time export, and MATLAB workflows
+- the `CV` plot keeps the full active waveform intact, including custom repeated triangle cycles; to reduce point jitter without cropping, it averages matching 3-sample same-channel windows for the selected and background times, so selecting the same sample as background produces an exactly zero CV
 - the waveform plot uses the active voltage axis decoded by the C reader; its display length comes from `waveform_full_points / sample_rate_hz`, and any time after the active custom waveform is shown as a hold at the first voltage
 - the waveform-program table is read-only and inferred from voltage-axis intervals, matching WaveNeuro's 10-voltage/9-time custom-waveform convention without turning the viewer into waveform-authoring software; real holds become `0 V/s` rows, including one-sample holds between custom waveform segments
 - editing the color-plot time bounds also updates the linked `I-t` time range, and editing the `I-t` time range updates the color-plot scan crop
-- the bandpass filter uses a zero-phase two-pole high-pass and low-pass cascade; for interleaved phase files it filters each phase family independently at that phase family's effective sampling rate
-- `Export Data` remembers the last selected plot checkboxes across launches and writes simple CSV files using the current plot processing state and active phase: color plot rows are `time_s,current_nA,voltage_V`, `I-t` rows are `time_s,current_nA` at the selected voltage crosshair, selected `CV` rows are `voltage_V,current_nA` at the active `T` marker, background `CV` rows are raw `voltage_V,current_nA` at the paired `B` marker, and marker-time rows are paired as `CV_times_s,BG_times_s,CV_scan_index,BG_scan_index`
+- channel switching keeps marker timestamps coherent by remapping `T#` and `B#` markers to the same per-channel sample times in the newly selected channel
+- the bandpass filter uses a zero-phase two-pole high-pass and low-pass cascade; for interleaved files it filters each channel independently at the per-channel CVF sampling rate
+- `Export Data` remembers the last selected plot checkboxes and includes a channel checkbox row above the plot choices; selecting multiple channels or multiple CV/background markers writes labeled long-form CSV rows with `channel_index`, `channel_name`, and marker columns where needed
+- CV export includes every visible `T#` marker for every selected channel, background CV export includes every visible `B#` marker for every selected channel, and marker-time export remaps the shared marker timestamps to the selected channel row indexes
+- Single-channel, single-marker exports preserve the compact legacy CSV headers: color plot rows are `time_s,current_nA,voltage_V`, `I-t` rows are `time_s,current_nA`, selected `CV` rows are `voltage_V,current_nA`, background `CV` rows are raw `voltage_V,current_nA`, and marker-time rows are paired as `CV_times_s,BG_times_s,CV_scan_index,BG_scan_index`
 
 ## MATLAB Integration
 
 The repository includes two MATLAB-friendly integration paths:
 
 - `hdcv --stdout` streams one requested export directly into MATLAB through `system(...)`, avoiding temporary data folders.
-- `matlab/hdcv_mex.c` builds an in-process MEX reader for CV extraction. It returns voltage and current matrices directly from the C parser, using the same selected phase and 3-scan same-phase averaging as the CLI CV export.
+- `matlab/hdcv_mex.c` builds an in-process MEX reader for CV extraction. It returns voltage and current matrices directly from the C parser, using the selected channel and the same 3-sample same-channel averaging as the CLI CV export.
 
 Build the MEX wrapper from MATLAB:
 

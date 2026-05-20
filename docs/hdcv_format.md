@@ -1,159 +1,129 @@
-# HDCV v1001 Sample Format Note
+# HDCV v1001 Format Note
 
-This note documents what was verified directly in `DA_5uM_1.hdcv` and what remains inferred.
+This note documents the HDCV v1001-style WaveNeuro layout implemented by the C reader. The format is proprietary, so these are dataset-backed observations rather than a vendor specification.
 
 ## Scope
 
-Verified against:
+Verified against local files under `/Users/tozturk/PhD/FSCV_Data`, including:
 
-- file: `DA_5uM_1.hdcv`
-- software family: Pine Research WaveNeuro HDCV v1001
+- `RATIO/DA/R10000_DA_5uM.hdcv`
+- `RECT/RECT_P2_200UA.hdcv`
+- `TRI/TRI_-0.4V_P2_200UA_2.hdcv`
 
-The format is proprietary. This note describes the sample-backed layout implemented by the C reader in this repository. It should be treated as version- and sample-qualified, not as a universal Pine spec.
+The older `DA_5uM_1.hdcv` sample remains useful for offsets and single-file validation, but the broader local dataset corrects the old "phase" interpretation. The interleaved row families are recorded channels/electrodes.
 
 ## High-Level Layout
 
-For the sample file, the file is organized as:
+Files are organized as:
 
 1. binary preamble
 2. ASCII metadata block beginning at `[Core Cluster]`
 3. first waveform-template header tail plus first full-cycle waveform data
-4. three additional waveform-template headers and full-cycle waveform data blocks
+4. additional waveform-template headers and full-cycle waveform data blocks
 5. current-matrix header
 6. big-endian float32 current matrix
 
-## Verified Offsets
-
-Absolute offsets in the sample file:
-
-- file size: `30,694,317` bytes
-- metadata start: `161`
-- metadata end at first NUL: `5897`
-- first full-cycle waveform data start: `5929`
-- second full-cycle waveform data start: `46025`
-- third full-cycle waveform data start: `86121`
-- fourth full-cycle waveform data start: `126217`
-- current matrix start: `166317`
-
-The current matrix therefore occupies:
-
-- `30,694,317 - 166,317 = 30,528,000` bytes
-- `30,528,000 / 4 = 7,632,000` float32 values
-- `7,632,000 / 1060 = 7200` scans
-
 ## Metadata Fields Used
 
-Important sample metadata fields:
+Important metadata fields:
 
-- `SampRate = 100000.000000`
-- `CVF = 10.000000`
-- `Wavespecs.<size(s)> = 4`
-- `Wavespecs 0.Data points per scan = 1060`
-- `Wavespecs 0.V1 = -0.400000`
-- `Wavespecs 0.V2 = 1.100000`
-- `Wavespecs 0.Duration of scan (ms) = 10.600000`
-- `Runs = 4`
-- `Run duration = 180.000000`
-- `Delay between runs = 1.000000`
+- `Core Cluster/SampRate`: raw waveform sample rate
+- `Core Cluster/CVF`: per-channel FSCV scan frequency
+- `Setup Cluster/Wavespecs.<size(s)>`: recorded channel/electrode count
+- `Setup Cluster/Wavespecs N.Name`: channel-associated names such as `Ramp0`, `Ramp1`
+- `Setup Cluster/Wavespecs 0.Data points per scan`: active current points per scan
+- `Setup Cluster/Wavespecs 0.V1`, `V2`, and `Duration of scan (ms)`: voltage-axis sanity checks
+
+Numbered `Wavespecs N...` entries and physical waveform-template blocks are tracked separately from the recorded channel count.
 
 ## Waveform Template Blocks
 
-### Verified properties
+Each physical waveform template contains `SampRate / CVF` big-endian float32 values. At `100000 Hz` and `10 Hz`, that is `10000` values for a full `100 ms` cycle.
 
-- The sample contains four identical full-cycle waveform templates.
-- Each template contains `10000` big-endian float32 values.
-- `10000 = SampRate / CVF = 100000 / 10`, so each template covers a full `100 ms` cycle.
-- The first `1060` points are the active FSCV ramp.
-- Points `1060..9999` are a hold at approximately `-0.4 V`.
+The current matrix stores only the active FSCV ramp points, not the full `10000`-point commanded waveform. For example, rectangular files may store `1060` active current points per row while triangular files store `2300`, `2350`, or `2400`.
 
-### Scientific interpretation
+Some valid files declare `Wavespecs.<size(s)> = 3` but include numbered entries through `Wavespecs 3...` and physically store four contiguous waveform templates. The reader therefore:
 
-This means the file stores both:
-
-- the full commanded cycle voltage waveform at the raw sample rate
-- the extracted active FSCV current matrix only for the `1060` ramp points
-
-That distinction matters. The current matrix is not a `10000`-point full-cycle recording per scan.
-
-### Header observations
-
-Between the waveform blocks there are descriptor headers. The repeated full header seen before waveform blocks 2 through 4 is `96` bytes long and contains the ASCII token `RealPoints`.
-
-A representative header suffix contains:
-
-- `RealPoints`
-- a big-endian `uint32` value `1060`
-- a big-endian `float64` sample period `1e-5`
-- a big-endian `uint32` full-cycle point count `10000`
-
-The first waveform block header appears to begin before the metadata NUL boundary, so only its tail is plainly visible after `metadata_end`.
-
-Some valid WaveNeuro files have misleading `Wavespecs.<size(s)>` metadata. For example, a file may declare `3` but also include numbered entries through `Wavespecs 3...` and physically store four contiguous full-cycle waveform templates. The reader therefore uses the larger of the declared size and the numbered WaveSpec entries, then keeps detecting contiguous waveform-template blocks before locating the current matrix.
+- uses `Wavespecs.<size(s)>` as recorded channel count
+- uses numbered WaveSpec entries only to estimate how many physical waveform templates to expect
+- keeps detecting contiguous physical waveform-template blocks before locating the current matrix
 
 ## Current Matrix Block
 
-### Verified properties
+The current matrix is stored as big-endian float32 rows of `points_per_scan` values.
 
-- The current matrix begins at absolute offset `166317`.
-- It is stored as big-endian float32.
-- Matrix shape is `7200 x 1060`.
-- Adjacent scans are highly correlated, as expected for sequential FSCV background-dominated traces.
+The current-matrix header tail is interpreted as:
 
-### Header observations
+```text
+samples_per_channel, channel_count, points_per_scan
+```
 
-Immediately before the current matrix is a `100`-byte header-like block. Its tail ends with:
+Rows are interleaved by channel:
 
-- `1800`
-- `4`
-- `1060`
+```text
+row_index = sample_index * channel_count + channel_index
+```
 
-Those fields are consistent with:
+Sequence time is therefore:
 
-- `1800 scans/run`
-- `4 runs`
-- `1060 points/scan`
+```text
+time_s = sample_index / CVF
+```
 
-`1800 * 4 = 7200`, which exactly matches the scan matrix length.
+not `row_index / CVF`.
 
-### Time-axis implication
+## Dataset Evidence
 
-The stored scan matrix contains `7200` scans, which corresponds to active FSCV acquisition only:
+All 26 `.hdcv` files under `/Users/tozturk/PhD/FSCV_Data` matched:
 
-- `4 runs * 180 s/run * 10 scans/s = 7200 scans`
+```text
+current_matrix_rows == samples_per_channel * channel_count
+```
 
-The 1-second inter-run delays are not represented as extra scan rows in the matrix itself.
+Representative files:
 
-As a result, two time axes are useful:
+| File | `Wavespecs.<size(s)>` | Numbered WaveSpecs | Physical templates | Header tail | Matrix rows |
+| --- | ---: | ---: | ---: | --- | ---: |
+| `RATIO/DA/R10000_DA_5uM.hdcv` | 4 | 4 | 4 | `1905, 4, 1501` | 7620 |
+| `RECT/RECT_P2_200UA.hdcv` | 3 | 4 | 4 | `305, 3, 1060` | 915 |
+| `TRI/TRI_-0.4V_P2_200UA_2.hdcv` | 3 | 4 | 4 | `947, 3, 2350` | 2841 |
 
-- sequence time: `scan_index / CVF`, contiguous from `0.0` to `719.9 s`
-- experiment time: sequence time with the 1-second gaps restored between runs, from `0.0` to `722.9 s`
+The `RECT` and `TRI` examples are the clearest correction: they physically contain four waveform-template blocks, but the recorded current matrix has three interleaved channels.
 
-## Why The Existing Python Heuristic Was Not Enough
+## Background And Filtering
 
-The existing `hdcv_decoder.py` script correctly finds and parses the metadata block, but its current-matrix inference is heuristic. On the sample file, the guessed offset lands too early and folds waveform-template bytes into the leading rows.
+Background subtraction must be channel-local. A background row is aligned to the same channel modulo as the selected row, and overview traces use the first sample in the same channel as the fixed baseline.
 
-The C reader avoids that by:
+Butterworth filtering is also channel-local. Because `CVF` is already the per-channel scan frequency, each channel trace is filtered at `CVF`, not at `CVF / channel_count`.
 
-1. using metadata-derived `SampRate`, `CVF`, and `Data points per scan`
-2. locating the four full-cycle waveform blocks directly
-3. locating the current matrix only after those blocks
-4. validating that the resulting scan count matches run timing
+## Time Axes
+
+Sequence time is contiguous per channel:
+
+```text
+sample_index / CVF
+```
+
+Experiment timing from `Run duration`, `Delay between runs`, and `Runs` is used only when the metadata-derived run structure matches `samples_per_channel`. Several local files have short captures where the header `samples_per_channel` does not match the configured run duration, so the reader preserves sequence time in those cases.
+
+## Reader Strategy
+
+The C reader avoids the old Python heuristic by:
+
+1. parsing metadata-derived sample rate, CVF, channel count, and points per scan
+2. locating physical full-cycle waveform-template blocks directly
+3. locating the current matrix only after those physical templates
+4. validating the matrix size against `samples_per_channel * channel_count`
+5. exposing both physical template count and recorded channel count in `hdcv_layout`
 
 ## Units
 
-The current matrix values are already float32 values in the file. No extra integer ADC scaling was identified in the sample. The existing Python tool labels them as current, and the magnitudes look consistent with nA-scale FSCV traces, but the file itself does not expose an extra scaling field used by the reader.
+The current matrix values are already float32 values in the file. No extra integer ADC scaling has been identified. The magnitudes are treated as nA-scale current values by the reader, CLI, viewer, and MATLAB wrapper.
 
-## Uncertainties
+## Remaining Uncertainties
 
-The following remain uncertain without more files or vendor documentation:
-
-- whether the four waveform blocks correspond strictly to four `Wavespecs`, four runs, or both
-- the meaning of several non-ASCII fields in the waveform and current headers
+- meaning of several non-ASCII fields in waveform and current headers
 - whether all HDCV v1001 exports use the same partial first-wave header behavior at the metadata boundary
-- whether multichannel acquisitions store additional current matrices or alternative interleaving schemes
+- whether future datasets can contain more physical waveform templates than numbered WaveSpecs
 
-The implementation is therefore conservative:
-
-- it validates size and offsets before reading
-- it uses the metadata and repeated block structure together
-- it fails with a clear error if the expected block pattern is not found
+The implementation is conservative: it validates size and offsets before reading, keeps physical waveform-template detection separate from channel count, and fails with a clear error if the expected block pattern is not found.

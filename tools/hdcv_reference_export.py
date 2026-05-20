@@ -7,7 +7,7 @@ offset for the sample file is heuristic. This script uses the sample-verified
 layout that the C parser also follows:
 
 - text metadata block
-- four 10,000-point full-cycle waveform templates
+- physical full-cycle waveform templates
 - one current-matrix header
 - big-endian float32 current matrix
 """
@@ -58,21 +58,22 @@ def get_int(metadata: Dict[str, Dict[str, str]], section: str, key: str) -> int:
     return int(round(float(metadata[section][key])))
 
 
-def infer_wavespec_count(metadata: Dict[str, Dict[str, str]]) -> int:
+def infer_wavespec_counts(metadata: Dict[str, Dict[str, str]]) -> Tuple[int, int]:
     declared = get_int(metadata, "Setup Cluster", "Wavespecs.<size(s)>")
     numbered = [
         int(key.split(".", 1)[0].split()[1]) + 1
         for key in metadata["Setup Cluster"]
         if key.startswith("Wavespecs ") and "." in key and key.split(".", 1)[0].split()[1].isdigit()
     ]
-    return max([declared, *numbered])
+    return declared, max(numbered, default=0)
 
 
 def find_layout(raw: bytes, metadata: Dict[str, Dict[str, str]], metadata_end: int) -> Dict[str, object]:
     sample_rate = get_float(metadata, "Core Cluster", "SampRate")
     cvf = get_float(metadata, "Core Cluster", "CVF")
     points_per_scan = get_int(metadata, "Setup Cluster", "Wavespecs 0.Data points per scan")
-    waveform_count = infer_wavespec_count(metadata)
+    channel_count, numbered_wavespec_count = infer_wavespec_counts(metadata)
+    expected_waveform_count = max(channel_count, numbered_wavespec_count, 1)
     run_count = get_int(metadata, "Experiment control cluster", "Runs")
     run_duration_s = get_float(metadata, "Experiment control cluster", "Run duration")
     delay_between_runs_s = get_float(metadata, "Experiment control cluster", "Delay between runs")
@@ -91,14 +92,22 @@ def find_layout(raw: bytes, metadata: Dict[str, Dict[str, str]], metadata_end: i
 
     first_count_offset = find_full_wave_count(metadata_end, metadata_end + 256)
     wave_data_offsets: List[int] = [first_count_offset + 4]
-    for _ in range(1, waveform_count):
+    for _ in range(1, expected_waveform_count):
         prev_end = wave_data_offsets[-1] + (full_wave_points * 4)
         count_offset = find_full_wave_count(prev_end, prev_end + 256)
         wave_data_offsets.append(count_offset + 4)
 
+    while True:
+        prev_end = wave_data_offsets[-1] + (full_wave_points * 4)
+        try:
+            count_offset = find_full_wave_count(prev_end, prev_end + 256)
+        except ValueError:
+            break
+        wave_data_offsets.append(count_offset + 4)
+
     last_wave_end = wave_data_offsets[-1] + (full_wave_points * 4)
     expected_scans_per_run = int(round(run_duration_s * cvf))
-    expected_scan_count = expected_scans_per_run * run_count
+    expected_row_count = expected_scans_per_run * run_count * channel_count
     row_bytes = points_per_scan * 4
 
     best = None
@@ -109,41 +118,53 @@ def find_layout(raw: bytes, metadata: Dict[str, Dict[str, str]], metadata_end: i
         remaining = len(raw) - data_offset
         if remaining % row_bytes != 0:
             continue
-        scan_count = remaining // row_bytes
-        sample = np.frombuffer(raw, dtype=">f4", count=min(2, scan_count) * points_per_scan, offset=data_offset)
+        row_count = remaining // row_bytes
+        header_samples_per_channel = int.from_bytes(raw[data_offset - 12:data_offset - 8], "big")
+        header_channel_count = int.from_bytes(raw[data_offset - 8:data_offset - 4], "big")
+        header_points = int.from_bytes(raw[data_offset - 4:data_offset], "big")
+        header_match = (
+            header_points == points_per_scan
+            and header_channel_count == channel_count
+            and header_samples_per_channel * header_channel_count == row_count
+        )
+        sample = np.frombuffer(raw, dtype=">f4", count=min(2, row_count) * points_per_scan, offset=data_offset)
         if sample.size < 2 * points_per_scan:
             continue
-        sample = sample.reshape(min(2, scan_count), points_per_scan).astype(np.float64)
+        sample = sample.reshape(min(2, row_count), points_per_scan).astype(np.float64)
         corr = np.corrcoef(sample[0], sample[1])[0, 1]
         score = corr * 1000.0
         score += min(sample[0].std(), 1000.0) + min(sample[1].std(), 1000.0)
-        if scan_count == expected_scan_count:
+        if header_match:
+            score += 20000.0
+        if row_count == expected_row_count:
             score += 10000.0
         if best is None or score > best[0]:
-            best = (score, off, data_offset, scan_count)
+            best = (score, off, data_offset, row_count, header_samples_per_channel, header_channel_count, header_points)
 
     if best is None:
         raise ValueError("Could not locate current matrix.")
 
-    _, current_count_offset, current_matrix_offset, scan_count = best
-    header_scans_per_run = int.from_bytes(raw[current_matrix_offset - 12:current_matrix_offset - 8], "big")
-    header_run_count = int.from_bytes(raw[current_matrix_offset - 8:current_matrix_offset - 4], "big")
-    header_points = int.from_bytes(raw[current_matrix_offset - 4:current_matrix_offset], "big")
+    _, current_count_offset, current_matrix_offset, row_count, samples_per_channel, header_channel_count, header_points = best
     if header_points != points_per_scan:
         raise ValueError("Current header tail does not end with points-per-scan.")
+    if header_channel_count != channel_count or samples_per_channel * channel_count != row_count:
+        raise ValueError("Current header tail does not match channel count and row count.")
 
     return {
         "sample_rate_hz": sample_rate,
         "cvf_hz": cvf,
         "points_per_scan": points_per_scan,
-        "waveform_count": waveform_count,
+        "channel_count": channel_count,
+        "numbered_wavespec_count": numbered_wavespec_count,
+        "physical_waveform_template_count": len(wave_data_offsets),
         "full_wave_points": full_wave_points,
         "wave_data_offsets": wave_data_offsets,
         "current_count_offset": current_count_offset,
         "current_matrix_offset": current_matrix_offset,
-        "scan_count": scan_count,
-        "run_count": header_run_count,
-        "scans_per_run": header_scans_per_run,
+        "current_matrix_row_count": row_count,
+        "samples_per_channel": samples_per_channel,
+        "run_count": run_count,
+        "scans_per_run": expected_scans_per_run,
         "run_duration_s": run_duration_s,
         "delay_between_runs_s": delay_between_runs_s,
         "v1_v": get_float(metadata, "Setup Cluster", "Wavespecs 0.V1"),
@@ -183,12 +204,12 @@ def main() -> None:
         dtype=">f4",
         mode="r",
         offset=int(layout["current_matrix_offset"]),
-        shape=(int(layout["scan_count"]), int(layout["points_per_scan"])),
+        shape=(int(layout["current_matrix_row_count"]), int(layout["points_per_scan"])),
     )
 
     first_idx = 0
-    middle_idx = int(layout["scan_count"]) // 2
-    last_idx = int(layout["scan_count"]) - 1
+    middle_idx = (int(layout["samples_per_channel"]) // 2) * int(layout["channel_count"])
+    last_idx = (int(layout["samples_per_channel"]) - 1) * int(layout["channel_count"])
     matrix[first_idx].astype("<f4").tofile(args.out / "scan_first.f32")
     matrix[middle_idx].astype("<f4").tofile(args.out / "scan_middle.f32")
     matrix[last_idx].astype("<f4").tofile(args.out / "scan_last.f32")
@@ -200,10 +221,14 @@ def main() -> None:
         "metadata_end_offset": metadata_end,
         "first_wave_data_offset": int(layout["wave_data_offsets"][0]),
         "current_matrix_offset": int(layout["current_matrix_offset"]),
-        "waveform_count": int(layout["waveform_count"]),
+        "waveform_count": int(layout["physical_waveform_template_count"]),
+        "physical_waveform_template_count": int(layout["physical_waveform_template_count"]),
+        "channel_count": int(layout["channel_count"]),
+        "samples_per_channel": int(layout["samples_per_channel"]),
+        "current_matrix_row_count": int(layout["current_matrix_row_count"]),
         "waveform_full_points": int(layout["full_wave_points"]),
         "points_per_scan": int(layout["points_per_scan"]),
-        "scan_count": int(layout["scan_count"]),
+        "scan_count": int(layout["current_matrix_row_count"]),
         "sample_rate_hz": float(layout["sample_rate_hz"]),
         "cvf_hz": float(layout["cvf_hz"]),
         "run_count": int(layout["run_count"]),
@@ -214,14 +239,14 @@ def main() -> None:
         "middle_scan_index": middle_idx,
         "last_scan_index": last_idx,
         "first_scan_time_sequence_s": 0.0,
-        "middle_scan_time_sequence_s": middle_idx / float(layout["cvf_hz"]),
-        "last_scan_time_sequence_s": last_idx / float(layout["cvf_hz"]),
-        "middle_scan_time_experiment_s": (middle_idx // int(layout["scans_per_run"])) * (
+        "middle_scan_time_sequence_s": (middle_idx // int(layout["channel_count"])) / float(layout["cvf_hz"]),
+        "last_scan_time_sequence_s": (last_idx // int(layout["channel_count"])) / float(layout["cvf_hz"]),
+        "middle_scan_time_experiment_s": ((middle_idx // int(layout["channel_count"])) // int(layout["scans_per_run"])) * (
             float(layout["run_duration_s"]) + float(layout["delay_between_runs_s"])
-        ) + (middle_idx % int(layout["scans_per_run"])) / float(layout["cvf_hz"]),
-        "last_scan_time_experiment_s": (last_idx // int(layout["scans_per_run"])) * (
+        ) + ((middle_idx // int(layout["channel_count"])) % int(layout["scans_per_run"])) / float(layout["cvf_hz"]),
+        "last_scan_time_experiment_s": ((last_idx // int(layout["channel_count"])) // int(layout["scans_per_run"])) * (
             float(layout["run_duration_s"]) + float(layout["delay_between_runs_s"])
-        ) + (last_idx % int(layout["scans_per_run"])) / float(layout["cvf_hz"]),
+        ) + ((last_idx // int(layout["channel_count"])) % int(layout["scans_per_run"])) / float(layout["cvf_hz"]),
     }
     write_manifest(args.out / "manifest.txt", manifest)
 

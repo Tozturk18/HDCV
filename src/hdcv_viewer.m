@@ -170,7 +170,12 @@ static NSString *const HDCVExportOptionsDefaultsKey = @"HDCVExportOptions";
 - (double)cvfHz;
 - (double)scanIntervalSeconds;
 - (double)scanDurationSeconds;
-- (uint32_t)phasePeriod;
+- (uint32_t)channelCount;
+- (uint32_t)samplesPerChannel;
+- (uint32_t)activeChannelIndex;
+- (NSString *)channelNameAtIndex:(NSUInteger)channelIndex;
+- (BOOL)copyVoltageForChannelIndex:(NSUInteger)channelIndex intoMutableData:(NSMutableData *)buffer;
+- (BOOL)setActiveChannelIndex:(NSUInteger)channelIndex error:(NSError **)error;
 - (uint32_t)runCount;
 - (uint32_t)scansPerRun;
 - (BOOL)hasExperimentTiming;
@@ -467,14 +472,14 @@ static BOOL HDCVDecodeMarkerFieldTag(NSInteger tag, HDCVTimeMarkerKind *outKind,
     return YES;
 }
 
-static NSUInteger HDCVPhaseAlignedBackgroundIndex(
+static NSUInteger HDCVChannelAlignedBackgroundIndex(
     NSUInteger rawBackgroundIndex,
     NSUInteger scanIndex,
     NSUInteger scanCount,
-    NSUInteger phasePeriod
+    NSUInteger channelCount
 )
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger period = MAX(channelCount, 1U);
     NSUInteger rawIndex;
     NSUInteger targetMod;
     double nearestPeriod;
@@ -502,21 +507,21 @@ static NSUInteger HDCVPhaseAlignedBackgroundIndex(
     return (NSUInteger)MAX(0, MIN(maxScan, nearest));
 }
 
-static BOOL HDCVScanIndexMatchesPhase(NSUInteger scanIndex, NSUInteger phaseIndex, NSUInteger phasePeriod)
+static BOOL HDCVRowIndexMatchesChannel(NSUInteger scanIndex, NSUInteger channelIndex, NSUInteger channelCount)
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
-    return period <= 1U || (scanIndex % period) == (phaseIndex % period);
+    NSUInteger period = MAX(channelCount, 1U);
+    return period <= 1U || (scanIndex % period) == (channelIndex % period);
 }
 
-static NSUInteger HDCVNearestScanIndexForPhase(
+static NSUInteger HDCVNearestRowIndexForChannel(
     NSUInteger scanIndex,
     NSUInteger scanCount,
-    NSUInteger phaseIndex,
-    NSUInteger phasePeriod
+    NSUInteger channelIndex,
+    NSUInteger channelCount
 )
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
-    NSUInteger targetPhase = phaseIndex % period;
+    NSUInteger period = MAX(channelCount, 1U);
+    NSUInteger targetChannel = channelIndex % period;
     NSInteger candidate;
     NSInteger maxScan;
 
@@ -526,11 +531,11 @@ static NSUInteger HDCVNearestScanIndexForPhase(
     if (period <= 1U || scanCount <= 1U) {
         return MIN(scanIndex, scanCount - 1U);
     }
-    if (targetPhase >= scanCount) {
-        targetPhase = 0U;
+    if (targetChannel >= scanCount) {
+        targetChannel = 0U;
     }
 
-    candidate = (NSInteger)targetPhase + (NSInteger)llround(((double)scanIndex - (double)targetPhase) / (double)period) * (NSInteger)period;
+    candidate = (NSInteger)targetChannel + (NSInteger)llround(((double)scanIndex - (double)targetChannel) / (double)period) * (NSInteger)period;
     maxScan = (NSInteger)scanCount - 1;
     while (candidate < 0) {
         candidate += (NSInteger)period;
@@ -541,14 +546,14 @@ static NSUInteger HDCVNearestScanIndexForPhase(
     return (NSUInteger)MAX(0, MIN(maxScan, candidate));
 }
 
-static NSUInteger HDCVScanIndexForPhaseSample(
+static NSUInteger HDCVRowIndexForChannelSample(
     NSUInteger sampleIndex,
     NSUInteger scanCount,
-    NSUInteger phaseIndex,
-    NSUInteger phasePeriod
+    NSUInteger channelIndex,
+    NSUInteger channelCount
 )
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger period = MAX(channelCount, 1U);
     NSUInteger scanIndex;
 
     if (scanCount == 0U) {
@@ -557,14 +562,35 @@ static NSUInteger HDCVScanIndexForPhaseSample(
     if (period <= 1U) {
         return MIN(sampleIndex, scanCount - 1U);
     }
-    scanIndex = (phaseIndex % period) + (sampleIndex * period);
+    scanIndex = (channelIndex % period) + (sampleIndex * period);
     return MIN(scanIndex, scanCount - 1U);
 }
 
-static NSUInteger HDCVPhaseSampleCount(NSUInteger scanCount, NSUInteger phaseIndex, NSUInteger phasePeriod)
+static NSUInteger HDCVSampleIndexForRow(NSUInteger scanIndex, NSUInteger channelCount)
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
-    NSUInteger firstScan = phaseIndex % period;
+    NSUInteger period = MAX(channelCount, 1U);
+    return period <= 1U ? scanIndex : (scanIndex / period);
+}
+
+static NSUInteger HDCVRowIndexForSourceSampleAndChannel(
+    NSUInteger sourceScanIndex,
+    NSUInteger scanCount,
+    NSUInteger channelIndex,
+    NSUInteger channelCount
+)
+{
+    return HDCVRowIndexForChannelSample(
+        HDCVSampleIndexForRow(sourceScanIndex, channelCount),
+        scanCount,
+        channelIndex,
+        channelCount
+    );
+}
+
+static NSUInteger HDCVChannelSampleCount(NSUInteger scanCount, NSUInteger channelIndex, NSUInteger channelCount)
+{
+    NSUInteger period = MAX(channelCount, 1U);
+    NSUInteger firstScan = channelIndex % period;
 
     if (scanCount == 0U) {
         return 0U;
@@ -578,15 +604,15 @@ static NSUInteger HDCVPhaseSampleCount(NSUInteger scanCount, NSUInteger phaseInd
     return ((scanCount - 1U - firstScan) / period) + 1U;
 }
 
-static NSUInteger HDCVFirstPhaseScanInRange(
+static NSUInteger HDCVFirstChannelRowInRange(
     NSUInteger minScan,
     NSUInteger maxScan,
-    NSUInteger phaseIndex,
-    NSUInteger phasePeriod
+    NSUInteger channelIndex,
+    NSUInteger channelCount
 )
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
-    NSUInteger targetPhase = phaseIndex % period;
+    NSUInteger period = MAX(channelCount, 1U);
+    NSUInteger targetChannel = channelIndex % period;
     NSUInteger remainder;
     NSUInteger delta;
 
@@ -597,22 +623,22 @@ static NSUInteger HDCVFirstPhaseScanInRange(
         return minScan;
     }
     remainder = minScan % period;
-    delta = (targetPhase + period - remainder) % period;
+    delta = (targetChannel + period - remainder) % period;
     if (minScan + delta > maxScan) {
         return NSNotFound;
     }
     return minScan + delta;
 }
 
-static NSUInteger HDCVPhaseSampleCountInRange(
+static NSUInteger HDCVChannelSampleCountInRange(
     NSUInteger minScan,
     NSUInteger maxScan,
-    NSUInteger phaseIndex,
-    NSUInteger phasePeriod
+    NSUInteger channelIndex,
+    NSUInteger channelCount
 )
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
-    NSUInteger firstScan = HDCVFirstPhaseScanInRange(minScan, maxScan, phaseIndex, period);
+    NSUInteger period = MAX(channelCount, 1U);
+    NSUInteger firstScan = HDCVFirstChannelRowInRange(minScan, maxScan, channelIndex, period);
 
     if (firstScan == NSNotFound) {
         return 0U;
@@ -623,17 +649,17 @@ static NSUInteger HDCVPhaseSampleCountInRange(
     return ((maxScan - firstScan) / period) + 1U;
 }
 
-static float HDCVAverageTraceInPhaseWindow(
+static float HDCVAverageTraceInChannelWindow(
     const float *trace,
     NSUInteger scanCount,
     NSUInteger centerScan,
-    NSUInteger phaseIndex,
-    NSUInteger phasePeriod,
+    NSUInteger channelIndex,
+    NSUInteger channelCount,
     NSUInteger halfWindow
 )
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
-    NSUInteger center = HDCVNearestScanIndexForPhase(centerScan, scanCount, phaseIndex, period);
+    NSUInteger period = MAX(channelCount, 1U);
+    NSUInteger center = HDCVNearestRowIndexForChannel(centerScan, scanCount, channelIndex, period);
     NSInteger start = (NSInteger)center - ((NSInteger)halfWindow * (NSInteger)period);
     NSInteger end = (NSInteger)center + ((NSInteger)halfWindow * (NSInteger)period);
     double sum = 0.0;
@@ -663,23 +689,23 @@ static float HDCVAverageTraceInPhaseWindow(
     return (float)(sum / (double)count);
 }
 
-static void HDCVApplyPhaseAlignedBackgroundToTrace(
+static void HDCVApplyChannelAlignedBackgroundToTrace(
     const float *source,
     float *destination,
     NSUInteger scanCount,
     NSUInteger rawBackgroundIndex,
-    NSUInteger phasePeriod
+    NSUInteger channelCount
 )
 {
     for (NSUInteger scanIndex = 0U; scanIndex < scanCount; ++scanIndex) {
-        NSUInteger alignedIndex = HDCVPhaseAlignedBackgroundIndex(rawBackgroundIndex, scanIndex, scanCount, phasePeriod);
+        NSUInteger alignedIndex = HDCVChannelAlignedBackgroundIndex(rawBackgroundIndex, scanIndex, scanCount, channelCount);
         destination[scanIndex] = source[scanIndex] - source[alignedIndex];
     }
 }
 
-static NSUInteger HDCVFixedPhaseBaselineIndexForScan(NSUInteger scanIndex, NSUInteger scanCount, NSUInteger phasePeriod)
+static NSUInteger HDCVFixedChannelBaselineIndexForRow(NSUInteger scanIndex, NSUInteger scanCount, NSUInteger channelCount)
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger period = MAX(channelCount, 1U);
     NSUInteger baselineIndex;
 
     if (scanCount == 0U) {
@@ -692,30 +718,34 @@ static NSUInteger HDCVFixedPhaseBaselineIndexForScan(NSUInteger scanIndex, NSUIn
     return (baselineIndex < scanCount) ? baselineIndex : 0U;
 }
 
-static void HDCVApplyFixedPhaseBaselineToTrace(
+static void HDCVApplyFixedChannelBaselineToTrace(
     const float *source,
     float *destination,
     NSUInteger scanCount,
-    NSUInteger phasePeriod
+    NSUInteger channelCount
 )
 {
     for (NSUInteger scanIndex = 0U; scanIndex < scanCount; ++scanIndex) {
-        NSUInteger baselineIndex = HDCVFixedPhaseBaselineIndexForScan(scanIndex, scanCount, phasePeriod);
+        NSUInteger baselineIndex = HDCVFixedChannelBaselineIndexForRow(scanIndex, scanCount, channelCount);
         destination[scanIndex] = source[scanIndex] - source[baselineIndex];
     }
 }
 
+static NSError *HDCVCSVError(NSURL *url, NSString *message)
+{
+    return [NSError errorWithDomain:HDCVViewerErrorDomain
+                               code:11
+                           userInfo:@{
+                               NSLocalizedDescriptionKey: message,
+                               NSURLErrorKey: url
+                           }];
+}
+
 static void HDCVSetCSVError(NSError **error, NSURL *url, NSString *message)
 {
-    if (error == NULL) {
-        return;
+    if (error != NULL) {
+        *error = HDCVCSVError(url, message);
     }
-    *error = [NSError errorWithDomain:HDCVViewerErrorDomain
-                                 code:11
-                             userInfo:@{
-                                 NSLocalizedDescriptionKey: message,
-                                 NSURLErrorKey: url
-                             }];
 }
 
 static FILE *HDCVOpenCSVFile(NSURL *url, NSError **error)
@@ -740,6 +770,36 @@ static BOOL HDCVCloseCSVFile(FILE *file, NSURL *url, NSError **error)
         return NO;
     }
     return YES;
+}
+
+static void HDCVWriteCSVString(FILE *file, NSString *string)
+{
+    const char *utf8 = (string == nil) ? "" : string.UTF8String;
+
+    fputc('"', file);
+    for (const char *p = utf8; p != NULL && *p != '\0'; ++p) {
+        if (*p == '"') {
+            fputc('"', file);
+        }
+        fputc(*p, file);
+    }
+    fputc('"', file);
+}
+
+static NSString *HDCVChannelNameForCSV(HDCVLoadedFile *loadedFile, NSUInteger channelIndex)
+{
+    NSString *name = [loadedFile channelNameAtIndex:channelIndex];
+    return (name.length > 0U)
+        ? name
+        : [NSString stringWithFormat:@"Channel %lu", (unsigned long)(channelIndex + 1U)];
+}
+
+static NSString *HDCVChannelCheckboxTitle(HDCVLoadedFile *loadedFile, NSUInteger channelIndex)
+{
+    NSString *name = [loadedFile channelNameAtIndex:channelIndex];
+    return (name.length > 0U)
+        ? [NSString stringWithFormat:@"Ch %lu - %@", (unsigned long)(channelIndex + 1U), name]
+        : [NSString stringWithFormat:@"Channel %lu", (unsigned long)(channelIndex + 1U)];
 }
 
 static NSURL *HDCVExportURLForSuffix(NSURL *baseURL, NSString *suffix, BOOL singleFile)
@@ -1332,18 +1392,18 @@ static void HDCVRobustRange(const float *values, size_t count, float *outMin, fl
     }
 }
 
-static void HDCVRobustRangeForPhase(
+static void HDCVRobustRangeForChannel(
     const float *values,
     size_t count,
-    NSUInteger phaseIndex,
-    NSUInteger phasePeriod,
+    NSUInteger channelIndex,
+    NSUInteger channelCount,
     float *outMin,
     float *outMax
 )
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
-    NSUInteger phase = phaseIndex % period;
-    size_t phaseCount;
+    NSUInteger period = MAX(channelCount, 1U);
+    NSUInteger channel = channelIndex % period;
+    size_t channelSampleCount;
     float *samples;
     size_t sampleCount = 0U;
     float minValue;
@@ -1354,9 +1414,9 @@ static void HDCVRobustRangeForPhase(
         return;
     }
 
-    phaseCount = HDCVPhaseSampleCount(count, phase, period);
-    samples = (float *)malloc(MAX((size_t)1U, phaseCount) * sizeof(*samples));
-    if (samples == NULL || phaseCount == 0U) {
+    channelSampleCount = HDCVChannelSampleCount(count, channel, period);
+    samples = (float *)malloc(MAX((size_t)1U, channelSampleCount) * sizeof(*samples));
+    if (samples == NULL || channelSampleCount == 0U) {
         free(samples);
         if (outMin != NULL) {
             *outMin = 0.0f;
@@ -1367,7 +1427,7 @@ static void HDCVRobustRangeForPhase(
         return;
     }
 
-    for (NSUInteger scanIndex = phase; scanIndex < count; scanIndex += period) {
+    for (NSUInteger scanIndex = channel; scanIndex < count; scanIndex += period) {
         float value = values[scanIndex];
         if (isfinite(value)) {
             samples[sampleCount++] = value;
@@ -1402,35 +1462,35 @@ static void HDCVRobustRangeForPhase(
     }
 }
 
-static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSUInteger phasePeriod, double scanRateHz)
+static BOOL HDCVApplyButterworthBandpassByChannel(float *values, size_t count, NSUInteger channelCount, double cvfHz)
 {
-    NSUInteger period = MAX(phasePeriod, 1U);
+    NSUInteger period = MAX(channelCount, 1U);
     BOOL filtered = NO;
 
     if (period <= 1U) {
-        return HDCVApplyButterworthBandpass(values, count, scanRateHz);
+        return HDCVApplyButterworthBandpass(values, count, cvfHz);
     }
 
-    for (NSUInteger phase = 0U; phase < period; ++phase) {
-        NSUInteger phaseCount = HDCVPhaseSampleCount(count, phase, period);
-        NSMutableData *phaseData;
-        float *phaseValues;
+    for (NSUInteger channel = 0U; channel < period; ++channel) {
+        NSUInteger channelSampleCount = HDCVChannelSampleCount(count, channel, period);
+        NSMutableData *channelData;
+        float *channelValues;
         NSUInteger j = 0U;
 
-        if (phaseCount == 0U) {
+        if (channelSampleCount == 0U) {
             continue;
         }
 
-        phaseData = [NSMutableData dataWithLength:phaseCount * sizeof(float)];
-        phaseValues = phaseData.mutableBytes;
-        for (NSUInteger scanIndex = phase; scanIndex < count; scanIndex += period) {
-            phaseValues[j++] = values[scanIndex];
+        channelData = [NSMutableData dataWithLength:channelSampleCount * sizeof(float)];
+        channelValues = channelData.mutableBytes;
+        for (NSUInteger scanIndex = channel; scanIndex < count; scanIndex += period) {
+            channelValues[j++] = values[scanIndex];
         }
 
-        if (HDCVApplyButterworthBandpass(phaseValues, phaseCount, scanRateHz / (double)period)) {
+        if (HDCVApplyButterworthBandpass(channelValues, channelSampleCount, cvfHz)) {
             j = 0U;
-            for (NSUInteger scanIndex = phase; scanIndex < count; scanIndex += period) {
-                values[scanIndex] = phaseValues[j++];
+            for (NSUInteger scanIndex = channel; scanIndex < count; scanIndex += period) {
+                values[scanIndex] = channelValues[j++];
             }
             filtered = YES;
         }
@@ -3492,6 +3552,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     uint32_t _overviewColumnCount;
     uint32_t _waveformPointCount;
     uint32_t _waveformFullPointCount;
+    uint32_t _activeChannelIndex;
     double _waveformCycleDurationSeconds;
     double _waveformFullDurationSeconds;
     float _overviewMinValue;
@@ -3515,17 +3576,6 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
     _isOpen = YES;
 
-    NSMutableData *voltageBuffer = [NSMutableData dataWithLength:(NSUInteger)_reader.layout.points_per_scan * sizeof(float)];
-    if (!hdcv_reader_copy_voltage(&_reader, voltageBuffer.mutableBytes, _reader.layout.points_per_scan)) {
-        if (error != NULL) {
-            *error = [NSError errorWithDomain:HDCVViewerErrorDomain
-                                         code:2
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Failed to copy active voltage waveform."}];
-        }
-        return nil;
-    }
-
-    _voltageData = [voltageBuffer copy];
     _waveformPointCount = _reader.layout.points_per_scan;
     _waveformFullPointCount = _reader.layout.waveform_full_points;
     _waveformCycleDurationSeconds = (_waveformPointCount > 0U)
@@ -3534,7 +3584,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _waveformFullDurationSeconds = (_waveformFullPointCount > 0U && _reader.layout.sample_rate_hz > 0.0)
         ? (double)_waveformFullPointCount / _reader.layout.sample_rate_hz
         : _waveformCycleDurationSeconds;
-    _waveformData = _voltageData;
+    if (![self setActiveChannelIndex:0U error:error]) {
+        return nil;
+    }
 
     {
         uint32_t overviewColumns = (uint32_t)MAX((NSUInteger)256U, MIN(maxOverviewColumns, (NSUInteger)2048U));
@@ -3580,7 +3632,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (double)cvfHz { return _reader.layout.cvf_hz; }
 - (double)scanIntervalSeconds { return _reader.layout.scan_interval_s; }
 - (double)scanDurationSeconds { return _reader.layout.scan_duration_s; }
-- (uint32_t)phasePeriod { return MAX(_reader.layout.waveform_count, 1U); }
+- (uint32_t)channelCount { return MAX(_reader.layout.channel_count, 1U); }
+- (uint32_t)samplesPerChannel { return _reader.layout.samples_per_channel; }
+- (uint32_t)activeChannelIndex { return _activeChannelIndex; }
 - (uint32_t)runCount { return _reader.layout.run_count; }
 - (uint32_t)scansPerRun { return _reader.layout.scans_per_run; }
 - (BOOL)hasExperimentTiming { return _reader.layout.has_experiment_timing != 0; }
@@ -3593,6 +3647,45 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (NSData *)voltageData { return _voltageData; }
 - (NSData *)waveformData { return _waveformData; }
 - (NSData *)overviewData { return _overviewData; }
+
+- (NSString *)channelNameAtIndex:(NSUInteger)channelIndex
+{
+    if (channelIndex >= _reader.layout.channel_count) {
+        channelIndex = 0U;
+    }
+    return [NSString stringWithUTF8String:hdcv_reader_channel_name(&_reader, (uint32_t)channelIndex)];
+}
+
+- (BOOL)copyVoltageForChannelIndex:(NSUInteger)channelIndex intoMutableData:(NSMutableData *)buffer
+{
+    if (channelIndex >= _reader.layout.channel_count) {
+        channelIndex = 0U;
+    }
+    buffer.length = (NSUInteger)_reader.layout.points_per_scan * sizeof(float);
+    return hdcv_reader_copy_voltage_for_channel(&_reader, (uint32_t)channelIndex, buffer.mutableBytes, _reader.layout.points_per_scan) != 0;
+}
+
+- (BOOL)setActiveChannelIndex:(NSUInteger)channelIndex error:(NSError **)error
+{
+    if (channelIndex >= _reader.layout.channel_count) {
+        channelIndex = 0U;
+    }
+
+    NSMutableData *voltageBuffer = [NSMutableData dataWithLength:(NSUInteger)_reader.layout.points_per_scan * sizeof(float)];
+    if (!hdcv_reader_copy_voltage_for_channel(&_reader, (uint32_t)channelIndex, voltageBuffer.mutableBytes, _reader.layout.points_per_scan)) {
+        if (error != NULL) {
+            *error = [NSError errorWithDomain:HDCVViewerErrorDomain
+                                         code:2
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Failed to copy the channel voltage waveform."}];
+        }
+        return NO;
+    }
+
+    _activeChannelIndex = (uint32_t)channelIndex;
+    _voltageData = [voltageBuffer copy];
+    _waveformData = _voltageData;
+    return YES;
+}
 
 - (float)voltageAtPoint:(NSUInteger)pointIndex
 {
@@ -3659,6 +3752,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 	    NSTextField *_cvPointField;
 	    NSTextField *_backgroundModeLabel;
 	    NSTextField *_bandpassFilterLabel;
+	    NSTextField *_channelSelectorLabel;
+	    NSPopUpButton *_channelSelector;
 	    NSStackView *_markerSelectedControls;
 	    NSStackView *_markerBackgroundControls;
 	    NSMutableArray<NSTextField *> *_markerTimeFields;
@@ -3673,7 +3768,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 	    HDCVLoadedFile *_loadedFile;
     NSMutableData *_selectedRawScanData;
     NSMutableData *_backgroundScanData;
-    NSMutableData *_selectedPhaseBackgroundScanData;
+    NSMutableData *_selectedChannelBackgroundScanData;
     NSMutableData *_displayScanData;
     NSMutableData *_displayCVScanData;
     NSMutableData *_rawPointTraceData;
@@ -3691,7 +3786,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 	    NSMutableArray<NSNumber *> *_backgroundMarkerScanIndexes;
 	    NSInteger _activeSelectedMarkerIndex;
 	    NSInteger _activeBackgroundMarkerIndex;
-	    NSUInteger _activePhaseIndex;
+	    NSUInteger _activeChannelIndex;
 	    BOOL _backgroundSubtractEnabled;
 	    BOOL _bandpassFilterEnabled;
 	    BOOL _exportInProgress;
@@ -3742,7 +3837,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _activeBackgroundMarkerIndex = 0;
         _markerTimeFields = [NSMutableArray array];
         _markerBackgroundFields = [NSMutableArray array];
-        _activePhaseIndex = 0U;
+        _activeChannelIndex = 0U;
         _backgroundSubtractEnabled = NO;
         _bandpassFilterEnabled = NO;
         _lastExportOptions = HDCVExportOptionColorPlot | HDCVExportOptionTimePlot | HDCVExportOptionCVPlot | HDCVExportOptionMarkerTimes;
@@ -4134,6 +4229,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
     _backgroundSubtractSwitch.enabled = enabled;
     _bandpassFilterSwitch.enabled = enabled;
+    _channelSelector.enabled = enabled && _loadedFile != nil && _loadedFile.channelCount > 1U;
     _useSelectedAsBackgroundButton.enabled = enabled;
     _timeResetViewButton.enabled = enabled;
     _cvResetViewButton.enabled = enabled;
@@ -4195,11 +4291,30 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             textColor:HDCVHeroColor()
                  size:13.0];
 
+    _channelSelectorLabel = HDCVLabel(@"Channel", [NSFont systemFontOfSize:10.5 weight:NSFontWeightSemibold], [[NSColor whiteColor] colorWithAlphaComponent:0.78]);
+    _channelSelector = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    _channelSelector.translatesAutoresizingMaskIntoConstraints = NO;
+    _channelSelector.target = self;
+    _channelSelector.action = @selector(channelSelectionChanged:);
+    _channelSelector.controlSize = NSControlSizeSmall;
+    _channelSelector.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightSemibold];
+    _channelSelector.enabled = NO;
+    [_channelSelector.widthAnchor constraintGreaterThanOrEqualToConstant:126.0].active = YES;
+
+    NSStackView *channelSelectorStack = [[NSStackView alloc] init];
+    channelSelectorStack.translatesAutoresizingMaskIntoConstraints = NO;
+    channelSelectorStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    channelSelectorStack.alignment = NSLayoutAttributeCenterY;
+    channelSelectorStack.spacing = 6.0;
+    [channelSelectorStack addArrangedSubview:_channelSelectorLabel];
+    [channelSelectorStack addArrangedSubview:_channelSelector];
+
     NSStackView *heroActions = [[NSStackView alloc] init];
     heroActions.translatesAutoresizingMaskIntoConstraints = NO;
     heroActions.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     heroActions.alignment = NSLayoutAttributeCenterY;
     heroActions.spacing = 10.0;
+    [heroActions addArrangedSubview:channelSelectorStack];
     [heroActions addArrangedSubview:openButton];
     [heroActions addArrangedSubview:_exportButton];
     [heroPanel addSubview:heroActions];
@@ -4478,9 +4593,22 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSAlert *alert = [[NSAlert alloc] init];
     alert.alertStyle = NSAlertStyleInformational;
     alert.messageText = @"Export FSCV plot data";
-    alert.informativeText = @"Exports use the current plot state and active phase. I-t uses the selected voltage; CV uses the selected time; marker times export the visible CV/BG crosshair lists for MATLAB.";
+    alert.informativeText = @"Choose one or more channels, then choose which current plot products to export. CV exports include every visible T marker; background CV exports include every visible B marker.";
     [alert addButtonWithTitle:@"Export"];
     [alert addButtonWithTitle:@"Cancel"];
+
+    NSUInteger channelCount = [self activeChannelCount];
+    NSMutableArray<NSButton *> *channelChecks = [NSMutableArray arrayWithCapacity:channelCount];
+    NSStackView *channelStack = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    channelStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    channelStack.alignment = NSLayoutAttributeCenterY;
+    channelStack.spacing = 12.0;
+    for (NSUInteger channelIndex = 0U; channelIndex < channelCount; ++channelIndex) {
+        NSButton *channelCheck = [NSButton checkboxWithTitle:HDCVChannelCheckboxTitle(_loadedFile, channelIndex) target:nil action:nil];
+        channelCheck.state = (channelIndex == (_activeChannelIndex % channelCount)) ? NSControlStateValueOn : NSControlStateValueOff;
+        [channelChecks addObject:channelCheck];
+        [channelStack addArrangedSubview:channelCheck];
+    }
 
     NSButton *colorCheck = [NSButton checkboxWithTitle:@"Color plot data (t, I, V)" target:nil action:nil];
     NSButton *timeCheck = [NSButton checkboxWithTitle:@"I-t plot (t, I)" target:nil action:nil];
@@ -4493,10 +4621,11 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     backgroundCVCheck.state = ((_lastExportOptions & HDCVExportOptionBackgroundCVPlot) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
     markerTimesCheck.state = ((_lastExportOptions & HDCVExportOptionMarkerTimes) != 0U) ? NSControlStateValueOn : NSControlStateValueOff;
 
-    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 360.0, 140.0)];
+    NSStackView *stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 500.0, 170.0)];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
     stack.spacing = 8.0;
+    [stack addArrangedSubview:channelStack];
     [stack addArrangedSubview:colorCheck];
     [stack addArrangedSubview:timeCheck];
     [stack addArrangedSubview:cvCheck];
@@ -4510,29 +4639,42 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         }
 
         HDCVExportOptions options = 0U;
-        NSUInteger selectedCount = 0U;
+        NSUInteger selectedPlotCount = 0U;
+        NSMutableArray<NSNumber *> *selectedChannelIndexes = [NSMutableArray array];
+        for (NSUInteger i = 0U; i < channelChecks.count; ++i) {
+            if (channelChecks[i].state == NSControlStateValueOn) {
+                [selectedChannelIndexes addObject:@(i)];
+            }
+        }
         if (colorCheck.state == NSControlStateValueOn) {
             options |= HDCVExportOptionColorPlot;
-            selectedCount += 1U;
+            selectedPlotCount += 1U;
         }
         if (timeCheck.state == NSControlStateValueOn) {
             options |= HDCVExportOptionTimePlot;
-            selectedCount += 1U;
+            selectedPlotCount += 1U;
         }
         if (cvCheck.state == NSControlStateValueOn) {
             options |= HDCVExportOptionCVPlot;
-            selectedCount += 1U;
+            selectedPlotCount += 1U;
         }
         if (backgroundCVCheck.state == NSControlStateValueOn) {
             options |= HDCVExportOptionBackgroundCVPlot;
-            selectedCount += 1U;
+            selectedPlotCount += 1U;
         }
         if (markerTimesCheck.state == NSControlStateValueOn) {
             options |= HDCVExportOptionMarkerTimes;
-            selectedCount += 1U;
+            selectedPlotCount += 1U;
         }
 
-        if (selectedCount == 0U) {
+        if (selectedChannelIndexes.count == 0U) {
+            NSAlert *emptyAlert = [[NSAlert alloc] init];
+            emptyAlert.alertStyle = NSAlertStyleWarning;
+            emptyAlert.messageText = @"Choose at least one channel";
+            [emptyAlert beginSheetModalForWindow:self->_window completionHandler:nil];
+            return;
+        }
+        if (selectedPlotCount == 0U) {
             NSAlert *emptyAlert = [[NSAlert alloc] init];
             emptyAlert.alertStyle = NSAlertStyleWarning;
             emptyAlert.messageText = @"Choose at least one CSV export";
@@ -4548,16 +4690,21 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             baseName = @"hdcv_export";
         }
         savePanel.nameFieldStringValue = [NSString stringWithFormat:@"%@_export.csv", baseName];
-        savePanel.message = selectedCount > 1U
+        BOOL writesMultipleSeries = selectedChannelIndexes.count > 1U ||
+            ((options & HDCVExportOptionCVPlot) != 0U && self->_selectedMarkerScanIndexes.count > 1U) ||
+            ((options & HDCVExportOptionBackgroundCVPlot) != 0U && self->_backgroundMarkerScanIndexes.count > 1U);
+        savePanel.message = selectedPlotCount > 1U
             ? @"Choose a base filename. The selected plots will be written as separate suffixed CSV files."
-            : @"Choose the CSV filename.";
+            : (writesMultipleSeries
+                ? @"Choose the CSV filename. Selected channels and crosshairs will be written as labeled rows."
+                : @"Choose the CSV filename.");
         savePanel.canCreateDirectories = YES;
 
         [savePanel beginSheetModalForWindow:self->_window completionHandler:^(NSModalResponse saveResponse) {
             if (saveResponse != NSModalResponseOK || savePanel.URL == nil) {
                 return;
             }
-            [self performExportWithOptions:options baseURL:savePanel.URL singleFile:(selectedCount == 1U)];
+            [self performExportWithOptions:options channelIndexes:[selectedChannelIndexes copy] baseURL:savePanel.URL singleFile:(selectedPlotCount == 1U)];
         }];
     }];
 }
@@ -4570,16 +4717,18 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
 - (BOOL)writeTimePlotCSVToURL:(NSURL *)url
                     loadedFile:(HDCVLoadedFile *)loadedFile
-                    pointIndex:(NSUInteger)pointIndex
-           backgroundScanIndex:(NSUInteger)backgroundScanIndex
-    backgroundSubtractEnabled:(BOOL)backgroundSubtractEnabled
-         bandpassFilterEnabled:(BOOL)bandpassFilterEnabled
-              activePhaseIndex:(NSUInteger)activePhaseIndex
-                   phasePeriod:(NSUInteger)phasePeriod
-                         error:(NSError **)error
+	                    pointIndex:(NSUInteger)pointIndex
+	           backgroundScanIndex:(NSUInteger)backgroundScanIndex
+	    backgroundSubtractEnabled:(BOOL)backgroundSubtractEnabled
+	         bandpassFilterEnabled:(BOOL)bandpassFilterEnabled
+	                 channelIndexes:(NSArray<NSNumber *> *)channelIndexes
+	                   channelCount:(NSUInteger)channelCount
+	                         error:(NSError **)error
 {
+    (void)backgroundScanIndex;
     NSUInteger scanCount = loadedFile.scanCount;
     NSMutableData *traceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
+    BOOL includeChannelColumns = channelIndexes.count > 1U;
     FILE *file = HDCVOpenCSVFile(url, error);
     if (file == NULL) {
         return NO;
@@ -4595,50 +4744,93 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (backgroundSubtractEnabled) {
         NSMutableData *sourceTraceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
         memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
-        HDCVApplyFixedPhaseBaselineToTrace(
+        HDCVApplyFixedChannelBaselineToTrace(
             sourceTraceData.bytes,
             trace,
             scanCount,
-            phasePeriod
+            channelCount
         );
     }
     if (bandpassFilterEnabled) {
-        (void)HDCVApplyButterworthBandpassByPhase(trace, scanCount, phasePeriod, loadedFile.cvfHz);
+        (void)HDCVApplyButterworthBandpassByChannel(trace, scanCount, channelCount, loadedFile.cvfHz);
     }
 
-    fprintf(file, "time_s,current_nA\n");
-    NSUInteger firstScan = HDCVFirstPhaseScanInRange(0U, scanCount - 1U, activePhaseIndex, phasePeriod);
-    for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex < scanCount; scanIndex += MAX(phasePeriod, 1U)) {
-        fprintf(file, "%.9g,%.9g\n", [loadedFile sequenceTimeSecondsAtScan:scanIndex], (double)trace[scanIndex]);
+    fprintf(file, includeChannelColumns ? "channel_index,channel_name,time_s,current_nA\n" : "time_s,current_nA\n");
+    for (NSNumber *channelNumber in channelIndexes) {
+        NSUInteger channelIndex = channelNumber.unsignedIntegerValue % MAX(channelCount, 1U);
+        NSUInteger firstScan = HDCVFirstChannelRowInRange(0U, scanCount - 1U, channelIndex, channelCount);
+        for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex < scanCount; scanIndex += MAX(channelCount, 1U)) {
+            if (includeChannelColumns) {
+                fprintf(file, "%lu,", (unsigned long)(channelIndex + 1U));
+                HDCVWriteCSVString(file, HDCVChannelNameForCSV(loadedFile, channelIndex));
+                fprintf(file, ",");
+            }
+            fprintf(file, "%.9g,%.9g\n", [loadedFile sequenceTimeSecondsAtScan:scanIndex], (double)trace[scanIndex]);
+        }
     }
     return HDCVCloseCSVFile(file, url, error);
 }
 
 - (BOOL)writeCVPlotCSVToURL:(NSURL *)url
-                 loadedFile:(HDCVLoadedFile *)loadedFile
-                  scanIndex:(NSUInteger)scanIndex
-        backgroundScanIndex:(NSUInteger)backgroundScanIndex
- backgroundSubtractEnabled:(BOOL)backgroundSubtractEnabled
-      bandpassFilterEnabled:(BOOL)bandpassFilterEnabled
-           activePhaseIndex:(NSUInteger)activePhaseIndex
-                phasePeriod:(NSUInteger)phasePeriod
-                      error:(NSError **)error
+	                 loadedFile:(HDCVLoadedFile *)loadedFile
+	                scanIndexes:(NSArray<NSNumber *> *)scanIndexes
+	                markerPrefix:(NSString *)markerPrefix
+	    pairedBackgroundScanIndexes:(NSArray<NSNumber *> *)pairedBackgroundScanIndexes
+	 backgroundSubtractEnabled:(BOOL)backgroundSubtractEnabled
+	      bandpassFilterEnabled:(BOOL)bandpassFilterEnabled
+	             channelIndexes:(NSArray<NSNumber *> *)channelIndexes
+	                channelCount:(NSUInteger)channelCount
+	                      error:(NSError **)error
 {
     NSUInteger scanCount = loadedFile.scanCount;
     NSUInteger pointsPerScan = loadedFile.pointsPerScan;
-    NSUInteger selectedCenter = HDCVNearestScanIndexForPhase(scanIndex, scanCount, activePhaseIndex, phasePeriod);
-    NSUInteger backgroundCenter = HDCVNearestScanIndexForPhase(backgroundScanIndex, scanCount, activePhaseIndex, phasePeriod);
+    BOOL includeSeriesColumns = channelIndexes.count > 1U || scanIndexes.count > 1U;
     FILE *file = HDCVOpenCSVFile(url, error);
+    __block NSError *blockError = nil;
     if (file == NULL) {
         return NO;
     }
 
-    fprintf(file, "voltage_V,current_nA\n");
+    fprintf(file, includeSeriesColumns
+        ? "channel_index,channel_name,marker,time_s,scan_index,voltage_V,current_nA\n"
+        : "voltage_V,current_nA\n");
+
+    BOOL (^writeOneCVSeries)(NSUInteger, NSUInteger, NSUInteger, NSString *) =
+        ^BOOL(NSUInteger sourceScanIndex, NSUInteger sourceBackgroundScanIndex, NSUInteger channelIndex, NSString *markerLabel) {
+    NSUInteger selectedCenter = HDCVRowIndexForSourceSampleAndChannel(sourceScanIndex, scanCount, channelIndex, channelCount);
+    NSUInteger backgroundCenter = HDCVRowIndexForSourceSampleAndChannel(sourceBackgroundScanIndex, scanCount, channelIndex, channelCount);
+    NSMutableData *voltageData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+    const float *voltage;
+
+    if (![loadedFile copyVoltageForChannelIndex:channelIndex intoMutableData:voltageData]) {
+        fclose(file);
+        blockError = HDCVCSVError(url, @"Could not read the channel voltage waveform for CV export.");
+        return NO;
+    }
+    voltage = voltageData.bytes;
+
+    void (^writeCurrentRow)(NSUInteger, float) = ^(NSUInteger pointIndex, float current) {
+        if (includeSeriesColumns) {
+            fprintf(file, "%lu,", (unsigned long)(channelIndex + 1U));
+            HDCVWriteCSVString(file, HDCVChannelNameForCSV(loadedFile, channelIndex));
+            fprintf(file, ",");
+            HDCVWriteCSVString(file, markerLabel);
+            fprintf(file,
+                ",%.9g,%lu,%.9g,%.9g\n",
+                [loadedFile sequenceTimeSecondsAtScan:selectedCenter],
+                (unsigned long)selectedCenter,
+                (double)voltage[pointIndex],
+                (double)current);
+        } else {
+            fprintf(file, "%.9g,%.9g\n", (double)voltage[pointIndex], (double)current);
+        }
+    };
+
     if (backgroundSubtractEnabled && selectedCenter == backgroundCenter) {
         for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
-            fprintf(file, "%.9g,0\n", (double)[loadedFile voltageAtPoint:pointIndex]);
+            writeCurrentRow(pointIndex, 0.0f);
         }
-        return HDCVCloseCSVFile(file, url, error);
+        return YES;
     }
 
     if (bandpassFilterEnabled) {
@@ -4650,36 +4842,37 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
             if (![loadedFile copyPointTraceAtIndex:(uint32_t)pointIndex intoMutableData:traceData min:NULL max:NULL]) {
                 fclose(file);
-                HDCVSetCSVError(error, url, @"Could not read a waveform-point trace for CV export.");
+                blockError = HDCVCSVError(url, @"Could not read a waveform-point trace for CV export.");
                 return NO;
             }
 
             float *trace = traceData.mutableBytes;
             if (backgroundSubtractEnabled) {
                 memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
-                HDCVApplyFixedPhaseBaselineToTrace(
+                HDCVApplyChannelAlignedBackgroundToTrace(
                     sourceTraceData.bytes,
                     trace,
                     scanCount,
-                    phasePeriod
+                    backgroundCenter,
+                    channelCount
                 );
             }
-            (void)HDCVApplyButterworthBandpassByPhase(trace, scanCount, phasePeriod, loadedFile.cvfHz);
-            float current = HDCVAverageTraceInPhaseWindow(
-                trace,
-                scanCount,
-                selectedCenter,
-                activePhaseIndex,
-                phasePeriod,
-                HDCVCVSelectedHalfWindow
-            );
+            (void)HDCVApplyButterworthBandpassByChannel(trace, scanCount, channelCount, loadedFile.cvfHz);
+            float current = HDCVAverageTraceInChannelWindow(
+	                trace,
+	                scanCount,
+	                selectedCenter,
+	                channelIndex,
+	                channelCount,
+	                HDCVCVSelectedHalfWindow
+	            );
             cvValues[pointIndex] = current;
         }
         if (backgroundSubtractEnabled) {
-            HDCVApplyBackgroundSubtractedCVDenoise(cvValues, loadedFile.voltageData.bytes, pointsPerScan);
+            HDCVApplyBackgroundSubtractedCVDenoise(cvValues, voltage, pointsPerScan);
         }
         for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
-            fprintf(file, "%.9g,%.9g\n", (double)[loadedFile voltageAtPoint:pointIndex], (double)cvValues[pointIndex]);
+            writeCurrentRow(pointIndex, cvValues[pointIndex]);
         }
     } else {
         NSMutableData *selectedAverageData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
@@ -4694,18 +4887,18 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         BOOL hasBackgroundAverage = NO;
 
         BOOL (^copyAverageScan)(NSUInteger, NSUInteger, float *) = ^BOOL(NSUInteger centerScan, NSUInteger halfWindow, float *destination) {
-            NSUInteger center = HDCVNearestScanIndexForPhase(centerScan, scanCount, activePhaseIndex, phasePeriod);
-            NSInteger start = (NSInteger)center - ((NSInteger)halfWindow * (NSInteger)phasePeriod);
-            NSInteger end = (NSInteger)center + ((NSInteger)halfWindow * (NSInteger)phasePeriod);
+            NSUInteger center = HDCVNearestRowIndexForChannel(centerScan, scanCount, channelIndex, channelCount);
+            NSInteger start = (NSInteger)center - ((NSInteger)halfWindow * (NSInteger)channelCount);
+            NSInteger end = (NSInteger)center + ((NSInteger)halfWindow * (NSInteger)channelCount);
             NSUInteger usedCount = 0U;
             memset(sums, 0, pointsPerScan * sizeof(double));
             while (start < 0) {
-                start += (NSInteger)phasePeriod;
+                start += (NSInteger)channelCount;
             }
             while (end >= (NSInteger)scanCount) {
-                end -= (NSInteger)phasePeriod;
+                end -= (NSInteger)channelCount;
             }
-            for (NSInteger localScan = start; localScan <= end; localScan += (NSInteger)phasePeriod) {
+            for (NSInteger localScan = start; localScan <= end; localScan += (NSInteger)channelCount) {
                 if (localScan < 0 || localScan >= (NSInteger)scanCount) {
                     continue;
                 }
@@ -4732,16 +4925,16 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             return YES;
         };
 
-        if (!copyAverageScan(scanIndex, HDCVCVSelectedHalfWindow, selectedAverage)) {
+        if (!copyAverageScan(selectedCenter, HDCVCVSelectedHalfWindow, selectedAverage)) {
             fclose(file);
-            HDCVSetCSVError(error, url, @"Could not read the selected CV scan average.");
+            blockError = HDCVCSVError(url, @"Could not read the selected CV scan average.");
             return NO;
         }
 
         if (backgroundSubtractEnabled) {
             if (!copyAverageScan(backgroundCenter, HDCVCVSelectedHalfWindow, backgroundAverage)) {
                 fclose(file);
-                HDCVSetCSVError(error, url, @"Could not read the phase-aligned background average for CV export.");
+                blockError = HDCVCSVError(url, @"Could not read the channel-aligned background average for CV export.");
                 return NO;
             }
             hasBackgroundAverage = YES;
@@ -4752,10 +4945,34 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             cvValues[pointIndex] = (float)current;
         }
         if (backgroundSubtractEnabled) {
-            HDCVApplyBackgroundSubtractedCVDenoise(cvValues, loadedFile.voltageData.bytes, pointsPerScan);
+            HDCVApplyBackgroundSubtractedCVDenoise(cvValues, voltage, pointsPerScan);
         }
         for (NSUInteger pointIndex = 0U; pointIndex < pointsPerScan; ++pointIndex) {
-            fprintf(file, "%.9g,%.9g\n", (double)[loadedFile voltageAtPoint:pointIndex], (double)cvValues[pointIndex]);
+            writeCurrentRow(pointIndex, cvValues[pointIndex]);
+        }
+    }
+
+    return YES;
+    };
+
+    for (NSNumber *channelNumber in channelIndexes) {
+        NSUInteger channelIndex = channelNumber.unsignedIntegerValue % MAX(channelCount, 1U);
+        for (NSUInteger markerIndex = 0U; markerIndex < scanIndexes.count; ++markerIndex) {
+            NSUInteger sourceScanIndex = MIN(scanIndexes[markerIndex].unsignedIntegerValue, scanCount - 1U);
+            NSUInteger sourceBackgroundScanIndex = sourceScanIndex;
+            NSString *label = [NSString stringWithFormat:@"%@%lu",
+                markerPrefix.length > 0U ? markerPrefix : @"T",
+                (unsigned long)(markerIndex + 1U)];
+            if (pairedBackgroundScanIndexes.count > 0U) {
+                NSUInteger backgroundIndex = MIN(markerIndex, pairedBackgroundScanIndexes.count - 1U);
+                sourceBackgroundScanIndex = MIN(pairedBackgroundScanIndexes[backgroundIndex].unsignedIntegerValue, scanCount - 1U);
+            }
+            if (!writeOneCVSeries(sourceScanIndex, sourceBackgroundScanIndex, channelIndex, label)) {
+                if (error != NULL && blockError != nil) {
+                    *error = blockError;
+                }
+                return NO;
+            }
         }
     }
 
@@ -4767,25 +4984,41 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
                     scanMinIndex:(NSUInteger)scanMinIndex
                     scanMaxIndex:(NSUInteger)scanMaxIndex
                    pointMinIndex:(NSUInteger)pointMinIndex
-                   pointMaxIndex:(NSUInteger)pointMaxIndex
-            backgroundScanIndex:(NSUInteger)backgroundScanIndex
-     backgroundSubtractEnabled:(BOOL)backgroundSubtractEnabled
-          bandpassFilterEnabled:(BOOL)bandpassFilterEnabled
-               activePhaseIndex:(NSUInteger)activePhaseIndex
-                    phasePeriod:(NSUInteger)phasePeriod
-                          error:(NSError **)error
+	                   pointMaxIndex:(NSUInteger)pointMaxIndex
+	            backgroundScanIndex:(NSUInteger)backgroundScanIndex
+	     backgroundSubtractEnabled:(BOOL)backgroundSubtractEnabled
+	          bandpassFilterEnabled:(BOOL)bandpassFilterEnabled
+	                 channelIndexes:(NSArray<NSNumber *> *)channelIndexes
+	                    channelCount:(NSUInteger)channelCount
+	                          error:(NSError **)error
 {
     (void)backgroundScanIndex;
     NSUInteger scanCount = loadedFile.scanCount;
     NSUInteger pointsPerScan = loadedFile.pointsPerScan;
-    NSUInteger exportScanCount = HDCVPhaseSampleCountInRange(scanMinIndex, scanMaxIndex, activePhaseIndex, phasePeriod);
     NSUInteger exportPointCount = pointMaxIndex - pointMinIndex + 1U;
+    BOOL includeChannelColumns = channelIndexes.count > 1U;
     FILE *file = HDCVOpenCSVFile(url, error);
+    __block NSError *blockError = nil;
     if (file == NULL) {
         return NO;
     }
 
-    fprintf(file, "time_s,current_nA,voltage_V\n");
+    fprintf(file, includeChannelColumns
+        ? "channel_index,channel_name,time_s,current_nA,voltage_V\n"
+        : "time_s,current_nA,voltage_V\n");
+
+    BOOL (^writeOneChannel)(NSUInteger) = ^BOOL(NSUInteger channelIndex) {
+    NSUInteger exportScanCount = HDCVChannelSampleCountInRange(scanMinIndex, scanMaxIndex, channelIndex, channelCount);
+    NSMutableData *voltageData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
+    const float *voltage;
+
+    if (![loadedFile copyVoltageForChannelIndex:channelIndex intoMutableData:voltageData]) {
+        fclose(file);
+        blockError = HDCVCSVError(url, @"Could not read the channel voltage waveform for color plot export.");
+        return NO;
+    }
+    voltage = voltageData.bytes;
+
     if (bandpassFilterEnabled) {
         NSMutableData *traceData = [NSMutableData dataWithLength:scanCount * sizeof(float)];
         NSMutableData *sourceTraceData = backgroundSubtractEnabled ? [NSMutableData dataWithLength:scanCount * sizeof(float)] : nil;
@@ -4795,44 +5028,47 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         for (NSUInteger pointIndex = pointMinIndex; pointIndex <= pointMaxIndex; ++pointIndex) {
             if (![loadedFile copyPointTraceAtIndex:(uint32_t)pointIndex intoMutableData:traceData min:NULL max:NULL]) {
                 fclose(file);
-                HDCVSetCSVError(error, url, @"Could not read a waveform-point trace for color plot export.");
+                blockError = HDCVCSVError(url, @"Could not read a waveform-point trace for color plot export.");
                 return NO;
             }
 
             float *trace = traceData.mutableBytes;
             if (backgroundSubtractEnabled) {
                 memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
-                HDCVApplyFixedPhaseBaselineToTrace(
+                HDCVApplyFixedChannelBaselineToTrace(
                     sourceTraceData.bytes,
                     trace,
                     scanCount,
-                    phasePeriod
+                    channelCount
                 );
             }
-            (void)HDCVApplyButterworthBandpassByPhase(trace, scanCount, phasePeriod, loadedFile.cvfHz);
+            (void)HDCVApplyButterworthBandpassByChannel(trace, scanCount, channelCount, loadedFile.cvfHz);
 
             NSUInteger localPoint = pointIndex - pointMinIndex;
             NSUInteger localScan = 0U;
-            NSUInteger firstScan = HDCVFirstPhaseScanInRange(scanMinIndex, scanMaxIndex, activePhaseIndex, phasePeriod);
-            for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex <= scanMaxIndex; scanIndex += MAX(phasePeriod, 1U)) {
+            NSUInteger firstScan = HDCVFirstChannelRowInRange(scanMinIndex, scanMaxIndex, channelIndex, channelCount);
+            for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex <= scanMaxIndex; scanIndex += MAX(channelCount, 1U)) {
                 matrix[(localScan * exportPointCount) + localPoint] = trace[scanIndex];
                 localScan += 1U;
             }
         }
 
         NSUInteger localScan = 0U;
-        NSUInteger firstScan = HDCVFirstPhaseScanInRange(scanMinIndex, scanMaxIndex, activePhaseIndex, phasePeriod);
-        for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex <= scanMaxIndex; scanIndex += MAX(phasePeriod, 1U)) {
+        NSUInteger firstScan = HDCVFirstChannelRowInRange(scanMinIndex, scanMaxIndex, channelIndex, channelCount);
+        for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex <= scanMaxIndex; scanIndex += MAX(channelCount, 1U)) {
             double time = [loadedFile sequenceTimeSecondsAtScan:scanIndex];
             for (NSUInteger pointIndex = pointMinIndex; pointIndex <= pointMaxIndex; ++pointIndex) {
                 NSUInteger localPoint = pointIndex - pointMinIndex;
-                fprintf(
-                    file,
+                if (includeChannelColumns) {
+                    fprintf(file, "%lu,", (unsigned long)(channelIndex + 1U));
+                    HDCVWriteCSVString(file, HDCVChannelNameForCSV(loadedFile, channelIndex));
+                    fprintf(file, ",");
+                }
+                fprintf(file,
                     "%.9g,%.9g,%.9g\n",
                     time,
                     (double)matrix[(localScan * exportPointCount) + localPoint],
-                    (double)[loadedFile voltageAtPoint:pointIndex]
-                );
+                    (double)voltage[pointIndex]);
             }
             localScan += 1U;
         }
@@ -4840,24 +5076,24 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         NSMutableDictionary<NSNumber *, NSData *> *backgroundCache = [NSMutableDictionary dictionary];
         NSMutableData *scanData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
 
-        NSUInteger firstScan = HDCVFirstPhaseScanInRange(scanMinIndex, scanMaxIndex, activePhaseIndex, phasePeriod);
-        for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex <= scanMaxIndex; scanIndex += MAX(phasePeriod, 1U)) {
+        NSUInteger firstScan = HDCVFirstChannelRowInRange(scanMinIndex, scanMaxIndex, channelIndex, channelCount);
+        for (NSUInteger scanIndex = firstScan; scanIndex != NSNotFound && scanIndex <= scanMaxIndex; scanIndex += MAX(channelCount, 1U)) {
             if (![loadedFile copyScanAtIndex:(uint32_t)scanIndex intoMutableData:scanData min:NULL max:NULL]) {
                 fclose(file);
-                HDCVSetCSVError(error, url, @"Could not read a scan for color plot export.");
+                blockError = HDCVCSVError(url, @"Could not read a scan for color plot export.");
                 return NO;
             }
 
             const float *background = NULL;
             if (backgroundSubtractEnabled) {
-                NSUInteger alignedIndex = HDCVFixedPhaseBaselineIndexForScan(scanIndex, scanCount, phasePeriod);
+                NSUInteger alignedIndex = HDCVFixedChannelBaselineIndexForRow(scanIndex, scanCount, channelCount);
                 NSNumber *key = @(alignedIndex);
                 NSData *cachedBackground = backgroundCache[key];
                 if (cachedBackground == nil) {
                     NSMutableData *backgroundData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
                     if (![loadedFile copyScanAtIndex:(uint32_t)alignedIndex intoMutableData:backgroundData min:NULL max:NULL]) {
                         fclose(file);
-                        HDCVSetCSVError(error, url, @"Could not read a phase-aligned background scan for color plot export.");
+                        blockError = HDCVCSVError(url, @"Could not read a channel-aligned background scan for color plot export.");
                         return NO;
                     }
                     cachedBackground = [backgroundData copy];
@@ -4870,8 +5106,25 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             double time = [loadedFile sequenceTimeSecondsAtScan:scanIndex];
             for (NSUInteger pointIndex = pointMinIndex; pointIndex <= pointMaxIndex; ++pointIndex) {
                 double current = (double)scan[pointIndex] - ((background != NULL) ? (double)background[pointIndex] : 0.0);
-                fprintf(file, "%.9g,%.9g,%.9g\n", time, current, (double)[loadedFile voltageAtPoint:pointIndex]);
+                if (includeChannelColumns) {
+                    fprintf(file, "%lu,", (unsigned long)(channelIndex + 1U));
+                    HDCVWriteCSVString(file, HDCVChannelNameForCSV(loadedFile, channelIndex));
+                    fprintf(file, ",");
+                }
+                fprintf(file, "%.9g,%.9g,%.9g\n", time, current, (double)voltage[pointIndex]);
             }
+        }
+    }
+    return YES;
+    };
+
+    for (NSNumber *channelNumber in channelIndexes) {
+        NSUInteger channelIndex = channelNumber.unsignedIntegerValue % MAX(channelCount, 1U);
+        if (!writeOneChannel(channelIndex)) {
+            if (error != NULL && blockError != nil) {
+                *error = blockError;
+            }
+            return NO;
         }
     }
 
@@ -4879,48 +5132,71 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 }
 
 - (BOOL)writeMarkerTimesCSVToURL:(NSURL *)url
-                       loadedFile:(HDCVLoadedFile *)loadedFile
-             selectedScanIndexes:(NSArray<NSNumber *> *)selectedScanIndexes
-           backgroundScanIndexes:(NSArray<NSNumber *> *)backgroundScanIndexes
-                            error:(NSError **)error
+	                       loadedFile:(HDCVLoadedFile *)loadedFile
+	             selectedScanIndexes:(NSArray<NSNumber *> *)selectedScanIndexes
+	           backgroundScanIndexes:(NSArray<NSNumber *> *)backgroundScanIndexes
+	                 channelIndexes:(NSArray<NSNumber *> *)channelIndexes
+	                   channelCount:(NSUInteger)channelCount
+	                            error:(NSError **)error
 {
     FILE *file = HDCVOpenCSVFile(url, error);
     if (file == NULL) {
         return NO;
     }
 
-    fprintf(file, "CV_times_s,BG_times_s,CV_scan_index,BG_scan_index\n");
+    BOOL includeChannelColumns = channelIndexes.count > 1U;
+    fprintf(file, includeChannelColumns
+        ? "channel_index,channel_name,CV_times_s,BG_times_s,CV_scan_index,BG_scan_index\n"
+        : "CV_times_s,BG_times_s,CV_scan_index,BG_scan_index\n");
     BOOL usesSharedBackground = (backgroundScanIndexes.count == 1U && selectedScanIndexes.count > 1U);
     NSUInteger rowCount = usesSharedBackground ? selectedScanIndexes.count : MAX(selectedScanIndexes.count, backgroundScanIndexes.count);
-    for (NSUInteger row = 0U; row < rowCount; ++row) {
-        BOOL hasSelected = row < selectedScanIndexes.count;
-        BOOL hasBackground = usesSharedBackground ? YES : (row < backgroundScanIndexes.count);
-        NSUInteger selectedScan = hasSelected ? MIN(selectedScanIndexes[row].unsignedIntegerValue, (NSUInteger)loadedFile.scanCount - 1U) : 0U;
-        NSUInteger backgroundScan = hasBackground
-            ? MIN(backgroundScanIndexes[usesSharedBackground ? 0U : row].unsignedIntegerValue, (NSUInteger)loadedFile.scanCount - 1U)
-            : 0U;
+    for (NSNumber *channelNumber in channelIndexes) {
+        NSUInteger channelIndex = channelNumber.unsignedIntegerValue % MAX(channelCount, 1U);
+        for (NSUInteger row = 0U; row < rowCount; ++row) {
+            BOOL hasSelected = row < selectedScanIndexes.count;
+            BOOL hasBackground = usesSharedBackground ? YES : (row < backgroundScanIndexes.count);
+            NSUInteger selectedScan = hasSelected
+                ? HDCVRowIndexForSourceSampleAndChannel(
+                    MIN(selectedScanIndexes[row].unsignedIntegerValue, (NSUInteger)loadedFile.scanCount - 1U),
+                    (NSUInteger)loadedFile.scanCount,
+                    channelIndex,
+                    channelCount)
+                : 0U;
+            NSUInteger backgroundScan = hasBackground
+                ? HDCVRowIndexForSourceSampleAndChannel(
+                    MIN(backgroundScanIndexes[usesSharedBackground ? 0U : row].unsignedIntegerValue, (NSUInteger)loadedFile.scanCount - 1U),
+                    (NSUInteger)loadedFile.scanCount,
+                    channelIndex,
+                    channelCount)
+                : 0U;
 
-        if (hasSelected) {
-            fprintf(file, "%.9g", [loadedFile sequenceTimeSecondsAtScan:selectedScan]);
+            if (includeChannelColumns) {
+                fprintf(file, "%lu,", (unsigned long)(channelIndex + 1U));
+                HDCVWriteCSVString(file, HDCVChannelNameForCSV(loadedFile, channelIndex));
+                fprintf(file, ",");
+            }
+            if (hasSelected) {
+                fprintf(file, "%.9g", [loadedFile sequenceTimeSecondsAtScan:selectedScan]);
+            }
+            fprintf(file, ",");
+            if (hasBackground) {
+                fprintf(file, "%.9g", [loadedFile sequenceTimeSecondsAtScan:backgroundScan]);
+            }
+            fprintf(file, ",");
+            if (hasSelected) {
+                fprintf(file, "%lu", (unsigned long)selectedScan);
+            }
+            fprintf(file, ",");
+            if (hasBackground) {
+                fprintf(file, "%lu", (unsigned long)backgroundScan);
+            }
+            fprintf(file, "\n");
         }
-        fprintf(file, ",");
-        if (hasBackground) {
-            fprintf(file, "%.9g", [loadedFile sequenceTimeSecondsAtScan:backgroundScan]);
-        }
-        fprintf(file, ",");
-        if (hasSelected) {
-            fprintf(file, "%lu", (unsigned long)selectedScan);
-        }
-        fprintf(file, ",");
-        if (hasBackground) {
-            fprintf(file, "%lu", (unsigned long)backgroundScan);
-        }
-        fprintf(file, "\n");
     }
     return HDCVCloseCSVFile(file, url, error);
 }
 
-- (void)performExportWithOptions:(HDCVExportOptions)options baseURL:(NSURL *)baseURL singleFile:(BOOL)singleFile
+- (void)performExportWithOptions:(HDCVExportOptions)options channelIndexes:(NSArray<NSNumber *> *)channelIndexes baseURL:(NSURL *)baseURL singleFile:(BOOL)singleFile
 {
     HDCVLoadedFile *loadedFile = _loadedFile;
     if (loadedFile == nil) {
@@ -4928,13 +5204,12 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
 
     [self syncPrimaryMarkerArrays];
-    NSUInteger selectedScanIndex = MIN(_selectedScanIndex, (NSUInteger)loadedFile.scanCount - 1U);
     NSUInteger selectedPointIndex = MIN(_selectedPointIndex, (NSUInteger)loadedFile.pointsPerScan - 1U);
-    NSUInteger backgroundScanIndex = MIN(_backgroundScanIndex, (NSUInteger)loadedFile.scanCount - 1U);
     NSArray<NSNumber *> *selectedMarkerScanIndexes = [_selectedMarkerScanIndexes copy];
     NSArray<NSNumber *> *backgroundMarkerScanIndexes = [_backgroundMarkerScanIndexes copy];
-    NSUInteger phasePeriod = MAX((NSUInteger)loadedFile.phasePeriod, 1U);
-    NSUInteger activePhaseIndex = _activePhaseIndex % phasePeriod;
+    NSMutableArray<NSNumber *> *pairedBackgroundMarkerScanIndexes = [NSMutableArray arrayWithCapacity:selectedMarkerScanIndexes.count];
+    NSUInteger channelCount = MAX((NSUInteger)loadedFile.channelCount, 1U);
+    NSArray<NSNumber *> *exportChannelIndexes = [channelIndexes copy];
     BOOL backgroundSubtractEnabled = _backgroundSubtractEnabled;
     BOOL bandpassFilterEnabled = _bandpassFilterEnabled;
     NSUInteger scanMinIndex = MIN(_heatmapView.visibleScanMinIndex, (NSUInteger)loadedFile.scanCount - 1U);
@@ -4952,6 +5227,19 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (pointMaxIndex < pointMinIndex) {
         pointMaxIndex = pointMinIndex;
     }
+    for (NSUInteger i = 0U; i < selectedMarkerScanIndexes.count; ++i) {
+        NSUInteger backgroundIndex = 0U;
+        if (backgroundMarkerScanIndexes.count > 1U) {
+            if (i < backgroundMarkerScanIndexes.count) {
+                backgroundIndex = i;
+            } else if (_activeBackgroundMarkerIndex >= 0 && (NSUInteger)_activeBackgroundMarkerIndex < backgroundMarkerScanIndexes.count) {
+                backgroundIndex = (NSUInteger)_activeBackgroundMarkerIndex;
+            }
+        }
+        if (backgroundMarkerScanIndexes.count > 0U) {
+            [pairedBackgroundMarkerScanIndexes addObject:backgroundMarkerScanIndexes[backgroundIndex]];
+        }
+    }
 
     _exportInProgress = YES;
     _exportButton.enabled = NO;
@@ -4967,15 +5255,15 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             if (![self writeColorPlotCSVToURL:url
                                    loadedFile:loadedFile
                                  scanMinIndex:scanMinIndex
-                                 scanMaxIndex:scanMaxIndex
-                                pointMinIndex:pointMinIndex
-                                pointMaxIndex:pointMaxIndex
-                          backgroundScanIndex:backgroundScanIndex
-                   backgroundSubtractEnabled:backgroundSubtractEnabled
-                        bandpassFilterEnabled:bandpassFilterEnabled
-                              activePhaseIndex:activePhaseIndex
-                                  phasePeriod:phasePeriod
-                                        error:&error]) {
+	                                 scanMaxIndex:scanMaxIndex
+	                                pointMinIndex:pointMinIndex
+	                                pointMaxIndex:pointMaxIndex
+	                          backgroundScanIndex:0U
+	                   backgroundSubtractEnabled:backgroundSubtractEnabled
+	                        bandpassFilterEnabled:bandpassFilterEnabled
+	                                channelIndexes:exportChannelIndexes
+	                                  channelCount:channelCount
+	                                        error:&error]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [self finishExportWithError:error writtenURLs:writtenURLs];
                 });
@@ -4987,14 +5275,14 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         if ((options & HDCVExportOptionTimePlot) != 0U) {
             NSURL *url = HDCVExportURLForSuffix(baseURL, @"it", singleFile);
             if (![self writeTimePlotCSVToURL:url
-                                  loadedFile:loadedFile
-                                  pointIndex:selectedPointIndex
-                         backgroundScanIndex:backgroundScanIndex
-                  backgroundSubtractEnabled:backgroundSubtractEnabled
-                       bandpassFilterEnabled:bandpassFilterEnabled
-                             activePhaseIndex:activePhaseIndex
-                                 phasePeriod:phasePeriod
-                                       error:&error]) {
+	                                  loadedFile:loadedFile
+	                                  pointIndex:selectedPointIndex
+	                         backgroundScanIndex:0U
+	                  backgroundSubtractEnabled:backgroundSubtractEnabled
+	                       bandpassFilterEnabled:bandpassFilterEnabled
+	                               channelIndexes:exportChannelIndexes
+	                                 channelCount:channelCount
+	                                       error:&error]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [self finishExportWithError:error writtenURLs:writtenURLs];
                 });
@@ -5006,14 +5294,15 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         if ((options & HDCVExportOptionCVPlot) != 0U) {
             NSURL *url = HDCVExportURLForSuffix(baseURL, @"cv", singleFile);
             if (![self writeCVPlotCSVToURL:url
-                                loadedFile:loadedFile
-                                 scanIndex:selectedScanIndex
-                       backgroundScanIndex:backgroundScanIndex
-                backgroundSubtractEnabled:backgroundSubtractEnabled
-                     bandpassFilterEnabled:bandpassFilterEnabled
-                          activePhaseIndex:activePhaseIndex
-                               phasePeriod:phasePeriod
-                                     error:&error]) {
+	                                loadedFile:loadedFile
+	                               scanIndexes:selectedMarkerScanIndexes
+	                              markerPrefix:@"T"
+	                  pairedBackgroundScanIndexes:pairedBackgroundMarkerScanIndexes
+	                backgroundSubtractEnabled:backgroundSubtractEnabled
+	                     bandpassFilterEnabled:bandpassFilterEnabled
+	                           channelIndexes:exportChannelIndexes
+	                               channelCount:channelCount
+	                                     error:&error]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [self finishExportWithError:error writtenURLs:writtenURLs];
                 });
@@ -5025,14 +5314,15 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         if ((options & HDCVExportOptionBackgroundCVPlot) != 0U) {
             NSURL *url = HDCVExportURLForSuffix(baseURL, @"cv_bg", singleFile);
             if (![self writeCVPlotCSVToURL:url
-                                loadedFile:loadedFile
-                                 scanIndex:backgroundScanIndex
-                       backgroundScanIndex:backgroundScanIndex
-                backgroundSubtractEnabled:NO
-                     bandpassFilterEnabled:bandpassFilterEnabled
-                          activePhaseIndex:activePhaseIndex
-                               phasePeriod:phasePeriod
-                                     error:&error]) {
+	                                loadedFile:loadedFile
+	                               scanIndexes:backgroundMarkerScanIndexes
+	                              markerPrefix:@"B"
+	                  pairedBackgroundScanIndexes:nil
+	                backgroundSubtractEnabled:NO
+	                     bandpassFilterEnabled:bandpassFilterEnabled
+	                           channelIndexes:exportChannelIndexes
+	                               channelCount:channelCount
+	                                     error:&error]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [self finishExportWithError:error writtenURLs:writtenURLs];
                 });
@@ -5044,10 +5334,12 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         if ((options & HDCVExportOptionMarkerTimes) != 0U) {
             NSURL *url = HDCVExportURLForSuffix(baseURL, @"marker_times", singleFile);
             if (![self writeMarkerTimesCSVToURL:url
-                                     loadedFile:loadedFile
-                           selectedScanIndexes:selectedMarkerScanIndexes
-                         backgroundScanIndexes:backgroundMarkerScanIndexes
-                                          error:&error]) {
+	                                     loadedFile:loadedFile
+	                           selectedScanIndexes:selectedMarkerScanIndexes
+	                         backgroundScanIndexes:backgroundMarkerScanIndexes
+	                               channelIndexes:exportChannelIndexes
+	                                 channelCount:channelCount
+	                                          error:&error]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [self finishExportWithError:error writtenURLs:writtenURLs];
                 });
@@ -5113,22 +5405,35 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     });
 }
 
+- (void)populateChannelSelectorForLoadedFile:(HDCVLoadedFile *)loaded
+{
+    [_channelSelector removeAllItems];
+    for (NSUInteger i = 0U; i < loaded.channelCount; ++i) {
+        [_channelSelector addItemWithTitle:HDCVChannelCheckboxTitle(loaded, i)];
+    }
+    if (_channelSelector.numberOfItems == 0) {
+        [_channelSelector addItemWithTitle:@"Channel 1"];
+    }
+    [_channelSelector selectItemAtIndex:0];
+}
+
 - (void)installLoadedFile:(HDCVLoadedFile *)loaded
 {
     _loadedFile = loaded;
+    [self populateChannelSelectorForLoadedFile:loaded];
 
     _selectedRawScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
     _backgroundScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
-    _selectedPhaseBackgroundScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
+    _selectedChannelBackgroundScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
     _displayScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
     _displayCVScanData = [NSMutableData dataWithLength:(NSUInteger)loaded.pointsPerScan * sizeof(float)];
     _rawPointTraceData = [NSMutableData dataWithLength:(NSUInteger)loaded.scanCount * sizeof(float)];
     _displayPointTraceData = [NSMutableData dataWithLength:(NSUInteger)loaded.scanCount * sizeof(float)];
 
-    _activePhaseIndex = 0U;
-    _selectedScanIndex = [self scanIndexNearestActivePhaseToScanIndex:loaded.scanCount / 2U];
+    _activeChannelIndex = 0U;
+    _selectedScanIndex = [self rowIndexNearestActiveChannelToRowIndex:loaded.scanCount / 2U];
     _selectedPointIndex = loaded.pointsPerScan / 2U;
-    _backgroundScanIndex = [self scanIndexNearestActivePhaseToScanIndex:0U];
+    _backgroundScanIndex = [self rowIndexNearestActiveChannelToRowIndex:0U];
     [_selectedMarkerScanIndexes removeAllObjects];
     [_selectedMarkerScanIndexes addObject:@(_selectedScanIndex)];
     [_backgroundMarkerScanIndexes removeAllObjects];
@@ -5176,10 +5481,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     [self requestPointTraceRefresh];
 
     _fileLabel.stringValue = [self fileSubtitleForLoadedFile:loaded filename:_pendingOpenPath.lastPathComponent];
-    _heroStatusLabel.stringValue = ([self activePhasePeriod] > 1U)
-        ? [NSString stringWithFormat:@"Phase %lu/%lu",
-            (unsigned long)_activePhaseIndex + 1UL,
-            (unsigned long)[self activePhasePeriod]]
+    _heroStatusLabel.stringValue = ([self activeChannelCount] > 1U)
+        ? [NSString stringWithFormat:@"Channel %lu/%lu",
+            (unsigned long)_activeChannelIndex + 1UL,
+            (unsigned long)[self activeChannelCount]]
         : @"Ready";
 }
 
@@ -5192,31 +5497,31 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     return [_loadedFile copyScanAtIndex:(uint32_t)_backgroundScanIndex intoMutableData:_backgroundScanData min:NULL max:NULL];
 }
 
-- (NSUInteger)activePhasePeriod
+- (NSUInteger)activeChannelCount
 {
-    return (_loadedFile == nil) ? 1U : MAX((NSUInteger)_loadedFile.phasePeriod, 1U);
+    return (_loadedFile == nil) ? 1U : MAX((NSUInteger)_loadedFile.channelCount, 1U);
 }
 
-- (NSUInteger)scanIndexNearestActivePhaseToScanIndex:(NSUInteger)scanIndex
+- (NSUInteger)rowIndexNearestActiveChannelToRowIndex:(NSUInteger)scanIndex
 {
     if (_loadedFile == nil) {
         return 0U;
     }
-    return HDCVNearestScanIndexForPhase(
+    return HDCVNearestRowIndexForChannel(
         scanIndex,
         (NSUInteger)_loadedFile.scanCount,
-        _activePhaseIndex,
-        [self activePhasePeriod]
+        _activeChannelIndex,
+        [self activeChannelCount]
     );
 }
 
-- (NSUInteger)phaseAlignedBackgroundScanIndexForScan:(NSUInteger)scanIndex
+- (NSUInteger)channelAlignedBackgroundScanIndexForRow:(NSUInteger)scanIndex
 {
-    return HDCVPhaseAlignedBackgroundIndex(
+    return HDCVChannelAlignedBackgroundIndex(
         _backgroundScanIndex,
         scanIndex,
         (NSUInteger)_loadedFile.scanCount,
-        (NSUInteger)_loadedFile.phasePeriod
+        (NSUInteger)_loadedFile.channelCount
     );
 }
 
@@ -5225,20 +5530,20 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (_loadedFile == nil) {
         return 0U;
     }
-    return HDCVFixedPhaseBaselineIndexForScan(
+    return HDCVFixedChannelBaselineIndexForRow(
         scanIndex,
         (NSUInteger)_loadedFile.scanCount,
-        [self activePhasePeriod]
+        [self activeChannelCount]
     );
 }
 
-- (BOOL)copyPhaseAlignedBackgroundScanForSelectedScan
+- (BOOL)copyChannelAlignedBackgroundScanForSelectedScan
 {
     if (_loadedFile == nil) {
         return NO;
     }
     NSUInteger alignedIndex = [self fixedPlotBaselineIndexForScan:_selectedScanIndex];
-    return [_loadedFile copyScanAtIndex:(uint32_t)alignedIndex intoMutableData:_selectedPhaseBackgroundScanData min:NULL max:NULL];
+    return [_loadedFile copyScanAtIndex:(uint32_t)alignedIndex intoMutableData:_selectedChannelBackgroundScanData min:NULL max:NULL];
 }
 
 - (BOOL)copySelectedScan
@@ -5249,7 +5554,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (![_loadedFile copyScanAtIndex:(uint32_t)_selectedScanIndex intoMutableData:_selectedRawScanData min:NULL max:NULL]) {
         return NO;
     }
-    return [self copyPhaseAlignedBackgroundScanForSelectedScan];
+    return [self copyChannelAlignedBackgroundScanForSelectedScan];
 }
 
 - (NSData *)cachedBackgroundScanForIndex:(NSUInteger)scanIndex cache:(NSMutableDictionary<NSNumber *, NSData *> *)cache
@@ -5279,8 +5584,8 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     NSUInteger scanCount = _loadedFile.scanCount;
     NSUInteger pointsPerScan = _loadedFile.pointsPerScan;
-    NSUInteger period = [self activePhasePeriod];
-    NSUInteger center = [self scanIndexNearestActivePhaseToScanIndex:centerScan];
+    NSUInteger period = [self activeChannelCount];
+    NSUInteger center = [self rowIndexNearestActiveChannelToRowIndex:centerScan];
     NSInteger start = (NSInteger)center - ((NSInteger)halfWindow * (NSInteger)period);
     NSInteger end = (NSInteger)center + ((NSInteger)halfWindow * (NSInteger)period);
     NSMutableData *scanData = [NSMutableData dataWithLength:pointsPerScan * sizeof(float)];
@@ -5348,15 +5653,15 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         float *trace = traceData.mutableBytes;
         if (_backgroundSubtractEnabled) {
             memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
-            HDCVApplyFixedPhaseBaselineToTrace(
+            HDCVApplyFixedChannelBaselineToTrace(
                 sourceTraceData.bytes,
                 trace,
                 scanCount,
-                [self activePhasePeriod]
+                [self activeChannelCount]
             );
         }
 
-        (void)HDCVApplyButterworthBandpassByPhase(trace, scanCount, [self activePhasePeriod], _loadedFile.cvfHz);
+        (void)HDCVApplyButterworthBandpassByChannel(trace, scanCount, [self activeChannelCount], _loadedFile.cvfHz);
         displayScan[pointIndex] = trace[_selectedScanIndex];
     }
 
@@ -5372,9 +5677,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
     NSUInteger scanCount = _loadedFile.scanCount;
     NSUInteger pointsPerScan = _loadedFile.pointsPerScan;
-    NSUInteger period = [self activePhasePeriod];
-    NSUInteger selectedCenter = HDCVNearestScanIndexForPhase(_selectedScanIndex, scanCount, _activePhaseIndex, period);
-    NSUInteger backgroundCenter = HDCVNearestScanIndexForPhase(_backgroundScanIndex, scanCount, _activePhaseIndex, period);
+    NSUInteger period = [self activeChannelCount];
+    NSUInteger selectedCenter = HDCVNearestRowIndexForChannel(_selectedScanIndex, scanCount, _activeChannelIndex, period);
+    NSUInteger backgroundCenter = HDCVNearestRowIndexForChannel(_backgroundScanIndex, scanCount, _activeChannelIndex, period);
     float *displayCVScan = _displayCVScanData.mutableBytes;
 
     if (_backgroundSubtractEnabled && selectedCenter == backgroundCenter) {
@@ -5396,20 +5701,20 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             float *trace = traceData.mutableBytes;
             if (_backgroundSubtractEnabled) {
                 memcpy(sourceTraceData.mutableBytes, trace, scanCount * sizeof(float));
-                HDCVApplyPhaseAlignedBackgroundToTrace(
+                HDCVApplyChannelAlignedBackgroundToTrace(
                     sourceTraceData.bytes,
                     trace,
                     scanCount,
                     _backgroundScanIndex,
-                    [self activePhasePeriod]
+                    [self activeChannelCount]
                 );
             }
-            (void)HDCVApplyButterworthBandpassByPhase(trace, scanCount, [self activePhasePeriod], _loadedFile.cvfHz);
-            displayCVScan[pointIndex] = HDCVAverageTraceInPhaseWindow(
+            (void)HDCVApplyButterworthBandpassByChannel(trace, scanCount, [self activeChannelCount], _loadedFile.cvfHz);
+            displayCVScan[pointIndex] = HDCVAverageTraceInChannelWindow(
                 trace,
                 scanCount,
                 selectedCenter,
-                _activePhaseIndex,
+                _activeChannelIndex,
                 period,
                 HDCVCVSelectedHalfWindow
             );
@@ -5449,14 +5754,14 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
 
     const float *selectedRaw = _selectedRawScanData.bytes;
-    const float *selectedPhaseBackground = _selectedPhaseBackgroundScanData.bytes;
+    const float *selectedChannelBackground = _selectedChannelBackgroundScanData.bytes;
     float *displayScan = _displayScanData.mutableBytes;
     NSUInteger pointsPerScan = _loadedFile.pointsPerScan;
     NSUInteger scanCount = _loadedFile.scanCount;
 
     if (!(_bandpassFilterEnabled && [self copyBandpassFilteredSelectedScanIntoDisplayBuffer])) {
         for (NSUInteger i = 0U; i < pointsPerScan; ++i) {
-            displayScan[i] = _backgroundSubtractEnabled ? (selectedRaw[i] - selectedPhaseBackground[i]) : selectedRaw[i];
+            displayScan[i] = _backgroundSubtractEnabled ? (selectedRaw[i] - selectedChannelBackground[i]) : selectedRaw[i];
         }
         HDCVRobustRange(_displayScanData.bytes, pointsPerScan, &_displayScanMin, &_displayScanMax);
     }
@@ -5475,9 +5780,9 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             displayTrace[i] = _backgroundSubtractEnabled ? (rawTrace[i] - rawTrace[alignedIndex]) : rawTrace[i];
         }
         if (_bandpassFilterEnabled) {
-            (void)HDCVApplyButterworthBandpassByPhase(displayTrace, scanCount, [self activePhasePeriod], _loadedFile.cvfHz);
+            (void)HDCVApplyButterworthBandpassByChannel(displayTrace, scanCount, [self activeChannelCount], _loadedFile.cvfHz);
         }
-        HDCVRobustRangeForPhase(_displayPointTraceData.bytes, scanCount, _activePhaseIndex, [self activePhasePeriod], &_displayTraceMin, &_displayTraceMax);
+        HDCVRobustRangeForChannel(_displayPointTraceData.bytes, scanCount, _activeChannelIndex, [self activeChannelCount], &_displayTraceMin, &_displayTraceMax);
     }
 
     [self refreshPlotTitles];
@@ -5603,11 +5908,11 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     double colorMin;
     double colorMax;
 
-    if (_backgroundSubtractEnabled || [self activePhasePeriod] > 1U) {
+    if (_backgroundSubtractEnabled || [self activeChannelCount] > 1U) {
         NSMutableData *scanData = [NSMutableData dataWithLength:height * sizeof(float)];
         NSMutableData *sumsData = [NSMutableData dataWithLength:height * sizeof(double)];
         double *sums = sumsData.mutableBytes;
-        NSUInteger period = [self activePhasePeriod];
+        NSUInteger period = [self activeChannelCount];
 
         for (NSUInteger x = 0U; x < width; ++x) {
             NSUInteger startScan = (NSUInteger)(((uint64_t)x * (uint64_t)_loadedFile.scanCount) / (uint64_t)width);
@@ -5620,7 +5925,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             memset(sums, 0, height * sizeof(double));
 
             for (NSUInteger scanIndex = startScan; scanIndex < endScan; ++scanIndex) {
-                if (!HDCVScanIndexMatchesPhase(scanIndex, _activePhaseIndex, period)) {
+                if (!HDCVRowIndexMatchesChannel(scanIndex, _activeChannelIndex, period)) {
                     continue;
                 }
                 if (![_loadedFile copyScanAtIndex:(uint32_t)scanIndex intoMutableData:scanData min:NULL max:NULL]) {
@@ -5642,7 +5947,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 
             if (usedScanCount == 0U) {
                 NSUInteger midpointScan = startScan + ((endScan - startScan) / 2U);
-                NSUInteger scanIndex = [self scanIndexNearestActivePhaseToScanIndex:midpointScan];
+                NSUInteger scanIndex = [self rowIndexNearestActiveChannelToRowIndex:midpointScan];
                 if ([_loadedFile copyScanAtIndex:(uint32_t)scanIndex intoMutableData:scanData min:NULL max:NULL]) {
                     NSUInteger backgroundIndex = [self fixedPlotBaselineIndexForScan:scanIndex];
                     NSData *backgroundData = _backgroundSubtractEnabled
@@ -5845,7 +6150,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSMutableArray<NSNumber *> *markers = (kind == HDCVTimeMarkerKindSelected)
         ? _selectedMarkerScanIndexes
         : _backgroundMarkerScanIndexes;
-    NSUInteger clampedScan = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
+    NSUInteger clampedScan = [self rowIndexNearestActiveChannelToRowIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
 
     if (index >= markers.count) {
         return;
@@ -5859,7 +6164,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         [self activateBackgroundMarkerIndex:index pairSelected:YES];
         _backgroundScanIndex = clampedScan;
         [self copyBackgroundScan];
-        [self copyPhaseAlignedBackgroundScanForSelectedScan];
+        [self copyChannelAlignedBackgroundScanForSelectedScan];
         [self applyDisplayModes];
         [self refreshSelectionReadout];
     } else {
@@ -5873,7 +6178,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     NSMutableArray<NSNumber *> *markers = (kind == HDCVTimeMarkerKindSelected)
         ? _selectedMarkerScanIndexes
         : _backgroundMarkerScanIndexes;
-    NSUInteger clampedScan = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
+    NSUInteger clampedScan = [self rowIndexNearestActiveChannelToRowIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
     [markers addObject:@(clampedScan)];
     if (kind == HDCVTimeMarkerKindSelected) {
         [self activateSelectedMarkerIndex:markers.count - 1U pairBackground:YES];
@@ -5881,7 +6186,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     } else {
         [self activateBackgroundMarkerIndex:markers.count - 1U pairSelected:YES];
         [self copyBackgroundScan];
-        [self copyPhaseAlignedBackgroundScanForSelectedScan];
+        [self copyChannelAlignedBackgroundScanForSelectedScan];
         [self applyDisplayModes];
         [self refreshSelectionReadout];
     }
@@ -5919,7 +6224,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         }
         [self activateBackgroundMarkerIndex:(NSUInteger)MAX((NSInteger)0, _activeBackgroundMarkerIndex) pairSelected:YES];
         [self copyBackgroundScan];
-        [self copyPhaseAlignedBackgroundScanForSelectedScan];
+        [self copyChannelAlignedBackgroundScanForSelectedScan];
         [self applyDisplayModes];
         [self refreshSelectionReadout];
     }
@@ -5934,14 +6239,14 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 {
     double sampleRate = loaded.sampleRateHz;
     NSString *sampleRateText;
-    double totalDuration = (double)loaded.scanCount * loaded.scanIntervalSeconds;
+    double totalDuration = (double)loaded.samplesPerChannel * loaded.scanIntervalSeconds;
 
     if (sampleRate >= 1000.0) {
         sampleRateText = [NSString stringWithFormat:@"%.1f kHz", sampleRate / 1000.0];
     } else {
         sampleRateText = [NSString stringWithFormat:@"%.1f Hz", sampleRate];
     }
-    return [NSString stringWithFormat:@"%@  |  %@  |  %.1f s", filename, sampleRateText, totalDuration];
+    return [NSString stringWithFormat:@"%@  |  %@  |  %u ch  |  %.1f s", filename, sampleRateText, loaded.channelCount, totalDuration];
 }
 
 - (void)refreshControlFields
@@ -6055,11 +6360,11 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (_displayPointTraceData.length >= _loadedFile.scanCount * sizeof(float)) {
         double traceMin = (double)_displayTraceMin;
         double traceMax = (double)_displayTraceMax;
-        NSUInteger phaseSampleCount = HDCVPhaseSampleCount((NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
-        NSUInteger firstPhaseScan = HDCVScanIndexForPhaseSample(0U, (NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
-        NSUInteger lastPhaseScan = HDCVScanIndexForPhaseSample(phaseSampleCount > 0U ? phaseSampleCount - 1U : 0U, (NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
-        double traceXMin = [self timeValueForScanIndex:firstPhaseScan];
-        double traceXMax = [self timeValueForScanIndex:lastPhaseScan];
+        NSUInteger channelSampleCount = HDCVChannelSampleCount((NSUInteger)_loadedFile.scanCount, _activeChannelIndex, [self activeChannelCount]);
+        NSUInteger firstChannelRow = HDCVRowIndexForChannelSample(0U, (NSUInteger)_loadedFile.scanCount, _activeChannelIndex, [self activeChannelCount]);
+        NSUInteger lastChannelRow = HDCVRowIndexForChannelSample(channelSampleCount > 0U ? channelSampleCount - 1U : 0U, (NSUInteger)_loadedFile.scanCount, _activeChannelIndex, [self activeChannelCount]);
+        double traceXMin = [self timeValueForScanIndex:firstChannelRow];
+        double traceXMax = [self timeValueForScanIndex:lastChannelRow];
         HDCVExpandRange(&traceMin, &traceMax);
         HDCVExpandRangeToIncludeZero(&traceXMin, &traceXMax);
         if (_backgroundSubtractEnabled) {
@@ -6262,7 +6567,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _backgroundScanIndex = [self scanIndexNearestTimeValue:value];
         _backgroundMarkerScanIndexes[[self clampedActiveBackgroundMarkerIndex]] = @(_backgroundScanIndex);
         [self copyBackgroundScan];
-        [self copyPhaseAlignedBackgroundScanForSelectedScan];
+        [self copyChannelAlignedBackgroundScanForSelectedScan];
         [self applyDisplayModes];
         [self refreshSelectionReadout];
         _heroStatusLabel.stringValue = [NSString stringWithFormat:@"BG %.3f s", [self timeValueForScanIndex:_backgroundScanIndex]];
@@ -6274,10 +6579,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     if (_loadedFile == nil || _loadedFile.scanCount == 0U) {
         return 0U;
     }
-    double interval = MAX(_loadedFile.scanIntervalSeconds, 1.0e-12);
-    double scanValue = xValue / interval;
-    NSUInteger rawNearest = (NSUInteger)llround(MAX(0.0, MIN((double)(_loadedFile.scanCount - 1U), scanValue)));
-    return [self scanIndexNearestActivePhaseToScanIndex:rawNearest];
+    double sampleValue = xValue * MAX(_loadedFile.cvfHz, 1.0e-12);
+    NSUInteger maxSample = (_loadedFile.samplesPerChannel > 0U) ? (NSUInteger)_loadedFile.samplesPerChannel - 1U : 0U;
+    NSUInteger sampleIndex = (NSUInteger)llround(MAX(0.0, MIN((double)maxSample, sampleValue)));
+    return HDCVRowIndexForChannelSample(sampleIndex, (NSUInteger)_loadedFile.scanCount, _activeChannelIndex, [self activeChannelCount]);
 }
 
 - (NSUInteger)pointIndexForHeatmapAxisValue:(double)value
@@ -6392,7 +6697,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
 
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
-    NSDictionary<NSString *, NSNumber *> *addInfo = @{@"scanIndex": @([self scanIndexNearestActivePhaseToScanIndex:scanIndex])};
+    NSDictionary<NSString *, NSNumber *> *addInfo = @{@"scanIndex": @([self rowIndexNearestActiveChannelToRowIndex:scanIndex])};
     NSMenuItem *addVertical = [menu addItemWithTitle:@"Add a vertical crosshair"
                                               action:@selector(addVerticalMarkerFromMenu:)
                                        keyEquivalent:@""];
@@ -6667,6 +6972,61 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     _heroStatusLabel.stringValue = _bandpassFilterEnabled ? @"Bandpass on" : @"Bandpass off";
 }
 
+- (void)channelSelectionChanged:(id)sender
+{
+    (void)sender;
+    if (_loadedFile == nil) {
+        return;
+    }
+
+    NSUInteger newChannelIndex = (NSUInteger)MAX((NSInteger)0, _channelSelector.indexOfSelectedItem);
+    NSUInteger channelCount = [self activeChannelCount];
+    if (channelCount == 0U) {
+        return;
+    }
+    newChannelIndex = MIN(newChannelIndex, channelCount - 1U);
+    if (newChannelIndex == _activeChannelIndex) {
+        return;
+    }
+
+    NSMutableArray<NSNumber *> *selectedSamples = [NSMutableArray arrayWithCapacity:_selectedMarkerScanIndexes.count];
+    NSMutableArray<NSNumber *> *backgroundSamples = [NSMutableArray arrayWithCapacity:_backgroundMarkerScanIndexes.count];
+    for (NSNumber *rowNumber in _selectedMarkerScanIndexes) {
+        [selectedSamples addObject:@(rowNumber.unsignedIntegerValue / channelCount)];
+    }
+    for (NSNumber *rowNumber in _backgroundMarkerScanIndexes) {
+        [backgroundSamples addObject:@(rowNumber.unsignedIntegerValue / channelCount)];
+    }
+
+    NSError *error = nil;
+    if (![_loadedFile setActiveChannelIndex:newChannelIndex error:&error]) {
+        _heroStatusLabel.stringValue = (error.localizedDescription != nil) ? error.localizedDescription : @"Channel switch failed";
+        [_channelSelector selectItemAtIndex:_activeChannelIndex];
+        return;
+    }
+
+    _activeChannelIndex = newChannelIndex;
+    for (NSUInteger i = 0U; i < selectedSamples.count; ++i) {
+        NSUInteger sampleIndex = selectedSamples[i].unsignedIntegerValue;
+        _selectedMarkerScanIndexes[i] = @(HDCVRowIndexForChannelSample(sampleIndex, (NSUInteger)_loadedFile.scanCount, _activeChannelIndex, channelCount));
+    }
+    for (NSUInteger i = 0U; i < backgroundSamples.count; ++i) {
+        NSUInteger sampleIndex = backgroundSamples[i].unsignedIntegerValue;
+        _backgroundMarkerScanIndexes[i] = @(HDCVRowIndexForChannelSample(sampleIndex, (NSUInteger)_loadedFile.scanCount, _activeChannelIndex, channelCount));
+    }
+    [self activateSelectedMarkerIndex:[self clampedActiveSelectedMarkerIndex] pairBackground:YES];
+    [self activateBackgroundMarkerIndex:[self clampedActiveBackgroundMarkerIndex] pairSelected:NO];
+
+    _heatmapView.voltageData = _loadedFile.voltageData;
+    [self copyBackgroundScan];
+    [self copySelectedScan];
+    [self applyDisplayModes];
+    [self rebuildHeatmapImage];
+    [self refreshWaveformProgram];
+    [self requestPointTraceRefresh];
+    _heroStatusLabel.stringValue = [NSString stringWithFormat:@"Channel %lu/%lu", (unsigned long)(_activeChannelIndex + 1U), (unsigned long)channelCount];
+}
+
 - (void)useSelectedScanAsBackground:(id)sender
 {
     (void)sender;
@@ -6680,7 +7040,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
     }
     _backgroundScanIndex = _selectedScanIndex;
     [self copyBackgroundScan];
-    [self copyPhaseAlignedBackgroundScanForSelectedScan];
+    [self copyChannelAlignedBackgroundScanForSelectedScan];
     [self applyDisplayModes];
     [self refreshSelectionReadout];
     _heroStatusLabel.stringValue = @"BG = selected scan";
@@ -6696,7 +7056,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         _activeSelectedMarkerIndex = markerIndex;
     }
     if (updateScan) {
-        _selectedScanIndex = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
+        _selectedScanIndex = [self rowIndexNearestActiveChannelToRowIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
         _selectedMarkerScanIndexes[[self clampedActiveSelectedMarkerIndex]] = @(_selectedScanIndex);
     } else {
         [self activateSelectedMarkerIndex:[self clampedActiveSelectedMarkerIndex] pairBackground:YES];
@@ -6725,10 +7085,10 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             _selectedScanIndex = _selectedMarkerScanIndexes[(NSUInteger)markerIndex].unsignedIntegerValue;
         }
     }
-    _backgroundScanIndex = [self scanIndexNearestActivePhaseToScanIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
+    _backgroundScanIndex = [self rowIndexNearestActiveChannelToRowIndex:MIN(scanIndex, (NSUInteger)_loadedFile.scanCount - 1U)];
     _backgroundMarkerScanIndexes[[self clampedActiveBackgroundMarkerIndex]] = @(_backgroundScanIndex);
     [self copyBackgroundScan];
-    [self copyPhaseAlignedBackgroundScanForSelectedScan];
+    [self copyChannelAlignedBackgroundScanForSelectedScan];
     [self applyDisplayModes];
     [self refreshSelectionReadout];
 }
@@ -6752,7 +7112,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
             _backgroundScanIndex = bestScanIndex;
             _backgroundMarkerScanIndexes[[self clampedActiveBackgroundMarkerIndex]] = @(_backgroundScanIndex);
             [self copyBackgroundScan];
-            [self copyPhaseAlignedBackgroundScanForSelectedScan];
+            [self copyChannelAlignedBackgroundScanForSelectedScan];
             [self applyDisplayModes];
             [self refreshSelectionReadout];
         } else {
@@ -6799,7 +7159,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
         return 0U;
     }
     if (view == _timePlotView) {
-        return HDCVPhaseSampleCount((NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
+        return HDCVChannelSampleCount((NSUInteger)_loadedFile.scanCount, _activeChannelIndex, [self activeChannelCount]);
     }
     if (view == _cvPlotView) {
         return _loadedFile.pointsPerScan;
@@ -6816,7 +7176,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 - (double)linePlotView:(HDCVLinePlotView *)view xValueAtIndex:(NSUInteger)index
 {
     if (view == _timePlotView) {
-        NSUInteger scanIndex = HDCVScanIndexForPhaseSample(index, (NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
+        NSUInteger scanIndex = HDCVRowIndexForChannelSample(index, (NSUInteger)_loadedFile.scanCount, _activeChannelIndex, [self activeChannelCount]);
         return [self timeValueForScanIndex:scanIndex];
     }
     if (view == _cvPlotView) {
@@ -6832,7 +7192,7 @@ static BOOL HDCVApplyButterworthBandpassByPhase(float *values, size_t count, NSU
 {
     if (view == _timePlotView) {
         const float *trace = _displayPointTraceData.bytes;
-        NSUInteger scanIndex = HDCVScanIndexForPhaseSample(index, (NSUInteger)_loadedFile.scanCount, _activePhaseIndex, [self activePhasePeriod]);
+        NSUInteger scanIndex = HDCVRowIndexForChannelSample(index, (NSUInteger)_loadedFile.scanCount, _activeChannelIndex, [self activeChannelCount]);
         return trace[scanIndex];
     }
     if (view == _cvPlotView) {
